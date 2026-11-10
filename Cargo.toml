@@ -1,0 +1,42 @@
+[package]
+name = "sororewind"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Replay a failed Soroban transaction locally and narrate the call tree to the point of failure"
+license = "Apache-2.0"
+repository = "https://github.com/example/sororewind"
+
+[[bin]]
+name = "sororewind"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+stellar-xdr = { version = "30.0.0" }
+soroban-env-host = { version = "30.0.0" }
+soroban-ledger-snapshot = "30.0.0-rc.1"
+owo-colors = "4"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+stellar-strkey = "1.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+insta = "1.49"
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -1,0 +1,20 @@
+---
+source: tests/narrative.rs
+expression: human_report(&fixture)
+---
+--- exit code: 0
+sororewind  32755e…c07c  testnet
+ledger 5564818 · protocol 30 · 2026-11-05 03:02:10 UTC
+
+✓ replay matches network
+  on-chain  trapped
+  local     trapped
+
+where it broke
+  contract error #13 · AlreadyProcessed
+  "failing with contract error"
+  in CDMMETEBO2H34SVSNZMYQQTLSDSZUE2NDBFN4J76SHMAFXYLD2AJIVAQ::report (depth 0)
+
+call tree
+CDMMETEBO2H34SVSNZMYQQTLSDSZUE2NDBFN4J76SHMAFXYLD2AJIVAQ::report(GBMUKN26BAC7VGVS6TLB2UJOJQPVVAJYJMBOSIHNNN53MX2Z5KGZZML6, CD4EQYJ2L5EG6M7KVDWWIIXYLP5HYNOWU5KNP5AMOIKALXXZVYGDRQ67, 0x010ed56e8aecdaec…(1337 bytes), 0x000e05f2a5f98529…(96 bytes), [{public_key: 0x27f08e65b59fc990…(32 bytes), signature: 0x377f4b56e08a611e…(64 bytes)}, {public_key: 0x4e841b3532bae8dd…(32 bytes), signature: 0xa3382fd0c7d4a9c2…(64 bytes)}, {public_key: 0x577e08d884de9b46…(32 bytes), signature: 0x84b7d3da43846f4c…(64 bytes)}])  ✗
+    · VM call trapped with HostError
