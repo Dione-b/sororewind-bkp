@@ -1,0 +1,110 @@
+---
+source: tests/narrative.rs
+expression: "serde_json::to_string_pretty(&json).unwrap()"
+---
+{
+  "budget": {
+    "cpuInsns": 907402,
+    "cpuLimit": 1033991,
+    "memBytes": 24184,
+    "memLimit": 41943040,
+    "networkCpuInsns": 907402,
+    "networkMemBytes": 24184
+  },
+  "calls": [
+    {
+      "args": [
+        "GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC",
+        "GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG",
+        "20000000000"
+      ],
+      "contract": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "depth": 0,
+      "failure": true,
+      "function": "transfer",
+      "logs": [],
+      "open": true,
+      "recovered": false,
+      "returned": null
+    }
+  ],
+  "closeTime": 1794385548,
+  "diagnostics": {
+    "local": [
+      "fail [-] fn_call, 0xd7928b72c2703ccf…(32 bytes), transfer [GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000]",
+      "fail [CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC] error, contract error #10 [\"resulting balance is not within the allowed range\", 10000000, -15000000100, 9223372036854775807]"
+    ],
+    "onchain": [
+      "fail [-] fn_call, 0xd7928b72c2703ccf…(32 bytes), transfer [GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000]",
+      "fail [CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC] error, contract error #10 [\"resulting balance is not within the allowed range\", 10000000, -15000000100, 9223372036854775807]",
+      "fail [-] host_fn_failed, contract error #10 void",
+      "fail [-] core_metrics, read_entry 4",
+      "fail [-] core_metrics, write_entry 0",
+      "fail [-] core_metrics, ledger_read_byte 236",
+      "fail [-] core_metrics, ledger_write_byte 0",
+      "fail [-] core_metrics, read_key_byte 80",
+      "fail [-] core_metrics, write_key_byte 0",
+      "fail [-] core_metrics, read_data_byte 236",
+      "fail [-] core_metrics, write_data_byte 0",
+      "fail [-] core_metrics, read_code_byte 0",
+      "fail [-] core_metrics, write_code_byte 0",
+      "fail [-] core_metrics, emit_event 0",
+      "fail [-] core_metrics, emit_event_byte 0",
+      "fail [-] core_metrics, cpu_insn 907402",
+      "fail [-] core_metrics, mem_byte 24184",
+      "fail [-] core_metrics, invoke_time_nsecs 358838",
+      "fail [-] core_metrics, max_rw_key_byte 40",
+      "fail [-] core_metrics, max_rw_data_byte 144",
+      "fail [-] core_metrics, max_rw_code_byte 0",
+      "fail [-] core_metrics, max_emit_event_byte 0"
+    ]
+  },
+  "failure": {
+    "contract": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+    "contractCode": 10,
+    "depth": 0,
+    "description": "contract error #10",
+    "errorCode": null,
+    "errorType": "contract",
+    "function": "transfer",
+    "message": "resulting balance is not within the allowed range",
+    "name": null,
+    "nameOrigin": null,
+    "trail": [
+      "resulting balance is not within the allowed range"
+    ]
+  },
+  "feeBump": false,
+  "fidelity": {
+    "divergence": null,
+    "match": true
+  },
+  "footprint": {
+    "archived": [],
+    "configDrifted": [],
+    "drifted": [
+      "account GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC"
+    ],
+    "entries": 4,
+    "missing": 1,
+    "ttlDrifted": []
+  },
+  "hash": "dd1f9bb61fc8d599aa7914469f4e013b40648a6dcd1adb6d294467f55efa53db",
+  "ledger": 5672381,
+  "network": "testnet",
+  "prngSeed": "derived",
+  "protocol": 30,
+  "result": {
+    "local": {
+      "code": "trapped",
+      "resultHash": null
+    },
+    "onchain": {
+      "code": "trapped",
+      "resultHash": null
+    }
+  },
+  "rpc": "<fixture>",
+  "schemaVersion": 1,
+  "status": "FAILED"
+}
