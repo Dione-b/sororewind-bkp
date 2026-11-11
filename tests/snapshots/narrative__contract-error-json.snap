@@ -52,7 +52,7 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
       "fail [-] core_metrics, emit_event_byte 0",
       "fail [-] core_metrics, cpu_insn 907402",
       "fail [-] core_metrics, mem_byte 24184",
-      "fail [-] core_metrics, invoke_time_nsecs 358838",
+      "fail [-] core_metrics, invoke_time_nsecs 269714",
       "fail [-] core_metrics, max_rw_key_byte 40",
       "fail [-] core_metrics, max_rw_data_byte 144",
       "fail [-] core_metrics, max_rw_code_byte 0",
@@ -81,12 +81,16 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
   },
   "footprint": {
     "archived": [],
+    "archivedInferred": [],
+    "configDriftUnknown": [],
     "configDrifted": [],
-    "drifted": [
-      "account GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC"
-    ],
+    "driftUnknown": [],
+    "drifted": [],
     "entries": 4,
+    "extMissing": [],
     "missing": 1,
+    "rebuildNote": null,
+    "rebuilt": [],
     "ttlDrifted": []
   },
   "hash": "dd1f9bb61fc8d599aa7914469f4e013b40648a6dcd1adb6d294467f55efa53db",

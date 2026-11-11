@@ -5,16 +5,23 @@
 
 use super::soroban_env_host::{
     budget::Budget,
-    e2e_invoke::{entry_size_for_rent, invoke_host_function, TtlLedgerEntryMeta},
+    e2e_invoke::{
+        entry_size_for_rent, extract_rent_changes, invoke_host_function, TtlLedgerEntryMeta,
+    },
+    fees::{
+        compute_rent_fee, compute_rent_write_fee_per_1kb, compute_transaction_resource_fee,
+        FeeConfiguration, LedgerEntryRentChange, RentFeeConfiguration, RentWriteFeeConfiguration,
+        TransactionResources,
+    },
     storage::Storage,
     vm::VersionedContractCodeCostInputs,
     xdr::{
         ContractCodeCostInputs, ContractCostParams, Hash, LedgerEntry, Limits, ReadXdr, ScError,
-        WriteXdr,
+        ScErrorCode, ScErrorType, WriteXdr,
     },
     Host, HostError, LedgerInfo, ModuleCache,
 };
-use crate::host::{Change, Failure, Invocation, Output};
+use crate::host::{Change, Failure, FeeRequest, Fees, Invocation, Output, RentChange};
 
 /// The protocol this host executes, and the only one it accepts.
 pub const PROTOCOL: u32 = super::soroban_env_host::meta::INTERFACE_VERSION.protocol;
@@ -41,6 +48,12 @@ pub fn invoke(invocation: &Invocation<'_>) -> Result<Output, Failure> {
         mem_params.clone(),
     )
     .map_err(|e| Failure::Budget(e.to_string()))?;
+    // Rent is sized, like the module cache is filled, outside the
+    // transaction's budget but with the network's own cost parameters: for
+    // contract code the size includes the parsed module's memory.
+    let unmetered =
+        Budget::try_from_configs(u64::MAX, u64::MAX, cpu_params.clone(), mem_params.clone())
+            .map_err(|e| Failure::Budget(e.to_string()))?;
     let module_cache = module_cache(invocation, cpu_params, mem_params)?;
 
     let entries = invocation
@@ -55,7 +68,8 @@ pub fn invoke(invocation: &Invocation<'_>) -> Result<Output, Failure> {
                 None => None,
                 Some(live_until_ledger) => Some(TtlLedgerEntryMeta {
                     live_until_ledger,
-                    entry_size_for_rent: rent_size(&entry.xdr).ok_or(Failure::Rent(index))?,
+                    entry_size_for_rent: rent_size(&unmetered, &entry.xdr)
+                        .ok_or(Failure::Rent(index))?,
                 }),
             };
             Ok((Some(entry.xdr.as_slice()), ttl))
@@ -75,7 +89,7 @@ pub fn invoke(invocation: &Invocation<'_>) -> Result<Output, Failure> {
     };
 
     let mut diagnostics = Vec::new();
-    let output = invoke_host_function(
+    let invoked = invoke_host_function(
         &budget,
         true,
         invocation.host_function.as_slice(),
@@ -89,42 +103,149 @@ pub fn invoke(invocation: &Invocation<'_>) -> Result<Output, Failure> {
         &mut diagnostics,
         None,
         Some(module_cache),
-    )
-    .map_err(|e| Failure::Start(e.to_string()))?;
+    );
 
-    let result = match &output.encoded_invoke_result {
-        Ok(value) => Ok(value.clone()),
-        Err(error) => Err(match ScError::try_from(error) {
-            Ok(error) => Some(error.to_xdr(Limits::none()).map_err(xdr)?),
-            Err(_) => None,
-        }),
+    // The host decodes its inputs against the transaction's budget before it
+    // runs anything, so it can fail there too. stellar-core (the bridge's
+    // `run_invoke_and_build_output`, checked 2026-11-11) treats that exactly
+    // like a failure inside the invocation: `success: false` with the budget
+    // consumed so far. Only an internal error is not a transaction result.
+    let (result, changes, contract_events) = match invoked {
+        Ok(output) => match output.encoded_invoke_result {
+            Ok(value) => {
+                let changes = output
+                    .ledger_changes
+                    .into_iter()
+                    .map(|change| Change {
+                        read_only: change.read_only,
+                        rent: rent_change(&change),
+                        new_value: change.encoded_new_value,
+                    })
+                    .collect();
+                (Ok(value), changes, output.encoded_contract_events)
+            }
+            Err(error) => (Err(failure(&error)?), Vec::new(), Vec::new()),
+        },
+        Err(error) => (Err(failure(&error)?), Vec::new(), Vec::new()),
     };
+
     Ok(Output {
         result,
-        changes: output
-            .ledger_changes
-            .into_iter()
-            .map(|change| Change {
-                read_only: change.read_only,
-                new_value: change.encoded_new_value,
-            })
-            .collect(),
-        contract_events: output.encoded_contract_events,
+        changes,
+        contract_events,
         diagnostics: diagnostics
             .iter()
             .map(|event| event.to_xdr(Limits::none()).map_err(xdr))
             .collect::<Result<_, _>>()?,
-        cpu_insns: budget.get_cpu_insns_consumed().unwrap_or_default(),
-        mem_bytes: budget.get_mem_bytes_consumed().unwrap_or_default(),
+        cpu_insns: budget
+            .get_cpu_insns_consumed()
+            .map_err(|e| Failure::Budget(e.to_string()))?,
+        mem_bytes: budget
+            .get_mem_bytes_consumed()
+            .map_err(|e| Failure::Budget(e.to_string()))?,
     })
+}
+
+/// The `ScError` behind a failed run, or [`Failure::Start`] for the internal
+/// errors stellar-core refuses to record as a result.
+fn failure(error: &HostError) -> Result<Option<Vec<u8>>, Failure> {
+    if error.error.is_code(ScErrorCode::InternalError)
+        && !error.error.is_type(ScErrorType::Contract)
+    {
+        return Err(Failure::Start(error.to_string()));
+    }
+    match ScError::try_from(error) {
+        Ok(error) => Ok(Some(error.to_xdr(Limits::none()).map_err(xdr)?)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The rent inputs of one change, when the host charges rent for it.
+fn rent_change(
+    change: &super::soroban_env_host::e2e_invoke::LedgerEntryChange,
+) -> Option<RentChange> {
+    let rent = extract_rent_changes(std::slice::from_ref(change)).pop()?;
+    Some(RentChange {
+        is_persistent: rent.is_persistent,
+        is_code_entry: rent.is_code_entry,
+        old_size_bytes: rent.old_size_bytes,
+        new_size_bytes: rent.new_size_bytes,
+        old_live_until_ledger: rent.old_live_until_ledger,
+        new_live_until_ledger: rent.new_live_until_ledger,
+    })
+}
+
+/// The fees stellar-core computes around one invocation, with the host's own
+/// `fees` module: `TransactionFrame::computeSorobanResourceFee` and the
+/// bridge's rent fee (checked 2026-11-11 against protocols 29 and 30).
+pub fn fees(request: &FeeRequest) -> Fees {
+    let settings = &request.settings;
+    let (non_refundable, refundable) = compute_transaction_resource_fee(
+        &TransactionResources {
+            instructions: request.instructions,
+            disk_read_entries: request.disk_read_entries,
+            write_entries: request.write_entries,
+            disk_read_bytes: request.disk_read_bytes,
+            write_bytes: request.write_bytes,
+            contract_events_size_bytes: request.contract_events_size_bytes,
+            transaction_size_bytes: request.transaction_size_bytes,
+        },
+        &FeeConfiguration {
+            fee_per_instruction_increment: settings.fee_per_instruction_increment,
+            fee_per_disk_read_entry: settings.fee_per_disk_read_entry,
+            fee_per_write_entry: settings.fee_per_write_entry,
+            fee_per_disk_read_1kb: settings.fee_per_disk_read_1kb,
+            fee_per_write_1kb: settings.fee_per_write_1kb,
+            fee_per_historical_1kb: settings.fee_per_historical_1kb,
+            fee_per_contract_event_1kb: settings.fee_per_contract_event_1kb,
+            fee_per_transaction_size_1kb: settings.fee_per_transaction_size_1kb,
+        },
+    );
+    let fee_per_rent_1kb = compute_rent_write_fee_per_1kb(
+        settings.average_state_size_bytes,
+        &RentWriteFeeConfiguration {
+            state_target_size_bytes: settings.state_target_size_bytes,
+            rent_fee_1kb_state_size_low: settings.rent_fee_1kb_state_size_low,
+            rent_fee_1kb_state_size_high: settings.rent_fee_1kb_state_size_high,
+            state_size_rent_fee_growth_factor: settings.state_size_rent_fee_growth_factor,
+        },
+    );
+    let changes: Vec<LedgerEntryRentChange> = request
+        .rent_changes
+        .iter()
+        .map(|change| LedgerEntryRentChange {
+            is_persistent: change.is_persistent,
+            is_code_entry: change.is_code_entry,
+            old_size_bytes: change.old_size_bytes,
+            new_size_bytes: change.new_size_bytes,
+            old_live_until_ledger: change.old_live_until_ledger,
+            new_live_until_ledger: change.new_live_until_ledger,
+        })
+        .collect();
+    let rent = compute_rent_fee(
+        &changes,
+        &RentFeeConfiguration {
+            fee_per_write_1kb: settings.fee_per_write_1kb,
+            fee_per_rent_1kb,
+            fee_per_write_entry: settings.fee_per_write_entry,
+            persistent_rent_rate_denominator: settings.persistent_rent_rate_denominator,
+            temporary_rent_rate_denominator: settings.temporary_rent_rate_denominator,
+        },
+        request.ledger_sequence,
+    );
+    Fees {
+        non_refundable,
+        refundable,
+        rent,
+    }
 }
 
 /// The size the host charges rent on: the encoded entry, plus the parsed
 /// module's memory for contract code.
-fn rent_size(entry_xdr: &[u8]) -> Option<u32> {
+fn rent_size(budget: &Budget, entry_xdr: &[u8]) -> Option<u32> {
     let entry = LedgerEntry::from_xdr(entry_xdr, Limits::none()).ok()?;
     let size = u32::try_from(entry_xdr.len()).ok()?;
-    entry_size_for_rent(&Budget::default(), &entry, size).ok()
+    entry_size_for_rent(budget, &entry, size).ok()
 }
 
 /// Pre-parse every contract in the footprint, the way stellar-core does.

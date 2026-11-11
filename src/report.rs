@@ -126,8 +126,25 @@ pub struct FootprintReport {
     /// Entries that were archived when the transaction ran and not restored
     /// by it.
     pub archived: Vec<String>,
+    /// The archived entries whose TTL back then is lost: that they were
+    /// archived is taken from the network's `ENTRY_ARCHIVED` result, so a
+    /// match on that result is assumed rather than reproduced.
+    pub archived_inferred: Vec<String>,
+    /// Entries that changed since the transaction and were rebuilt, from
+    /// ledger metadata, as the transaction saw them.
+    pub rebuilt: Vec<String>,
+    /// Why the entries still listed in `drifted` could not be rebuilt.
+    pub rebuild_note: Option<String>,
+    /// Entries the RPC returned without a `lastModifiedLedgerSeq`: whether
+    /// they changed since the transaction is unknown.
+    pub drift_unknown: Vec<String>,
+    /// Classic entries the RPC returned without their extension; they were
+    /// replayed with an empty one and may be smaller than they were.
+    pub ext_missing: Vec<String>,
     /// Network settings modified at or after the transaction's ledger.
     pub config_drifted: Vec<String>,
+    /// Network settings the RPC returned without a `lastModifiedLedgerSeq`.
+    pub config_drift_unknown: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -143,6 +160,9 @@ pub enum TtlDriftReason {
     ExtendedSince,
     /// The entry was live for the transaction and has been archived since.
     ArchivedSince,
+    /// The transaction listed the entry for restoration; something else has
+    /// restored it since.
+    RestoredSince,
 }
 
 impl TtlDriftReason {
@@ -150,6 +170,7 @@ impl TtlDriftReason {
         match self {
             TtlDriftReason::ExtendedSince => "TTL extended since",
             TtlDriftReason::ArchivedSince => "archived since",
+            TtlDriftReason::RestoredSince => "restored since",
         }
     }
 }
@@ -159,6 +180,7 @@ impl From<TtlDrift> for TtlDriftReason {
         match drift {
             TtlDrift::ExtendedSince => TtlDriftReason::ExtendedSince,
             TtlDrift::ArchivedSince => TtlDriftReason::ArchivedSince,
+            TtlDrift::RestoredSince => TtlDriftReason::RestoredSince,
         }
     }
 }

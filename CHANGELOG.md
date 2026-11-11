@@ -21,6 +21,15 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 - The footprint report separates value drift, TTL drift, archived entries and
   network-settings drift.
 - `--json` documents carry `schemaVersion: 1`.
+- Entries that changed since the transaction are rebuilt from ledger metadata
+  (`getLedgers`), so busy contracts such as price oracles replay as a match.
+  The report lists them (`footprint.rebuilt`) and says why any could not be
+  rebuilt (`footprint.rebuildNote`).
+- stellar-core's refundable-fee check (`insufficient refundable fee`), the
+  disk-read byte limit and the per-entry size limits are mirrored.
+- New `footprint` fields in JSON: `rebuilt`, `rebuildNote`, `archivedInferred`,
+  `driftUnknown`, `extMissing`, `configDriftUnknown`; and the TTL drift reason
+  `restoredSince`.
 - `sororewind --version` shows the protocols and host versions it replays.
 
 ### Changed
@@ -33,6 +42,21 @@ an incompatible change to the JSON bumps its `schemaVersion`.
   "diverged".
 
 ### Fixed
+
+- A transaction in the ledger that upgraded the protocol or the base reserve
+  is replayed under the previous values, as the network ran it.
+- A host failure while decoding its inputs is replayed as `trapped` or
+  `resource limit exceeded` instead of aborting the run.
+- Only entries actually found archived are restored; an archived contract's
+  code being restored is no longer pre-parsed for free.
+- An entry listed for restoration and restored by a later transaction is
+  replayed as archived-and-restored and reported as TTL drift.
+- `ENTRY_ARCHIVED` blames the entry the network named; a liveness taken from
+  the network's result is reported as inferred.
+- Missing `lastModifiedLedgerSeq` and `extXdr` are reported instead of being
+  read as "not drifted" and "no extension". The close time comes from the
+  ledger header.
+- A contract error named from code that changed after the transaction says so.
 
 - The invoker of a host call is the operation's source account when it has
   one.

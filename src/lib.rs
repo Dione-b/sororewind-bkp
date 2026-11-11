@@ -5,7 +5,7 @@
 //! stage:
 //!
 //! ```text
-//! fetch (rpc, transport) → decode (tx) → reconstruct (state) → replay (replay)
+//! fetch (rpc, transport) → decode (tx) → reconstruct (state, history) → replay (replay)
 //!       → narrate (story, spec) → report (report, render)
 //! ```
 //!
@@ -22,6 +22,7 @@ pub mod discover;
 pub mod display;
 pub mod error;
 pub mod hash;
+pub mod history;
 pub mod host;
 pub mod network;
 pub mod pipeline;

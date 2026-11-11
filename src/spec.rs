@@ -132,6 +132,16 @@ fn leb128_u32(bytes: &[u8]) -> Option<(u32, usize)> {
     None
 }
 
+/// A contract's WASM as the ledger has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractWasm {
+    pub wasm: Vec<u8>,
+    /// The contract's instance or code was written at or after the
+    /// transaction's ledger (and could not be rebuilt): it may have been
+    /// upgraded since, so this may not be the code the transaction ran.
+    pub changed_since: bool,
+}
+
 /// Fetch the WASM behind a contract: its instance entry tells us the code
 /// hash, the code entry gives us the bytes. Both are usually already in the
 /// footprint; when they are not, they are one `getLedgerEntries` away each.
@@ -139,13 +149,13 @@ pub async fn contract_wasm(
     rpc: &RpcClient,
     state: &Reconstructed,
     contract_id: &ContractId,
-) -> Result<Vec<u8>> {
+) -> Result<ContractWasm> {
     let instance_key = LedgerKey::ContractData(LedgerKeyContractData {
         contract: ScAddress::Contract(contract_id.clone()),
         key: ScVal::LedgerKeyContractInstance,
         durability: ContractDataDurability::Persistent,
     });
-    let instance = fetch_entry(rpc, state, &instance_key).await?;
+    let (instance, instance_changed) = fetch_entry(rpc, state, &instance_key).await?;
 
     let LedgerEntryData::ContractData(data) = instance.data else {
         return Err(RewindError::ContractCode {
@@ -165,28 +175,34 @@ pub async fn contract_wasm(
     };
 
     let code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash });
-    let code = fetch_entry(rpc, state, &code_key).await?;
+    let (code, code_changed) = fetch_entry(rpc, state, &code_key).await?;
     let LedgerEntryData::ContractCode(code) = code.data else {
         return Err(RewindError::ContractCode {
             reason: "the contract's code entry does not hold contract code",
         });
     };
-    Ok(code.code.to_vec())
+    Ok(ContractWasm {
+        wasm: code.code.to_vec(),
+        changed_since: instance_changed || code_changed,
+    })
 }
 
 /// Look a ledger entry up in the reconstructed footprint first, and only go to
-/// the network when the transaction never touched it.
+/// the network when the transaction never touched it. Also says whether the
+/// entry was written at or after the transaction's ledger.
 async fn fetch_entry(
     rpc: &RpcClient,
     state: &Reconstructed,
     key: &LedgerKey,
-) -> Result<LedgerEntry> {
+) -> Result<(LedgerEntry, bool)> {
     let key_xdr = codec::encode(key, "a ledger key")?;
+    let tx_ledger = state.ledger_info.sequence_number;
 
     if let Some(slot) = state.slot(&key_xdr) {
-        return slot.entry.clone().ok_or(RewindError::ContractCode {
+        let entry = slot.entry.clone().ok_or(RewindError::ContractCode {
             reason: "the entry is no longer on the ledger",
-        });
+        })?;
+        return Ok((entry, slot.value_drifted(tx_ledger)));
     }
 
     let keys = [codec::b64_encode(&key_xdr)];
@@ -198,7 +214,8 @@ async fn fetch_entry(
             .ok_or(RewindError::ContractCode {
                 reason: "the RPC has no such entry; the contract may have been archived",
             })?;
-    codec::assemble_entry(&raw)
+    let changed = raw.last_modified_ledger_seq.is_some_and(|m| m >= tx_ledger);
+    Ok((codec::assemble_entry(&raw)?, changed))
 }
 
 #[cfg(test)]

@@ -41,7 +41,9 @@ pub fn encode<T: WriteXdr>(value: &T, what: &'static str) -> Result<Vec<u8>> {
 pub fn assemble_entry(raw: &RawLedgerEntry) -> Result<LedgerEntry> {
     let data: LedgerEntryData = decode(&raw.xdr, "a ledger entry body")?;
 
-    // Older RPCs omit the field; an absent extension means `V0`.
+    // Older RPCs omit the field; an absent extension is replayed as `V0`,
+    // and `state` reports the classic entries it may have shrunk. Likewise an
+    // absent sequence is `0` for the host, and reported as unknown drift.
     let ext = match raw.ext_xdr.as_deref() {
         Some(text) if !text.is_empty() => decode(text, "a ledger entry extension")?,
         _ => LedgerEntryExt::V0,

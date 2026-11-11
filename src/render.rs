@@ -185,6 +185,26 @@ fn fidelity(out: &mut impl Write, report: &Report, p: &Palette) -> fmt::Result {
             ))
         )?;
     }
+    if !report.footprint.config_drift_unknown.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            p.yellow(&format!(
+                "⚠ the RPC does not say when these network settings last changed: {}",
+                report.footprint.config_drift_unknown.join(", ")
+            ))
+        )?;
+    }
+    if !report.footprint.archived_inferred.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            p.dim(
+                "  the archived entry's TTL at the time is lost; that it was archived is taken \
+                 from the network's result, not reproduced"
+            )
+        )?;
+    }
     writeln!(out)
 }
 
@@ -319,11 +339,16 @@ fn drift(out: &mut impl Write, report: &Report, p: &Palette, detail: Detail) -> 
         out,
         "{}",
         p.dim(&format!(
-            "footprint {} entries · {} drifted · {} ttl-drifted · {} missing · prng seed {}",
+            "footprint {} entries · {} drifted · {} ttl-drifted · {} missing{} · prng seed {}",
             f.entries,
             f.drifted.len(),
             f.ttl_drifted.len(),
             f.missing,
+            if f.rebuilt.is_empty() {
+                String::new()
+            } else {
+                format!(" · {} rebuilt", f.rebuilt.len())
+            },
             match report.prng_seed {
                 PrngSeed::Derived => "derived",
                 PrngSeed::Fixed => "fixed (apply order unknown)",
@@ -344,6 +369,8 @@ fn drift(out: &mut impl Write, report: &Report, p: &Palette, detail: Detail) -> 
         ("archived:", &f.archived),
         ("drifted:", &f.drifted),
         ("ttl drifted:", &ttl_drifted),
+        ("drift unknown:", &f.drift_unknown),
+        ("extension missing:", &f.ext_missing),
     ] {
         for entry in entries.iter().take(limit) {
             writeln!(out, "  {} {entry}", p.yellow(label))?;
@@ -357,6 +384,15 @@ fn drift(out: &mut impl Write, report: &Report, p: &Palette, detail: Detail) -> 
                     entries.len() - limit
                 ))
             )?;
+        }
+    }
+    if let Some(note) = &f.rebuild_note {
+        writeln!(out, "  {}", p.yellow(note))?;
+    }
+    // What was rebuilt is the replay working as intended: detail, not a warning.
+    if detail >= Detail::Budget {
+        for entry in &f.rebuilt {
+            writeln!(out, "  {} {entry}", p.dim("rebuilt from ledger metadata:"))?;
         }
     }
     writeln!(out)

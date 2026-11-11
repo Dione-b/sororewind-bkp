@@ -167,16 +167,24 @@ exit code and read the details from the document.
 A divergence (exit `2`) means the local run did not reproduce what the network
 recorded. These are the known causes:
 
-- **The state moved on.** The RPC only serves the *current* value of a ledger
-  entry, not its value when the transaction ran. If an entry in the footprint
-  was written after that, the replay runs against different data. The
-  footprint section lists the entries that changed, so you can tell. Replay
-  soon after the failure for the best odds; contracts that rewrite the same
-  entry every few ledgers, such as price oracles, will rarely match.
-- **Checks stellar-core makes around the host.** The refundable-fee check
-  (`insufficient refundable fee`), the disk-read byte limit for classic
-  entries, and per-entry size limits need fee state the replay does not
-  rebuild. Transactions that failed on one of these replay as if they had not.
+- **The state moved on, and could not be rebuilt.** The RPC only serves the
+  *current* value of a ledger entry. Entries written after the transaction
+  are rebuilt from the ledger metadata the RPC keeps (`footprint … N rebuilt`,
+  listed with `-v`; `footprint.rebuilt` in JSON), which is what lets
+  contracts that rewrite the same entry every few ledgers, such as price
+  oracles, replay as a match. An entry stays `drifted`, with the reason, when
+  the metadata is outside the RPC's retention window (about a week), when the
+  RPC keeps none, or when the entry's history is too long to follow. TTL
+  extensions and deletions are only seen in the 16 ledgers after the
+  transaction; network settings are not rebuilt.
+- **Rent priced from a moving window.** The checks stellar-core makes around
+  the host are mirrored: archived entries, per-entry size limits, disk-read
+  and write bytes, events size, and the refundable fee (`insufficient
+  refundable fee`). The rent part of that fee depends on the network's
+  state-size window, which is resampled every few minutes; the replay uses
+  the current one. That only matters within a few stroops of the limit, and
+  the report then lists `LiveSorobanStateSizeWindow` among the changed
+  settings.
 - **Unknown apply order.** The host's random-number seed is derived the way the
   network derives it, from the ledger's transaction set and the transaction's
   position in it. If the RPC does not report that position, a fixed seed is
@@ -279,7 +287,9 @@ Each fixture comes from a `find_failed` category:
 
 | Fixture | How to find one |
 |---------|-----------------|
-| `auth-error`, `budget-error`, `contract-error`, `storage-error` | A transaction of that category. For `budget-error`, pick one whose result is `resource limit exceeded`: `insufficient refundable fee` does not replay (see [Why a replay can diverge](#why-a-replay-can-diverge)). |
+| `auth-error`, `budget-error`, `contract-error`, `storage-error` | A transaction of that category. For `budget-error`, pick one whose result is `resource limit exceeded`. |
+| `refundable-fee` | A `budget-error` whose result is `insufficient refundable fee`. |
+| `rebuilt-entry` | A failure of a contract that rewrites its entries every few ledgers (an oracle's `write_prices`, for example) whose replay reports `N rebuilt`. |
 | `auth-check-auth` | An `auth-error` whose call tree, from `sororewind <TX_HASH>`, shows a `__check_auth` call: a custom account contract rejected the signature. |
 | `mainnet-*` | A mainnet transaction, recorded with `--network mainnet`, that keeps the older embedded host covered while mainnet runs the previous protocol. |
 

@@ -73,14 +73,30 @@ struct GetLedgerEntriesResponse {
     entries: Vec<RawLedgerEntry>,
 }
 
-/// One ledger from `getLedgers`. Only the header is kept; the response's
-/// `metadataXdr` (the full `LedgerCloseMeta`) is skipped by the deserializer.
+/// One ledger from `getLedgers`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawLedger {
     pub sequence: u32,
-    pub ledger_close_time: String,
     pub header_xdr: String,
+    /// The full `LedgerCloseMeta`, as a live RPC sends it.
+    #[serde(default)]
+    pub metadata_xdr: Option<String>,
+    /// What a fixture keeps of `metadataXdr`: the changes to the entries it
+    /// recorded. Not an RPC field; see `transport` and `history`.
+    #[serde(default, rename = "sororewindChanges")]
+    pub changes: Option<Vec<RawChangeGroup>>,
+}
+
+/// The ledger entry changes one transaction made in one phase of a ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawChangeGroup {
+    pub phase: crate::history::Phase,
+    /// Zero-based apply position of the transaction in its ledger.
+    pub tx: u32,
+    /// `LedgerEntryChanges`, base64 XDR.
+    pub changes_xdr: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,18 +220,25 @@ impl RpcClient {
 
     /// Fetch exactly one ledger; `None` when the RPC no longer has it.
     pub async fn get_ledger(&self, sequence: u32) -> Result<Option<RawLedger>> {
+        Ok(self
+            .get_ledgers(sequence, 1)
+            .await?
+            .into_iter()
+            .find(|ledger| ledger.sequence == sequence))
+    }
+
+    /// Fetch up to `limit` consecutive ledgers starting at `start`, metadata
+    /// included. The RPC returns fewer when it has not closed them yet.
+    pub async fn get_ledgers(&self, start: u32, limit: u32) -> Result<Vec<RawLedger>> {
         // The limit lives under `pagination`; at the top level it is ignored
         // and the RPC falls back to 50 ledgers (~14 MB of metadata).
         let response: GetLedgersResponse = self
             .call(
                 "getLedgers",
-                json!({ "startLedger": sequence, "pagination": { "limit": 1 } }),
+                json!({ "startLedger": start, "pagination": { "limit": limit } }),
             )
             .await?;
-        Ok(response
-            .ledgers
-            .into_iter()
-            .find(|ledger| ledger.sequence == sequence))
+        Ok(response.ledgers)
     }
 
     /// One page of transactions, oldest first. Start with `start_ledger`, then
@@ -318,7 +341,7 @@ mod tests {
             .on("getNetwork", &json!({"result": {"passphrase": "Test SDF Network ; September 2015"}}))
             .on("getTransaction", &json!({"result": {"status": "NOT_FOUND"}}))
             .on("getLedgers", &json!({"result": {"ledgers": [
-                {"sequence": 7, "ledgerCloseTime": "100", "headerXdr": "AAAA", "metadataXdr": "ignored"}
+                {"sequence": 7, "ledgerCloseTime": "100", "headerXdr": "AAAA", "metadataXdr": "kept"}
             ]}}));
         let calls = transport.calls();
         let rpc = RpcClient::new(transport);
@@ -333,8 +356,13 @@ mod tests {
             TxStatus::NotFound
         );
         assert_eq!(
-            rpc.get_ledger(7).await.unwrap().unwrap().ledger_close_time,
-            "100"
+            rpc.get_ledger(7)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata_xdr
+                .as_deref(),
+            Some("kept")
         );
         assert!(rpc.get_ledger(8).await.unwrap().is_none());
 

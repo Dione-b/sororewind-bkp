@@ -291,6 +291,46 @@ pub fn config_entry(id: ConfigSettingId, last_modified: u32) -> RawLedgerEntry {
                 ..StateArchivalSettings::default()
             })
         }
+        ConfigSettingId::ContractLedgerCostV0 => ConfigSettingEntry::ContractLedgerCostV0(
+            stellar_xdr::ConfigSettingContractLedgerCostV0 {
+                fee_disk_read_ledger_entry: 6_250,
+                fee_write_ledger_entry: 10_000,
+                fee_disk_read1_kb: 1_786,
+                soroban_state_target_size_bytes: 3_000_000_000,
+                rent_fee1_kb_soroban_state_size_low: -17_000,
+                rent_fee1_kb_soroban_state_size_high: 10_000,
+                soroban_state_rent_fee_growth_factor: 5_000,
+                ..Default::default()
+            },
+        ),
+        ConfigSettingId::ContractLedgerCostExtV0 => ConfigSettingEntry::ContractLedgerCostExtV0(
+            stellar_xdr::ConfigSettingContractLedgerCostExtV0 {
+                tx_max_footprint_entries: 100,
+                fee_write1_kb: 3_500,
+            },
+        ),
+        ConfigSettingId::ContractHistoricalDataV0 => ConfigSettingEntry::ContractHistoricalDataV0(
+            stellar_xdr::ConfigSettingContractHistoricalDataV0 {
+                fee_historical1_kb: 16_235,
+            },
+        ),
+        ConfigSettingId::ContractBandwidthV0 => {
+            ConfigSettingEntry::ContractBandwidthV0(stellar_xdr::ConfigSettingContractBandwidthV0 {
+                fee_tx_size1_kb: 1_624,
+                ..Default::default()
+            })
+        }
+        ConfigSettingId::ContractMaxSizeBytes => ConfigSettingEntry::ContractMaxSizeBytes(131_072),
+        ConfigSettingId::ContractDataEntrySizeBytes => {
+            ConfigSettingEntry::ContractDataEntrySizeBytes(65_536)
+        }
+        ConfigSettingId::LiveSorobanStateSizeWindow => {
+            ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                vec![1_000_000_000u64, 1_000_000_002, 1_000_000_003]
+                    .try_into()
+                    .unwrap(),
+            )
+        }
         other => panic!("no test value for {other}"),
     };
     raw_entry(
@@ -299,7 +339,7 @@ pub fn config_entry(id: ConfigSettingId, last_modified: u32) -> RawLedgerEntry {
     )
 }
 
-/// The five settings `state::build_config` asks for, in request order.
+/// The settings `state::build_config` asks for, in request order.
 pub fn config_entries(last_modified: u32) -> Vec<Option<RawLedgerEntry>> {
     [
         ConfigSettingId::ContractCostParamsCpuInstructions,
@@ -307,6 +347,13 @@ pub fn config_entries(last_modified: u32) -> Vec<Option<RawLedgerEntry>> {
         ConfigSettingId::ContractComputeV0,
         ConfigSettingId::ContractEventsV0,
         ConfigSettingId::StateArchival,
+        ConfigSettingId::ContractLedgerCostV0,
+        ConfigSettingId::ContractLedgerCostExtV0,
+        ConfigSettingId::ContractHistoricalDataV0,
+        ConfigSettingId::ContractBandwidthV0,
+        ConfigSettingId::ContractMaxSizeBytes,
+        ConfigSettingId::ContractDataEntrySizeBytes,
+        ConfigSettingId::LiveSorobanStateSizeWindow,
     ]
     .into_iter()
     .map(|id| Some(config_entry(id, last_modified)))
@@ -467,6 +514,8 @@ pub fn decoded_tx() -> DecodedTx {
         source_account: account([1; 32]),
         host_function: host_function(),
         resources: resources(),
+        resource_fee: 0,
+        envelope_size: 0,
         auth: Vec::new(),
         restored_rw_indices: Vec::new(),
         onchain_result: InvokeHostFunctionResult::Trapped,
@@ -571,8 +620,7 @@ pub fn sample_report() -> Report {
                 entry: "contract data C…AAAA Balance (persistent)".to_string(),
                 reason: TtlDriftReason::ExtendedSince,
             }],
-            archived: Vec::new(),
-            config_drifted: Vec::new(),
+            ..FootprintReport::default()
         },
         prng_seed: PrngSeed::Derived,
         diagnostics: Diagnostics {

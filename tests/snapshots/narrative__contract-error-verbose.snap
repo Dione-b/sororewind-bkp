@@ -19,5 +19,4 @@ CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer(GB2YUAICRUQNA
 
 budget 907,402 / 1,033,991 cpu instructions · 23.6 KB / 40.0 MB memory
 network used 907,402 cpu instructions · 23.6 KB memory
-footprint 4 entries · 1 drifted · 0 ttl-drifted · 1 missing · prng seed derived
-  drifted: account GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC
+footprint 4 entries · 0 drifted · 0 ttl-drifted · 1 missing · prng seed derived

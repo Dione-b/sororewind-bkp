@@ -31,6 +31,12 @@ pub struct DecodedTx {
     pub source_account: AccountId,
     pub host_function: HostFunction,
     pub resources: SorobanResources,
+    /// The resource fee the transaction declared (`sorobanData.resourceFee`).
+    pub resource_fee: i64,
+    /// XDR size of the Soroban transaction's own envelope, signatures
+    /// included: what core charges the transaction-size fee on. For a
+    /// fee-bump that is the inner envelope.
+    pub envelope_size: u32,
     pub auth: Vec<SorobanAuthorizationEntry>,
     /// Indices into `resources.footprint.read_write` of entries the transaction
     /// asked the host to auto-restore. Empty for ordinary invocations.
@@ -91,10 +97,10 @@ pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
 
     // A fee-bump only changes who pays: the Soroban transaction is its inner
     // transaction, and that is what the host executes.
-    let (tx, fee_bump) = match envelope {
-        TransactionEnvelope::Tx(v1) => (v1.tx, false),
+    let (inner, fee_bump) = match envelope {
+        TransactionEnvelope::Tx(v1) => (v1, false),
         TransactionEnvelope::TxFeeBump(outer) => match outer.tx.inner_tx {
-            FeeBumpTransactionInnerTx::Tx(inner) => (inner.tx, true),
+            FeeBumpTransactionInnerTx::Tx(inner) => (inner, true),
         },
         TransactionEnvelope::TxV0(_) => {
             return Err(not_soroban(
@@ -103,6 +109,9 @@ pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
             ));
         }
     };
+    // A `TransactionEnvelope` is its four-byte type followed by the envelope.
+    let envelope_size = 4 + codec::encode(&inner, "the transaction envelope")?.len();
+    let tx = inner.tx;
     let Transaction {
         source_account: tx_source,
         operations,
@@ -160,6 +169,8 @@ pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
         source_account,
         host_function: invoke.host_function.clone(),
         resources: soroban_data.resources,
+        resource_fee: soroban_data.resource_fee,
+        envelope_size: u32::try_from(envelope_size).unwrap_or(u32::MAX),
         auth: invoke.auth.to_vec(),
         restored_rw_indices,
         onchain_result,

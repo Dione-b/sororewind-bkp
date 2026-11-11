@@ -8,20 +8,35 @@
 //!
 //! The host is only part of what decides an `InvokeHostFunctionResult`.
 //! stellar-core's `InvokeHostFunctionOpFrame` wraps it in checks of its own,
-//! and the ones that can be evaluated offline are mirrored here:
+//! which are mirrored here in core's order (checked 2026-11-11 against
+//! stellar-core's `InvokeHostFunctionOpFrame.cpp`, `MutableTransactionResult.cpp`
+//! and `TransactionFrame.cpp`; protocols 29 and 30 do not differ in any of
+//! them, so nothing is gated on the protocol yet):
 //!
-//! - *before* the host: an archived footprint entry that is not listed for
-//!   restoration fails the operation with `ENTRY_ARCHIVED`;
-//! - *host failure*: instructions or memory over the limit map to
+//! - *before* the host, per footprint entry in order:
+//!   - an archived entry that is not listed for restoration fails the
+//!     operation with `ENTRY_ARCHIVED`;
+//!   - contract code or data larger than the network's per-entry limit is
+//!     `RESOURCE_LIMIT_EXCEEDED`;
+//!   - classic entries and restored entries are read from disk, and their
+//!     bytes beyond the declared `diskReadBytes` are `RESOURCE_LIMIT_EXCEEDED`
+//!     (live Soroban entries are in memory since protocol 23, and free);
+//! - *host failure*, during the invocation or while the host decodes its
+//!   inputs: instructions or memory over the limit map to
 //!   `RESOURCE_LIMIT_EXCEEDED`, anything else to `TRAPPED`;
-//! - *after a successful host run*: bytes written beyond the declared
-//!   `writeBytes`, or events plus return value beyond the network's
-//!   `txMaxContractEventsSizeBytes`, are `RESOURCE_LIMIT_EXCEEDED`.
+//! - *after a successful host run*:
+//!   - a written entry over the per-entry limit, bytes written beyond the
+//!     declared `writeBytes`, or events plus return value beyond the
+//!     network's `txMaxContractEventsSizeBytes`, are `RESOURCE_LIMIT_EXCEEDED`;
+//!   - rent, then rent plus the events fee, beyond the refundable part of the
+//!     declared `resourceFee` is `INSUFFICIENT_REFUNDABLE_FEE`. The fees are
+//!     computed by the host's own `fees` module from the network's settings.
 //!
-//! Not mirrored: the refundable-fee check (`INSUFFICIENT_REFUNDABLE_FEE`),
-//! the disk-read byte limit for classic entries, and per-entry size limits.
-//! Those need fee state and settings the replay does not reconstruct; such a
-//! transaction shows up as a divergence.
+//! The rent fee is priced from the network's state-size window, which is
+//! resampled every few minutes; the replay uses the current window. Its
+//! average moves slowly, so this only matters for a transaction within a few
+//! stroops of its refundable fee, and the report flags the window as drifted
+//! whenever that fee decided either result.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -29,13 +44,13 @@ use stellar_xdr::{
     ContractCodeEntryExt, ContractEvent, ContractEventBody, ContractEventType, ContractEventV0,
     DiagnosticEvent, ExtensionPoint, Hash, InvokeHostFunctionResult,
     InvokeHostFunctionSuccessPreImage, LedgerEntryData, LedgerKey, Limits, ReadXdr, ScBytes,
-    ScError, ScErrorCode, ScString, ScSymbol, ScVal, ScVec, StringM, WriteXdr,
+    ScError, ScErrorCode, ScString, ScSymbol, ScVal, ScVec, StringM,
 };
 
 use crate::codec;
 use crate::display;
 use crate::error::{Result, RewindError};
-use crate::host::{self, Change, ContractCode, Invocation};
+use crate::host::{self, Change, ContractCode, FeeRequest, Fees, Invocation};
 use crate::state::{FootprintSlot, LedgerContext, Reconstructed};
 use crate::tx::DecodedTx;
 
@@ -187,11 +202,10 @@ pub fn replay(
     };
 
     // stellar-core loads the footprint before it invokes the host, and gives
-    // up at the first archived entry.
-    if let Some(slot) = state.slots.iter().find(|slot| slot.archived()) {
-        let (error, event) = archived_entry_error(slot);
+    // up at the first entry it cannot take.
+    if let Some((result, error, event)) = footprint_checks(tx, state)? {
         return Ok(ReplayOutcome {
-            result: InvokeHostFunctionResult::EntryArchived,
+            result,
             error: Some(error),
             diagnostics: vec![event],
             budget: budget_use,
@@ -205,12 +219,13 @@ pub fn replay(
             ledger.protocol
         ))
     })?;
+    let restored_rw_indices = state.restored_rw_indices();
     let invocation = Invocation {
         host_function: tx.encoded_host_function()?,
         resources: tx.encoded_resources()?,
         source_account: tx.encoded_source_account()?,
         auth: tx.encoded_auth()?,
-        restored_rw_indices: &tx.restored_rw_indices,
+        restored_rw_indices: &restored_rw_indices,
         ledger: state.ledger_info.clone(),
         entries: state.encoded_entries()?,
         prng_seed: seed,
@@ -221,7 +236,7 @@ pub fn replay(
             &state.config.mem_cost_params,
             "the memory cost parameters",
         )?,
-        contracts: contracts(state),
+        contracts: contracts(state)?,
     };
     let output = host.invoke(&invocation).map_err(|failure| match failure {
         host::Failure::Xdr(e) => RewindError::Replay(format!(
@@ -235,8 +250,9 @@ pub fn replay(
             RewindError::Replay(format!("could not set up the module cache: {e}"))
         }
         host::Failure::Start(e) => RewindError::Replay(format!(
-            "the host refused to start (this usually means the ledger state is inconsistent \
-             with the transaction): {e}"
+            "the host failed with an internal error, which the network would not have recorded \
+             as a result (this usually means the ledger state is inconsistent with the \
+             transaction): {e}"
         )),
         host::Failure::Rent(index) => RewindError::Replay(format!(
             "could not size {} for rent",
@@ -267,8 +283,25 @@ pub fn replay(
             let checks = PostHostChecks {
                 write_bytes_limit: u64::from(tx.resources.write_bytes),
                 events_size_limit: u64::from(state.config.tx_max_contract_events_size_bytes),
+                sizes: SizeLimits::of(state),
             };
-            match checks.run(&output.changes, &output.contract_events, return_value) {
+            let failed = match checks.run(&output.changes, &output.contract_events, return_value) {
+                Err(failed) => Some(failed),
+                Ok(events_size) => {
+                    let request = fee_request(tx, state, ledger, &output.changes, events_size);
+                    refundable_fee_check(
+                        tx.resource_fee,
+                        // Before apply, core prices the declared resources
+                        // with no events at all.
+                        &host.fees(&FeeRequest {
+                            contract_events_size_bytes: 0,
+                            ..request.clone()
+                        }),
+                        &host.fees(&request),
+                    )
+                }
+            };
+            match failed {
                 None => (
                     InvokeHostFunctionResult::Success(success_hash(
                         return_value,
@@ -276,9 +309,9 @@ pub fn replay(
                     )?),
                     None,
                 ),
-                Some((error, event)) => {
+                Some((result, error, event)) => {
                     diagnostics.push(event);
-                    (InvokeHostFunctionResult::ResourceLimitExceeded, Some(error))
+                    (result, Some(error))
                 }
             }
         }
@@ -291,6 +324,168 @@ pub fn replay(
         budget: budget_use,
         prng_seed,
     })
+}
+
+/// A check stellar-core makes around the host, failed: the result it records
+/// and the diagnostic it emits.
+type Failed = (InvokeHostFunctionResult, ScError, DiagnosticEvent);
+
+fn limit_exceeded(message: &str, used: u64, limit: u64) -> Failed {
+    let (error, event) = core_error(
+        ScError::Budget(ScErrorCode::ExceededLimit),
+        message,
+        vec![ScVal::U64(used), ScVal::U64(limit)],
+    );
+    (
+        InvokeHostFunctionResult::ResourceLimitExceeded,
+        error,
+        event,
+    )
+}
+
+/// The network's per-entry size limits (`validateContractLedgerEntry`).
+#[derive(Debug, Clone, Copy)]
+struct SizeLimits {
+    contract_code: u64,
+    contract_data: u64,
+}
+
+impl SizeLimits {
+    fn of(state: &Reconstructed) -> Self {
+        Self {
+            contract_code: u64::from(state.config.max_contract_size_bytes),
+            contract_data: u64::from(state.config.max_contract_data_entry_size_bytes),
+        }
+    }
+
+    fn check(&self, entry: &LedgerEntryData, size: u64) -> Option<Failed> {
+        match entry {
+            LedgerEntryData::ContractCode(_) if size > self.contract_code => Some(limit_exceeded(
+                "Wasm size exceeds network config maximum contract size",
+                size,
+                self.contract_code,
+            )),
+            LedgerEntryData::ContractData(_) if size > self.contract_data => Some(limit_exceeded(
+                "ContractData size exceeds network config maximum size",
+                size,
+                self.contract_data,
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// stellar-core's `addReads`: walk the footprint in order and fail at the
+/// first entry that is archived, too large, or pushes the bytes read from
+/// disk over what the transaction declared.
+fn footprint_checks(tx: &DecodedTx, state: &Reconstructed) -> Result<Option<Failed>> {
+    let sizes = SizeLimits::of(state);
+    let disk_read_limit = u64::from(tx.resources.disk_read_bytes);
+    let mut disk_read = 0u64;
+
+    for slot in &state.slots {
+        if slot.archived() {
+            let (error, event) = archived_entry_error(slot);
+            return Ok(Some((
+                InvokeHostFunctionResult::EntryArchived,
+                error,
+                event,
+            )));
+        }
+        let Some(entry) = slot.entry.as_ref().filter(|_| !slot.missing()) else {
+            continue;
+        };
+        let size = codec::encode(entry, "a footprint entry")?.len() as u64;
+        if let Some(failed) = sizes.check(&entry.data, size) {
+            return Ok(Some(failed));
+        }
+        // Since protocol 23 live Soroban entries are served from memory; only
+        // classic entries and restored ones are disk reads.
+        let soroban = matches!(
+            slot.key,
+            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
+        );
+        if !soroban || slot.restored() {
+            disk_read += size;
+            if disk_read > disk_read_limit {
+                return Ok(Some(limit_exceeded(
+                    "operation byte-read resources exceeds amount specified",
+                    disk_read,
+                    disk_read_limit,
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// What the transaction declared and what the run produced, as the fee
+/// computation wants it (`TransactionFrame::computeSorobanResourceFee`).
+fn fee_request(
+    tx: &DecodedTx,
+    state: &Reconstructed,
+    ledger: &LedgerContext,
+    changes: &[Change],
+    events_size: u64,
+) -> FeeRequest {
+    let footprint = &tx.resources.footprint;
+    let classic = footprint
+        .read_only
+        .iter()
+        .chain(footprint.read_write.iter())
+        .filter(|key| !matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)))
+        .count();
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    FeeRequest {
+        instructions: tx.resources.instructions,
+        // Classic entries, plus every entry listed for restoration: archived
+        // entries are the only Soroban entries read from disk.
+        disk_read_entries: count(classic + tx.restored_rw_indices.len()),
+        write_entries: count(footprint.read_write.len()),
+        disk_read_bytes: tx.resources.disk_read_bytes,
+        write_bytes: tx.resources.write_bytes,
+        contract_events_size_bytes: u32::try_from(events_size).unwrap_or(u32::MAX),
+        transaction_size_bytes: tx.envelope_size,
+        rent_changes: changes.iter().filter_map(|change| change.rent).collect(),
+        ledger_sequence: ledger.sequence,
+        settings: state.config.fees,
+    }
+}
+
+/// `RefundableFeeTracker::consumeRefundableSorobanResources`: the refundable
+/// part of the declared resource fee must cover rent, and then rent plus the
+/// events fee.
+fn refundable_fee_check(declared: i64, pre_apply: &Fees, consumed: &Fees) -> Option<Failed> {
+    let insufficient = |message: &str, needed: i64, available: i64| {
+        // core hands both amounts to `makeU64SCVal`.
+        let (error, event) = core_error(
+            ScError::Budget(ScErrorCode::ExceededLimit),
+            message,
+            vec![ScVal::U64(needed as u64), ScVal::U64(available as u64)],
+        );
+        Some((
+            InvokeHostFunctionResult::InsufficientRefundableFee,
+            error,
+            event,
+        ))
+    };
+    let refundable = declared.saturating_sub(pre_apply.non_refundable);
+    if refundable < consumed.rent {
+        return insufficient(
+            "refundable resource fee was not sufficient to cover the ledger storage rent: {} > {}",
+            consumed.rent,
+            refundable,
+        );
+    }
+    if refundable < consumed.rent.saturating_add(consumed.refundable) {
+        return insufficient(
+            "refundable resource fee was not sufficient to cover the events fee after paying \
+             for ledger storage rent: {} > {}",
+            consumed.refundable,
+            refundable - consumed.rent,
+        );
+    }
+    None
 }
 
 /// How stellar-core classifies a failed host run.
@@ -306,25 +501,39 @@ fn host_failure_code(budget: &BudgetUse) -> InvokeHostFunctionResult {
 struct PostHostChecks {
     write_bytes_limit: u64,
     events_size_limit: u64,
+    sizes: SizeLimits,
 }
 
 impl PostHostChecks {
-    /// The first limit the host output breaks, as stellar-core would report it.
+    /// The first limit the host output breaks, as stellar-core would report
+    /// it; otherwise the size of the events and the return value, which the
+    /// events fee is charged on.
+    #[allow(clippy::result_large_err)] // a failed check is as likely as a passed one
     fn run(
         &self,
         changes: &[Change],
         events: &[Vec<u8>],
         return_value: &[u8],
-    ) -> Option<(ScError, DiagnosticEvent)> {
+    ) -> std::result::Result<u64, Failed> {
         // Every read-write entry that still exists is written back.
         let mut written = 0u64;
         for change in changes.iter().filter(|change| !change.read_only) {
-            written += change.new_value.as_ref().map_or(0, |v| v.len() as u64);
+            let Some(value) = &change.new_value else {
+                continue;
+            };
+            let size = value.len() as u64;
+            // The limits depend only on the kind of entry, which leads its XDR.
+            if let Ok(entry) = stellar_xdr::LedgerEntry::from_xdr(value, Limits::none()) {
+                if let Some(failed) = self.sizes.check(&entry.data, size) {
+                    return Err(failed);
+                }
+            }
+            written += size;
             if written > self.write_bytes_limit {
-                return Some(core_error(
-                    ScError::Budget(ScErrorCode::ExceededLimit),
+                return Err(limit_exceeded(
                     "operation byte-write resources exceeds amount specified",
-                    vec![ScVal::U64(written), ScVal::U64(self.write_bytes_limit)],
+                    written,
+                    self.write_bytes_limit,
                 ));
             }
         }
@@ -333,22 +542,22 @@ impl PostHostChecks {
         for event in events {
             emitted += event.len() as u64;
             if emitted > self.events_size_limit {
-                return Some(core_error(
-                    ScError::Budget(ScErrorCode::ExceededLimit),
+                return Err(limit_exceeded(
                     "total events size exceeds network config maximum",
-                    vec![ScVal::U64(emitted), ScVal::U64(self.events_size_limit)],
+                    emitted,
+                    self.events_size_limit,
                 ));
             }
         }
         emitted += return_value.len() as u64;
         if emitted > self.events_size_limit {
-            return Some(core_error(
-                ScError::Budget(ScErrorCode::ExceededLimit),
+            return Err(limit_exceeded(
                 "return value pushes events size above network config maximum",
-                vec![ScVal::U64(emitted), ScVal::U64(self.events_size_limit)],
+                emitted,
+                self.events_size_limit,
             ));
         }
-        None
+        Ok(emitted)
     }
 }
 
@@ -417,22 +626,31 @@ fn success_hash(return_value: &[u8], events: &[Vec<u8>]) -> Result<Hash> {
 }
 
 /// The contracts in the footprint, for the host's module cache.
-fn contracts(state: &Reconstructed) -> Vec<ContractCode> {
+///
+/// Core's cache holds the code that is *live*: an archived contract the
+/// transaction restores is not in it, so the host parses that module inside
+/// the invocation and charges the transaction for it.
+fn contracts(state: &Reconstructed) -> Result<Vec<ContractCode>> {
     state
         .slots
         .iter()
-        .filter(|slot| !slot.missing() && !slot.archived())
+        .filter(|slot| !slot.missing() && !slot.archived() && !slot.restored())
         .filter_map(|slot| match slot.entry.as_ref().map(|e| &e.data) {
             Some(LedgerEntryData::ContractCode(code)) => Some(code),
             _ => None,
         })
-        .map(|code| ContractCode {
-            hash: code.hash.0,
-            wasm: code.code.to_vec(),
-            cost_inputs: match &code.ext {
-                ContractCodeEntryExt::V0 => None,
-                ContractCodeEntryExt::V1(v1) => v1.cost_inputs.to_xdr(Limits::none()).ok(),
-            },
+        .map(|code| {
+            Ok(ContractCode {
+                hash: code.hash.0,
+                wasm: code.code.to_vec(),
+                cost_inputs: match &code.ext {
+                    ContractCodeEntryExt::V0 => None,
+                    ContractCodeEntryExt::V1(v1) => Some(codec::encode(
+                        &v1.cost_inputs,
+                        "the contract code cost inputs",
+                    )?),
+                },
+            })
         })
         .collect()
 }
@@ -579,7 +797,17 @@ mod tests {
         Change {
             read_only,
             new_value: new_value.map(|n| vec![0; n]),
+            rent: None,
         }
+    }
+
+    const NO_SIZE_LIMITS: SizeLimits = SizeLimits {
+        contract_code: u64::MAX,
+        contract_data: u64::MAX,
+    };
+
+    fn message(failed: &Failed) -> String {
+        display::diagnostic(&failed.2)
     }
 
     #[test]
@@ -587,6 +815,7 @@ mod tests {
         let checks = PostHostChecks {
             write_bytes_limit: 100,
             events_size_limit: 50,
+            sizes: NO_SIZE_LIMITS,
         };
         // Read-only entries and removed entries are not writes.
         let changes = [
@@ -594,27 +823,161 @@ mod tests {
             change(false, None),
             change(false, Some(100)),
         ];
-        assert!(checks.run(&changes, &[], &[]).is_none());
+        assert_eq!(checks.run(&changes, &[], &[]).unwrap(), 0);
 
-        let (error, event) = checks
+        let failed = checks
             .run(
                 &[change(false, Some(60)), change(false, Some(41))],
                 &[],
                 &[],
             )
-            .unwrap();
-        assert_eq!(error, ScError::Budget(ScErrorCode::ExceededLimit));
+            .unwrap_err();
+        assert_eq!(failed.0, InvokeHostFunctionResult::ResourceLimitExceeded);
+        assert_eq!(failed.1, ScError::Budget(ScErrorCode::ExceededLimit));
         assert_eq!(
-            display::diagnostic(&event),
+            message(&failed),
             "fail [-] error, budget error ExceededLimit \
              [\"operation byte-write resources exceeds amount specified\", 101, 100]"
         );
 
-        assert!(checks.run(&[], &[vec![0; 30]], &[0; 20]).is_none());
-        let (_, event) = checks.run(&[], &[vec![0; 30], vec![0; 21]], &[]).unwrap();
-        assert!(display::diagnostic(&event).contains("total events size exceeds"));
-        let (_, event) = checks.run(&[], &[vec![0; 30]], &[0; 21]).unwrap();
-        assert!(display::diagnostic(&event).contains("return value pushes events size"));
+        // The events fee is charged on the events and the return value.
+        assert_eq!(checks.run(&[], &[vec![0; 30]], &[0; 20]).unwrap(), 50);
+        let failed = checks
+            .run(&[], &[vec![0; 30], vec![0; 21]], &[])
+            .unwrap_err();
+        assert!(message(&failed).contains("total events size exceeds"));
+        let failed = checks.run(&[], &[vec![0; 30]], &[0; 21]).unwrap_err();
+        assert!(message(&failed).contains("return value pushes events size"));
+    }
+
+    #[test]
+    fn written_entries_respect_the_per_entry_limits() {
+        use crate::test_support::{code_entry, data_entry};
+        use stellar_xdr::ContractDataDurability::Persistent;
+
+        let written = |entry: &stellar_xdr::LedgerEntry| Change {
+            read_only: false,
+            new_value: Some(codec::encode(entry, "entry").unwrap()),
+            rent: None,
+        };
+        let data = written(&data_entry([2; 32], Persistent, 1));
+        let code = written(&code_entry(&[0; 64], 1));
+        let (data_size, code_size) = (
+            data.new_value.as_ref().unwrap().len() as u64,
+            code.new_value.as_ref().unwrap().len() as u64,
+        );
+        let checks = |contract_code, contract_data| PostHostChecks {
+            write_bytes_limit: u64::MAX,
+            events_size_limit: u64::MAX,
+            sizes: SizeLimits {
+                contract_code,
+                contract_data,
+            },
+        };
+        let both = [data.clone(), code.clone()];
+
+        // Exactly at the limit is fine.
+        assert!(checks(code_size, data_size).run(&both, &[], &[]).is_ok());
+        let failed = checks(code_size, data_size - 1)
+            .run(&both, &[], &[])
+            .unwrap_err();
+        assert!(
+            message(&failed).contains("ContractData size exceeds network config maximum size"),
+            "{}",
+            message(&failed)
+        );
+        let failed = checks(code_size - 1, data_size)
+            .run(&both, &[], &[])
+            .unwrap_err();
+        assert!(message(&failed).contains("Wasm size exceeds network config maximum contract size"));
+        assert_eq!(failed.0, InvokeHostFunctionResult::ResourceLimitExceeded);
+    }
+
+    #[test]
+    fn the_refundable_fee_must_cover_rent_and_then_events() {
+        let fees = |non_refundable, refundable, rent| Fees {
+            non_refundable,
+            refundable,
+            rent,
+        };
+        // Declared 1000, of which 400 is not refundable: 600 to spend.
+        let pre_apply = fees(400, 0, 0);
+        assert!(refundable_fee_check(1_000, &pre_apply, &fees(400, 100, 500)).is_none());
+
+        let failed = refundable_fee_check(1_000, &pre_apply, &fees(400, 0, 601)).unwrap();
+        assert_eq!(
+            failed.0,
+            InvokeHostFunctionResult::InsufficientRefundableFee
+        );
+        assert_eq!(failed.1, ScError::Budget(ScErrorCode::ExceededLimit));
+        assert_eq!(
+            message(&failed),
+            "fail [-] error, budget error ExceededLimit [\"refundable resource fee was not \
+             sufficient to cover the ledger storage rent: {} > {}\", 601, 600]"
+        );
+
+        // Rent fits, the events fee on top of it does not.
+        let failed = refundable_fee_check(1_000, &pre_apply, &fees(400, 101, 500)).unwrap();
+        assert_eq!(
+            message(&failed),
+            "fail [-] error, budget error ExceededLimit [\"refundable resource fee was not \
+             sufficient to cover the events fee after paying for ledger storage rent: {} > {}\", \
+             101, 100]"
+        );
+    }
+
+    #[test]
+    fn every_embedded_host_prices_fees() {
+        use crate::host::{FeeSettings, RentChange};
+
+        let request = FeeRequest {
+            instructions: 1_000_000,
+            disk_read_entries: 1,
+            write_entries: 2,
+            disk_read_bytes: 200,
+            write_bytes: 300,
+            contract_events_size_bytes: 1_024,
+            transaction_size_bytes: 500,
+            rent_changes: vec![RentChange {
+                is_persistent: true,
+                is_code_entry: false,
+                old_size_bytes: 0,
+                new_size_bytes: 1_024,
+                old_live_until_ledger: 0,
+                new_live_until_ledger: 100_000,
+            }],
+            ledger_sequence: 1,
+            settings: FeeSettings {
+                fee_per_instruction_increment: 25,
+                fee_per_disk_read_entry: 6_250,
+                fee_per_write_entry: 10_000,
+                fee_per_disk_read_1kb: 1_786,
+                fee_per_write_1kb: 3_500,
+                fee_per_historical_1kb: 16_235,
+                fee_per_contract_event_1kb: 10_000,
+                fee_per_transaction_size_1kb: 1_624,
+                state_target_size_bytes: 3_000_000_000,
+                rent_fee_1kb_state_size_low: -17_000,
+                rent_fee_1kb_state_size_high: 10_000,
+                state_size_rent_fee_growth_factor: 5_000,
+                average_state_size_bytes: 2_500_000_000,
+                persistent_rent_rate_denominator: 1_215,
+                temporary_rent_rate_denominator: 2_430,
+            },
+        };
+        for host in &host::HOSTS {
+            let fees = host.fees(&request);
+            // The events fee is the only refundable part of the resource fee.
+            assert_eq!(fees.refundable, 10_000, "{host:?}");
+            assert!(fees.non_refundable > 0 && fees.rent > 0, "{host:?}");
+            let without_events = host.fees(&FeeRequest {
+                contract_events_size_bytes: 0,
+                ..request.clone()
+            });
+            assert_eq!(without_events.refundable, 0);
+            assert_eq!(without_events.non_refundable, fees.non_refundable);
+            assert_eq!(without_events.rent, fees.rent);
+        }
     }
 
     #[test]

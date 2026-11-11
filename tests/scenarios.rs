@@ -13,6 +13,9 @@ use sororewind::codec;
 use sororewind::report::Report;
 use sororewind::{Network, Outcome, RewindError};
 use stellar_xdr::{
+    ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerKeyConfigSetting, TransactionExt,
+};
+use stellar_xdr::{
     ContractDataDurability, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
     FeeBumpTransactionInnerTx, Hash, InnerTransactionResult, InnerTransactionResultExt,
     InnerTransactionResultPair, InnerTransactionResultResult, InvokeHostFunctionResult, LedgerKey,
@@ -140,26 +143,135 @@ fn archive(key: String) -> impl Fn(&mut Value) + Send + Sync + 'static {
     }
 }
 
-/// Rewrite `getTransaction` as if core had refused an archived entry: the
-/// operation fails with `ENTRY_ARCHIVED` and the host never ran, so there are
-/// no diagnostics.
-fn failed_on_archived_entry(result: &mut Value) {
+/// Rewrite `getTransaction` as if core had failed the operation with `code`
+/// before the host ran, so there are no diagnostics.
+fn failed_before_the_host(result: &mut Value, code: InvokeHostFunctionResult) {
     let plain: TransactionResult =
         codec::decode(result["resultXdr"].as_str().unwrap(), "resultXdr").unwrap();
-    let archived = TransactionResult {
+    let failed = TransactionResult {
         fee_charged: plain.fee_charged,
         result: TransactionResultResult::TxFailed(
             vec![OperationResult::OpInner(
-                OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::EntryArchived),
+                OperationResultTr::InvokeHostFunction(code),
             )]
             .try_into()
             .unwrap(),
         ),
         ext: TransactionResultExt::V0,
     };
-    result["resultXdr"] = b64(&archived).into();
+    result["resultXdr"] = b64(&failed).into();
     // The diagnostics live in the transaction meta.
     result.as_object_mut().unwrap().remove("resultMetaXdr");
+}
+
+/// Rewrite `getTransaction` as if core had refused an archived entry.
+fn failed_on_archived_entry(result: &mut Value) {
+    failed_before_the_host(result, InvokeHostFunctionResult::EntryArchived);
+}
+
+/// Rewrite `getTransaction` as if the transaction had declared no bytes to
+/// read from disk, and core had stopped at its first classic entry.
+fn declared_no_disk_reads(result: &mut Value) {
+    let envelope: TransactionEnvelope =
+        codec::decode(result["envelopeXdr"].as_str().unwrap(), "envelopeXdr").unwrap();
+    let TransactionEnvelope::Tx(mut envelope) = envelope else {
+        panic!("the fixture's envelope is not a v1 transaction");
+    };
+    let TransactionExt::V1(data) = &mut envelope.tx.ext else {
+        panic!("the fixture's transaction carries no Soroban data");
+    };
+    data.resources.disk_read_bytes = 0;
+    result["envelopeXdr"] = b64(&TransactionEnvelope::Tx(envelope)).into();
+    failed_before_the_host(result, InvokeHostFunctionResult::ResourceLimitExceeded);
+}
+
+#[tokio::test]
+async fn classic_entries_count_against_the_declared_disk_reads() {
+    let report = replay(
+        Overlay::on(FIXTURE)
+            .await
+            .rewrite_result("getTransaction", declared_no_disk_reads),
+    )
+    .await;
+
+    assert_eq!(report.outcome(), Outcome::Matched);
+    assert_eq!(report.result.local.code, "resource_limit_exceeded");
+    let failure = report.story.failure.as_ref().unwrap();
+    assert!(
+        failure
+            .message
+            .contains("operation byte-read resources exceeds amount specified"),
+        "{failure:?}"
+    );
+}
+
+/// Rewrite `getLedgerEntries` as if the network took contract data entries of
+/// one byte at most.
+fn tiny_contract_data_limit(result: &mut Value) {
+    let key = b64(&LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::ContractDataEntrySizeBytes,
+    }));
+    for entry in result["entries"].as_array_mut().unwrap() {
+        if entry["key"] == key.as_str() {
+            entry["xdr"] = b64(&LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractDataEntrySizeBytes(1),
+            ))
+            .into();
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_entry_over_the_network_size_limit_fails_like_core() {
+    let report = replay(
+        Overlay::on(FIXTURE)
+            .await
+            .rewrite_result("getLedgerEntries", tiny_contract_data_limit)
+            .rewrite_result("getTransaction", |result| {
+                failed_before_the_host(result, InvokeHostFunctionResult::ResourceLimitExceeded);
+            }),
+    )
+    .await;
+
+    assert_eq!(report.outcome(), Outcome::Matched);
+    assert_eq!(report.result.local.code, "resource_limit_exceeded");
+    let failure = report.story.failure.as_ref().unwrap();
+    assert!(
+        failure
+            .message
+            .contains("ContractData size exceeds network config maximum size"),
+        "{failure:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_refundable_fee_check_is_mirrored() {
+    // The host succeeds; core then finds the rent beyond the refundable fee.
+    let report = common::replay("refundable-fee").await.unwrap();
+    assert_eq!(report.outcome(), Outcome::Matched);
+    assert_eq!(report.result.local.code, "insufficient_refundable_fee");
+    let failure = report.story.failure.as_ref().unwrap();
+    assert!(
+        failure
+            .message
+            .contains("refundable resource fee was not sufficient"),
+        "{failure:?}"
+    );
+    // Rent is priced from a window that keeps moving; the report says so.
+    assert!(report
+        .footprint
+        .config_drifted
+        .iter()
+        .any(|setting| setting == "LiveSorobanStateSizeWindow"));
+}
+
+#[tokio::test]
+async fn a_drifted_entry_is_rebuilt_from_ledger_metadata() {
+    let report = common::replay("rebuilt-entry").await.unwrap();
+    assert_eq!(report.outcome(), Outcome::Matched);
+    assert!(!report.footprint.rebuilt.is_empty());
+    assert!(report.footprint.drifted.is_empty());
+    assert_eq!(report.footprint.rebuild_note, None);
 }
 
 #[tokio::test]

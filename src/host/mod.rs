@@ -76,12 +76,73 @@ pub struct Invocation<'a> {
 }
 
 /// What one footprint entry became.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Change {
     pub read_only: bool,
     /// The new `LedgerEntry`, XDR-encoded; `None` when it was removed or is
     /// read-only.
     pub new_value: Option<Vec<u8>>,
+    /// What the change costs in rent, when it costs anything.
+    pub rent: Option<RentChange>,
+}
+
+/// One entry's rent inputs, as the host's `LedgerEntryRentChange` holds them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RentChange {
+    pub is_persistent: bool,
+    pub is_code_entry: bool,
+    pub old_size_bytes: u32,
+    pub new_size_bytes: u32,
+    pub old_live_until_ledger: u32,
+    pub new_live_until_ledger: u32,
+}
+
+/// The network's fee settings, as the hosts' `fees` module wants them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FeeSettings {
+    pub fee_per_instruction_increment: i64,
+    pub fee_per_disk_read_entry: i64,
+    pub fee_per_write_entry: i64,
+    pub fee_per_disk_read_1kb: i64,
+    /// The flat write fee (`feeWrite1KB`).
+    pub fee_per_write_1kb: i64,
+    pub fee_per_historical_1kb: i64,
+    pub fee_per_contract_event_1kb: i64,
+    pub fee_per_transaction_size_1kb: i64,
+    /// The inputs of the rent fee per 1 KB, which grows with the state size.
+    pub state_target_size_bytes: i64,
+    pub rent_fee_1kb_state_size_low: i64,
+    pub rent_fee_1kb_state_size_high: i64,
+    pub state_size_rent_fee_growth_factor: u32,
+    /// Average of the network's `LiveSorobanStateSizeWindow`.
+    pub average_state_size_bytes: i64,
+    pub persistent_rent_rate_denominator: i64,
+    pub temporary_rent_rate_denominator: i64,
+}
+
+/// What a transaction declared and what it emitted, for the fee computation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeeRequest {
+    pub instructions: u32,
+    pub disk_read_entries: u32,
+    pub write_entries: u32,
+    pub disk_read_bytes: u32,
+    pub write_bytes: u32,
+    pub contract_events_size_bytes: u32,
+    pub transaction_size_bytes: u32,
+    pub rent_changes: Vec<RentChange>,
+    pub ledger_sequence: u32,
+    pub settings: FeeSettings,
+}
+
+/// The fees stellar-core derives for one transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Fees {
+    /// Charged whatever happens; depends only on the declared resources.
+    pub non_refundable: i64,
+    /// The refundable part of the resource fee: the events fee.
+    pub refundable: i64,
+    pub rent: i64,
 }
 
 /// What the host reported for one invocation.
@@ -106,7 +167,8 @@ pub enum Failure {
     Xdr(String),
     Budget(String),
     ModuleCache(String),
-    /// The host rejected its inputs before running anything.
+    /// The host failed with an internal error, which stellar-core treats as
+    /// a bug rather than as a transaction result.
     Start(String),
     /// The footprint entry at this index could not be sized for rent.
     Rent(usize),
@@ -119,11 +181,17 @@ pub struct Host {
     /// Its `soroban-env-host` version.
     pub version: &'static str,
     invoke: fn(&Invocation<'_>) -> std::result::Result<Output, Failure>,
+    fees: fn(&FeeRequest) -> Fees,
 }
 
 impl Host {
     pub fn invoke(&self, invocation: &Invocation<'_>) -> std::result::Result<Output, Failure> {
         (self.invoke)(invocation)
+    }
+
+    /// The resource and rent fees, computed by this host's own `fees` module.
+    pub fn fees(&self, request: &FeeRequest) -> Fees {
+        (self.fees)(request)
     }
 }
 
@@ -142,11 +210,13 @@ pub static HOSTS: [Host; 2] = [
         protocol: p29::PROTOCOL,
         version: p29::VERSION,
         invoke: p29::invoke,
+        fees: p29::fees,
     },
     Host {
         protocol: p30::PROTOCOL,
         version: p30::VERSION,
         invoke: p30::invoke,
+        fees: p30::fees,
     },
 ];
 

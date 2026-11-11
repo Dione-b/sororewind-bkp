@@ -20,6 +20,7 @@ use crate::state::{self, LedgerContext, Reconstructed};
 use crate::story::{Failure, Story};
 use crate::tx::{self, DecodedTx};
 use crate::{host, spec, strkey};
+use stellar_xdr::{ConfigSettingId, InvokeHostFunctionResult};
 
 /// What to replay.
 #[derive(Debug, Clone)]
@@ -127,15 +128,18 @@ async fn narrate(
         return Ok(story);
     };
 
-    let wasm = match &request.wasm_debug {
-        Some(path) => tokio::fs::read(path)
-            .await
-            .map_err(|source| RewindError::WasmFile {
-                path: path.clone(),
-                source,
-            })?,
+    let (wasm, changed_since) = match &request.wasm_debug {
+        Some(path) => {
+            let wasm = tokio::fs::read(path)
+                .await
+                .map_err(|source| RewindError::WasmFile {
+                    path: path.clone(),
+                    source,
+                })?;
+            (wasm, false)
+        }
         None => match failing_contract_wasm(rpc, state, &story).await {
-            Some(wasm) => wasm,
+            Some(contract) => (contract.wasm, contract.changed_since),
             None => return Ok(story),
         },
     };
@@ -145,7 +149,14 @@ async fn narrate(
         Ok(names) => {
             if let Some(failure) = &mut story.failure {
                 failure.name = names.name(code).map(str::to_string);
-                failure.name_origin = names.origin;
+                // The name is read from the code the contract has now.
+                failure.name_origin = match (names.origin, changed_since) {
+                    (Some(origin), true) => Some(format!(
+                        "{origin}, read from code that changed after the transaction: the \
+                         name may not be the one this error had"
+                    )),
+                    (origin, _) => origin,
+                };
             }
         }
         Err(err) => log::debug!(target: "spec", "{err}"),
@@ -163,7 +174,7 @@ async fn failing_contract_wasm(
     rpc: &RpcClient,
     state: &Reconstructed,
     story: &Story,
-) -> Option<Vec<u8>> {
+) -> Option<spec::ContractWasm> {
     let contract = story
         .failure
         .as_ref()
@@ -217,7 +228,12 @@ fn assemble(run: Replayed<'_>) -> Report {
         },
         story: run.story,
         budget: run.outcome.budget,
-        footprint: footprint_report(&run.state, run.ledger.sequence),
+        footprint: footprint_report(
+            &run.state,
+            run.ledger.sequence,
+            [&run.tx.onchain_result, &run.outcome.result]
+                .contains(&&InvokeHostFunctionResult::InsufficientRefundableFee),
+        ),
         prng_seed: run.outcome.prng_seed,
         diagnostics: Diagnostics {
             onchain: lines(&run.tx.onchain_diagnostic_events),
@@ -230,7 +246,7 @@ fn lines(events: &[stellar_xdr::DiagnosticEvent]) -> Vec<String> {
     events.iter().map(display::diagnostic).collect()
 }
 
-fn footprint_report(state: &Reconstructed, tx_ledger: u32) -> FootprintReport {
+fn footprint_report(state: &Reconstructed, tx_ledger: u32, fee_decided: bool) -> FootprintReport {
     let labels = |keep: &dyn Fn(&state::FootprintSlot) -> bool| -> Vec<String> {
         state
             .slots
@@ -239,6 +255,21 @@ fn footprint_report(state: &Reconstructed, tx_ledger: u32) -> FootprintReport {
             .map(|slot| display::ledger_key(&slot.key))
             .collect()
     };
+    let mut config_drifted: Vec<String> = state
+        .config
+        .drifted
+        .iter()
+        .map(|setting| setting.to_string())
+        .collect();
+    // The state-size window only prices rent, so it is only worth a mention
+    // when the refundable fee decided a result.
+    if fee_decided && state.config.state_size_window_drifted {
+        config_drifted.push(
+            ConfigSettingId::LiveSorobanStateSizeWindow
+                .name()
+                .to_string(),
+        );
+    }
     FootprintReport {
         entries: state.slots.len(),
         missing: state.slots.iter().filter(|slot| slot.missing()).count(),
@@ -254,9 +285,17 @@ fn footprint_report(state: &Reconstructed, tx_ledger: u32) -> FootprintReport {
             })
             .collect(),
         archived: labels(&|slot| slot.archived()),
-        config_drifted: state
+        archived_inferred: labels(&|slot| {
+            matches!(slot.liveness, state::Liveness::Archived { inferred: true })
+        }),
+        rebuilt: labels(&|slot| slot.rebuilt),
+        rebuild_note: state.rebuild_note.clone(),
+        drift_unknown: labels(&|slot| slot.drift_unknown()),
+        ext_missing: labels(&|slot| slot.ext_missing),
+        config_drifted,
+        config_drift_unknown: state
             .config
-            .drifted
+            .drift_unknown
             .iter()
             .map(|setting| setting.to_string())
             .collect(),

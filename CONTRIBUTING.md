@@ -111,7 +111,11 @@ new protocol N:
    two embedded protocols, gate it on `ledger.protocol` instead of changing it
    for both. What to review:
    - the PRNG seed derivation (`replay::prng_seed`);
-   - the post-host checks (`PostHostChecks` in `replay.rs`);
+   - the checks around the host (`footprint_checks`, `PostHostChecks` and
+     `refundable_fee_check` in `replay.rs`) and the fee computation
+     (`fees` in `src/host/proto.rs`);
+   - how a host failure before execution is classified (`src/host/proto.rs`);
+   - the order of ledger entry changes in `LedgerCloseMeta` (`history.rs`);
    - the network settings read (`CONFIG_SETTINGS` in `state.rs`);
    - the liveness and TTL rules (top of `state.rs`).
 6. **Fixtures.** Record fixtures for protocol N on testnet (README,

@@ -105,7 +105,13 @@ expression: json(&sample_report()).unwrap()
       }
     ],
     "archived": [],
-    "configDrifted": []
+    "archivedInferred": [],
+    "rebuilt": [],
+    "rebuildNote": null,
+    "driftUnknown": [],
+    "extMissing": [],
+    "configDrifted": [],
+    "configDriftUnknown": []
   },
   "prngSeed": "derived",
   "diagnostics": {

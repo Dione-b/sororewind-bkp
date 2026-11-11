@@ -20,10 +20,12 @@
 //! answers `getLedgerEntries` however the client chooses to batch its keys.
 //! Other responses are addressed by a digest of their canonical params, so two
 //! calls to one method never collide. `getLedgers` responses are stored
-//! without `metadataXdr`: sororewind never reads it and it is ~100 KB per
-//! ledger.
+//! without `metadataXdr`, which is 100 KB to a few MB per ledger. Where a
+//! replay reads it (to rebuild drifted entries, see `history`), the recording
+//! keeps the part it needs in its place as `sororewindChanges`: the ledger
+//! entry changes that touch the keys in `ledgerEntries.json` or their TTLs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -317,6 +319,23 @@ impl<T: Transport> Recording<T> {
     }
 }
 
+impl<T> Recording<T> {
+    /// The ledger keys recorded so far and the keys of their TTL entries,
+    /// XDR-encoded: the entries whose history is worth keeping.
+    async fn recorded_keys(&self) -> HashSet<Vec<u8>> {
+        let store = self.entries.lock().await;
+        let mut keys = HashSet::new();
+        for key in store.entries.keys() {
+            let Ok(key) = crate::codec::b64_decode(key, "a ledger key") else {
+                continue;
+            };
+            keys.extend(crate::history::ttl_key(&key));
+            keys.insert(key);
+        }
+        keys
+    }
+}
+
 impl<T: Transport> Transport for Recording<T> {
     fn request<'a>(&'a self, method: &'a str, params: &'a Value) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
@@ -326,7 +345,8 @@ impl<T: Transport> Transport for Recording<T> {
             } else {
                 let path = self.dir.join(response_file(method, params));
                 log::debug!(target: "record", "{method} → {}", path.display());
-                tokio::fs::write(&path, slim(method, &text))
+                let keep = self.recorded_keys().await;
+                tokio::fs::write(&path, slim(method, &text, &keep))
                     .await
                     .map_err(RewindError::record_path(&path))?;
             }
@@ -349,8 +369,10 @@ async fn write_json<V: Serialize>(path: &Path, value: &V) -> Result<()> {
         .map_err(RewindError::record_path(path))
 }
 
-/// Drop response fields sororewind never reads and that dominate fixture size.
-fn slim(method: &str, text: &str) -> String {
+/// Drop response fields sororewind never reads and that dominate fixture
+/// size. Ledger metadata is reduced to the changes that touch `keep`; with no
+/// keys recorded yet (the header is read first) it is dropped altogether.
+fn slim(method: &str, text: &str, keep: &HashSet<Vec<u8>>) -> String {
     if method != "getLedgers" {
         return text.to_string();
     }
@@ -362,8 +384,19 @@ fn slim(method: &str, text: &str) -> String {
         .and_then(Value::as_array_mut)
     {
         for ledger in ledgers.iter_mut().filter_map(Value::as_object_mut) {
-            ledger.remove("metadataXdr");
+            let metadata = ledger.remove("metadataXdr");
             ledger.remove("metadataJson");
+            if keep.is_empty() {
+                continue;
+            }
+            let changes = metadata
+                .as_ref()
+                .and_then(Value::as_str)
+                .and_then(|metadata| crate::history::slim(metadata, keep))
+                .and_then(|changes| serde_json::to_value(changes).ok());
+            if let Some(changes) = changes {
+                ledger.insert("sororewindChanges".to_string(), changes);
+            }
         }
     }
     response.to_string()
@@ -485,13 +518,22 @@ mod tests {
             {"sequence": 1, "headerXdr": "AAAA", "metadataXdr": "big"}
         ]}})
         .to_string();
-        let slimmed: Value = serde_json::from_str(&slim("getLedgers", &text)).unwrap();
+        let none = HashSet::new();
+        let slimmed: Value = serde_json::from_str(&slim("getLedgers", &text, &none)).unwrap();
         assert_eq!(
             slimmed["result"]["ledgers"][0],
             json!({"sequence": 1, "headerXdr": "AAAA"})
         );
-        assert_eq!(slim("getTransaction", &text), text);
-        assert_eq!(slim("getLedgers", "not json"), "not json");
+        assert_eq!(slim("getTransaction", &text, &none), text);
+        assert_eq!(slim("getLedgers", "not json", &none), "not json");
+
+        // With keys recorded, undecodable metadata is still dropped.
+        let some = HashSet::from([vec![1u8]]);
+        let slimmed: Value = serde_json::from_str(&slim("getLedgers", &text, &some)).unwrap();
+        assert_eq!(
+            slimmed["result"]["ledgers"][0],
+            json!({"sequence": 1, "headerXdr": "AAAA"})
+        );
     }
 
     #[tokio::test]
