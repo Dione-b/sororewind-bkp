@@ -1,0 +1,22 @@
+---
+source: src/render.rs
+expression: "human(&sample_report(), false, Detail::Summary)"
+---
+sororewind  aaaaaa…aaaa  testnet
+ledger 1000 · protocol 30 · 2023-11-14 22:13:20 UTC · fee-bump
+
+✓ replay matches network
+  on-chain  trapped
+  local     trapped
+
+where it broke
+  contract error #3 · InsufficientBalance
+  "balance too low"
+  in CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::inner (depth 1)
+
+call tree
+CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::outer(1, "two")
+    · starting
+└─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::probe()
+└─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::inner()  ✗
+       · about to fail

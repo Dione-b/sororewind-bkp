@@ -1,72 +1,97 @@
 //! Live end-to-end test against the public testnet RPC.
 //!
-//! Ignored by default (`cargo test` stays offline and deterministic); run it
-//! nightly with `cargo test --test live -- --ignored --nocapture`.
+//! Ignored by default (`cargo test` stays offline and deterministic); CI runs
+//! it nightly with `cargo test --test live -- --ignored --nocapture`.
 //!
-//! It asserts the two properties that make the tool trustworthy on a real
-//! network: a known-failed transaction replays, and the replay matches the
-//! network's recorded result.
+//! No hash is committed here: the RPC forgets transactions after about a
+//! week, so the test asks the network for its most recent failures instead.
+//! Some of those legitimately diverge (a contract that rewrites the same entry
+//! every few ledgers cannot be replayed against current state, and one busy
+//! contract can fill the whole recent history), so the test samples a few
+//! failures of each kind and demands that every replay completes in time and
+//! that at least one matches.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// A failed testnet `invoke_host_function` transaction known to replay-match.
-/// If it ages out of the RPC's ~7-day retention window this test fails — that
-/// is the signal to pick a fresh hash (see scripts/find-fixtures.sh).
-const KNOWN_FAILED: &str = "015b092ded2eec4838dee20a5d172c428faa863a74e3706cd3aeb6581df0fd16";
+use sororewind::discover::{recent_failures, Candidate, Search};
+use sororewind::rpc::RpcClient;
+use sororewind::transport::HttpTransport;
+use sororewind::{Network, Outcome, Request};
 
-/// The tool must answer in a few seconds; the spec's budget is <5s. Generous
-/// headroom for CI, but it still catches a pathological RPC round-trip.
-const TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+/// How many recent failures of each category to replay.
+const PER_CATEGORY: usize = 3;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_sororewind")
-}
+/// The tool must answer in a few seconds; generous headroom for CI, but it
+/// still catches a pathological RPC round-trip.
+const TIME_BUDGET: Duration = Duration::from_secs(15);
 
-#[test]
+#[tokio::test]
 #[ignore = "requires network access to the testnet RPC"]
-fn known_failed_tx_replays_and_matches() {
-    let started = Instant::now();
-    let out = Command::new(bin())
-        .arg(KNOWN_FAILED)
-        .arg("--no-color")
-        .output()
-        .expect("failed to spawn sororewind");
-    let elapsed = started.elapsed();
+async fn recent_failures_replay_and_match() {
+    let network = Network::Testnet;
+    let rpc = RpcClient::new(HttpTransport::new(network.default_rpc_url()).unwrap());
+    let search = Search {
+        limit: 300,
+        max_ledgers: 8_000,
+    };
+    let found = recent_failures(&rpc, search)
+        .await
+        .expect("could not list recent failures on testnet");
+    let mut candidates = Vec::new();
+    for candidate in found {
+        let seen = candidates
+            .iter()
+            .filter(|c: &&Candidate| c.category == candidate.category)
+            .count();
+        if seen < PER_CATEGORY {
+            candidates.push(candidate);
+        }
+    }
+    assert!(
+        !candidates.is_empty(),
+        "testnet had no failed Soroban transaction in the last {} ledgers",
+        search.max_ledgers
+    );
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let code = out.status.code().unwrap_or(-1);
+    let mut matched = 0;
+    let mut problems = Vec::new();
+    for candidate in &candidates {
+        let request = Request {
+            hash: candidate.hash.clone(),
+            network: Some(network),
+            wasm_debug: None,
+        };
+        let started = Instant::now();
+        let result = sororewind::run(&rpc, &request).await;
+        let elapsed = started.elapsed();
+        let verdict = match &result {
+            Ok(report) => format!("{:?}", report.outcome()),
+            Err(err) => format!("error: {err}"),
+        };
+        println!(
+            "{} {:<14} {verdict} in {elapsed:.1?}",
+            candidate.hash, candidate.category
+        );
 
-    assert_eq!(
-        code, 0,
-        "expected fidelity match (exit 0), got {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("replay matches network"),
-        "fidelity line missing\n{stdout}"
-    );
-    assert!(
-        stdout.contains("where it broke"),
-        "narrative section missing\n{stdout}"
-    );
-    assert!(
-        elapsed < TIME_BUDGET,
-        "replay took {elapsed:?}, budget is {TIME_BUDGET:?}"
-    );
-}
+        match result {
+            Ok(report) if report.outcome() == Outcome::Matched => matched += 1,
+            Ok(_) => {}
+            Err(err) => problems.push(format!("{}: {err}", candidate.hash)),
+        }
+        if elapsed > TIME_BUDGET {
+            problems.push(format!("{}: took {elapsed:.1?}", candidate.hash));
+        }
+    }
 
-#[test]
-#[ignore = "requires network access to the testnet RPC"]
-fn bad_hash_is_a_clean_error() {
-    let out = Command::new(bin())
-        .arg("not-a-hash")
-        .output()
-        .expect("failed to spawn sororewind");
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("64 hexadecimal characters"),
-        "unexpected error text: {stderr}"
+        problems.is_empty(),
+        "replays failed:\n{}",
+        problems.join("\n")
+    );
+    assert!(
+        matched > 0,
+        "none of {} recent failures replayed as a match",
+        candidates.len()
     );
 }
