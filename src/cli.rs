@@ -11,7 +11,6 @@ use crate::network::Network;
 use crate::pipeline::Request;
 use crate::rpc::RpcClient;
 use crate::transport::{FixtureManifest, FixtureTransport, HttpTransport, Recording};
-use crate::HOST_VERSION;
 
 /// Replay a failed Soroban transaction locally and narrate the call tree.
 #[derive(Debug, Parser)]
@@ -77,13 +76,13 @@ pub struct Cli {
     pub record: Option<PathBuf>,
 }
 
-/// `0.1.0 (protocol 30, soroban-env-host 30.0.0)`: which transactions this
-/// build can replay is part of its version.
+/// `0.1.0 (protocols 29 (soroban-env-host 29.0.2), 30 (...))`: which
+/// transactions this build can replay is part of its version.
 static VERSION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "{} (protocol {}, soroban-env-host {HOST_VERSION})",
+        "{} (protocols {})",
         env!("CARGO_PKG_VERSION"),
-        crate::host_protocol()
+        crate::host::describe()
     )
 });
 
@@ -215,10 +214,12 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
         let text = err.to_string();
         let expected = format!(
-            "sororewind {} (protocol {}, soroban-env-host {HOST_VERSION})\n",
+            "sororewind {} (protocols {})\n",
             env!("CARGO_PKG_VERSION"),
-            crate::host_protocol()
+            crate::host::describe()
         );
         assert_eq!(text, expected);
+        assert!(text.contains("29 (soroban-env-host 29."), "{text}");
+        assert!(text.contains("30 (soroban-env-host 30."), "{text}");
     }
 }

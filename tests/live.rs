@@ -96,16 +96,17 @@ async fn recent_failures_replay_and_match() {
     );
 }
 
-/// The nightly signal for a protocol upgrade: this build replays one protocol,
-/// so the day a network moves past it, sororewind stops working there until
-/// the host is bumped (see CONTRIBUTING.md, "Protocol upgrades").
+/// The nightly signal for a protocol upgrade: this build replays the protocols
+/// of its embedded hosts, so the day a network moves past the newest one,
+/// sororewind stops working there until a host is added (see CONTRIBUTING.md,
+/// "Protocol upgrades").
 ///
-/// A network still *behind* the embedded protocol is only reported: testnet
-/// upgrades first, and mainnet catches up on its own schedule.
+/// A network older than every embedded host is only reported: it cannot be
+/// fixed by an upgrade here.
 #[tokio::test]
 #[ignore = "requires network access to the testnet and mainnet RPCs"]
-async fn no_network_is_ahead_of_the_embedded_protocol() {
-    let host = sororewind::host_protocol();
+async fn no_network_is_ahead_of_the_embedded_hosts() {
+    let newest = sororewind::host::newest().protocol;
     let mut ahead = Vec::new();
     for network in [Network::Testnet, Network::Mainnet] {
         let rpc = RpcClient::new(HttpTransport::new(network.default_rpc_url()).unwrap());
@@ -115,21 +116,25 @@ async fn no_network_is_ahead_of_the_embedded_protocol() {
             .await
             .unwrap();
         let protocol = ledger.protocol;
-        match protocol.cmp(&host) {
-            std::cmp::Ordering::Equal => println!("{network:?}: protocol {protocol}, replayable"),
-            std::cmp::Ordering::Less => println!(
-                "{network:?}: protocol {protocol}, behind the embedded {host}; \
-                 its transactions cannot be replayed by this build"
-            ),
-            std::cmp::Ordering::Greater => {
-                ahead.push(format!("{network:?} runs protocol {protocol}"));
-            }
+        if let Some(host) = sororewind::host::for_protocol(protocol) {
+            println!(
+                "{network:?}: protocol {protocol}, replayed by soroban-env-host {}",
+                host.version
+            );
+        } else if protocol > newest {
+            ahead.push(format!("{network:?} runs protocol {protocol}"));
+        } else {
+            println!(
+                "{network:?}: protocol {protocol}, older than every embedded host ({})",
+                sororewind::host::describe()
+            );
         }
     }
     assert!(
         ahead.is_empty(),
-        "this build embeds protocol {host}, but {}; bump soroban-env-host and \
-         stellar-xdr (CONTRIBUTING.md, \"Protocol upgrades\")",
+        "this build embeds protocols {}, but {}; add a host for the new protocol \
+         (CONTRIBUTING.md, \"Protocol upgrades\")",
+        sororewind::host::describe(),
         ahead.join(" and ")
     );
 }

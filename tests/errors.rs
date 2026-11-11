@@ -150,17 +150,18 @@ async fn transaction_that_never_reached_the_host() {
 
 #[tokio::test]
 async fn transaction_from_another_protocol() {
-    let host = sororewind::host_protocol();
+    // A protocol newer than any embedded host.
+    let unsupported = sororewind::host::newest().protocol + 1;
     let overlay = Overlay::on(FIXTURE)
         .await
         .rewrite_result("getLedgers", move |result| {
             let ledger = &mut result["ledgers"][0];
             let mut history: LedgerHeaderHistoryEntry =
                 codec::decode(ledger["headerXdr"].as_str().unwrap(), "headerXdr").unwrap();
-            history.header.ledger_version = host - 1;
+            history.header.ledger_version = unsupported;
             ledger["headerXdr"] = b64(&history).into();
         });
-    let err = fails(overlay, &format!("ran on protocol {}", host - 1)).await;
+    let err = fails(overlay, &format!("ran on protocol {unsupported}")).await;
     assert!(matches!(err, RewindError::ProtocolMismatch { .. }));
 }
 

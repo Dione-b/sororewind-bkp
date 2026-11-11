@@ -25,23 +25,17 @@
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use soroban_env_host::{
-    budget::Budget,
-    e2e_invoke::{invoke_host_function, LedgerEntryChange},
-    storage::Storage,
-    vm::VersionedContractCodeCostInputs,
-    Host, HostError, ModuleCache,
-};
 use stellar_xdr::{
     ContractCodeEntryExt, ContractEvent, ContractEventBody, ContractEventType, ContractEventV0,
     DiagnosticEvent, ExtensionPoint, Hash, InvokeHostFunctionResult,
     InvokeHostFunctionSuccessPreImage, LedgerEntryData, LedgerKey, Limits, ReadXdr, ScBytes,
-    ScError, ScErrorCode, ScString, ScSymbol, ScVal, ScVec, StringM,
+    ScError, ScErrorCode, ScString, ScSymbol, ScVal, ScVec, StringM, WriteXdr,
 };
 
 use crate::codec;
 use crate::display;
 use crate::error::{Result, RewindError};
+use crate::host::{self, Change, ContractCode, Invocation};
 use crate::state::{FootprintSlot, LedgerContext, Reconstructed};
 use crate::tx::DecodedTx;
 
@@ -205,61 +199,80 @@ pub fn replay(
         });
     }
 
-    // Cost parameters come from the ledger's own ConfigSetting entries so the
-    // host prices every instruction exactly as the network did.
-    let budget = Budget::try_from_configs(
-        budget_use.cpu_limit,
-        budget_use.mem_limit,
-        state.config.cpu_cost_params.clone(),
-        state.config.mem_cost_params.clone(),
-    )
-    .map_err(|e| RewindError::Replay(format!("could not configure the execution budget: {e}")))?;
-
-    let mut diagnostics: Vec<DiagnosticEvent> = Vec::new();
-    let output = invoke_host_function(
-        &budget,
-        true,
-        tx.encoded_host_function()?,
-        tx.encoded_resources()?,
-        &tx.restored_rw_indices,
-        tx.encoded_source_account()?,
-        tx.encoded_auth()?.into_iter(),
-        state.ledger_info.clone(),
-        state.encoded_entries()?.into_iter(),
-        seed.to_vec(),
-        &mut diagnostics,
-        None,
-        Some(module_cache(state)?),
-    )
-    .map_err(|e| {
+    let host = host::for_protocol(ledger.protocol).ok_or_else(|| {
         RewindError::Replay(format!(
-            "the host refused to start (this usually means the ledger state is inconsistent \
-             with the transaction): {e}"
+            "no embedded host runs protocol {}",
+            ledger.protocol
         ))
     })?;
+    let invocation = Invocation {
+        host_function: tx.encoded_host_function()?,
+        resources: tx.encoded_resources()?,
+        source_account: tx.encoded_source_account()?,
+        auth: tx.encoded_auth()?,
+        restored_rw_indices: &tx.restored_rw_indices,
+        ledger: state.ledger_info.clone(),
+        entries: state.encoded_entries()?,
+        prng_seed: seed,
+        cpu_limit: budget_use.cpu_limit,
+        mem_limit: budget_use.mem_limit,
+        cpu_cost_params: codec::encode(&state.config.cpu_cost_params, "the CPU cost parameters")?,
+        mem_cost_params: codec::encode(
+            &state.config.mem_cost_params,
+            "the memory cost parameters",
+        )?,
+        contracts: contracts(state),
+    };
+    let output = host.invoke(&invocation).map_err(|failure| match failure {
+        host::Failure::Xdr(e) => RewindError::Replay(format!(
+            "could not hand the transaction to soroban-env-host {}: {e}",
+            host.version
+        )),
+        host::Failure::Budget(e) => {
+            RewindError::Replay(format!("could not configure the execution budget: {e}"))
+        }
+        host::Failure::ModuleCache(e) => {
+            RewindError::Replay(format!("could not set up the module cache: {e}"))
+        }
+        host::Failure::Start(e) => RewindError::Replay(format!(
+            "the host refused to start (this usually means the ledger state is inconsistent \
+             with the transaction): {e}"
+        )),
+        host::Failure::Rent(index) => RewindError::Replay(format!(
+            "could not size {} for rent",
+            state.slots.get(index).map_or_else(
+                || format!("footprint entry {index}"),
+                |slot| display::ledger_key(&slot.key)
+            )
+        )),
+    })?;
 
-    budget_use.cpu_insns = budget.get_cpu_insns_consumed().unwrap_or_default();
-    budget_use.mem_bytes = budget.get_mem_bytes_consumed().unwrap_or_default();
+    budget_use.cpu_insns = output.cpu_insns;
+    budget_use.mem_bytes = output.mem_bytes;
+    let mut diagnostics = output
+        .diagnostics
+        .iter()
+        .map(|event| from_host::<DiagnosticEvent>(event, "a diagnostic event"))
+        .collect::<Result<Vec<_>>>()?;
 
-    let (result, error) = match &output.encoded_invoke_result {
+    let (result, error) = match &output.result {
         Err(host_error) => (
             host_failure_code(&budget_use),
-            ScError::try_from(host_error).ok(),
+            host_error
+                .as_deref()
+                .map(|error| from_host::<ScError>(error, "the host error"))
+                .transpose()?,
         ),
         Ok(return_value) => {
             let checks = PostHostChecks {
                 write_bytes_limit: u64::from(tx.resources.write_bytes),
                 events_size_limit: u64::from(state.config.tx_max_contract_events_size_bytes),
             };
-            match checks.run(
-                &output.ledger_changes,
-                &output.encoded_contract_events,
-                return_value,
-            ) {
+            match checks.run(&output.changes, &output.contract_events, return_value) {
                 None => (
                     InvokeHostFunctionResult::Success(success_hash(
                         return_value,
-                        &output.encoded_contract_events,
+                        &output.contract_events,
                     )?),
                     None,
                 ),
@@ -299,17 +312,14 @@ impl PostHostChecks {
     /// The first limit the host output breaks, as stellar-core would report it.
     fn run(
         &self,
-        changes: &[LedgerEntryChange],
+        changes: &[Change],
         events: &[Vec<u8>],
         return_value: &[u8],
     ) -> Option<(ScError, DiagnosticEvent)> {
         // Every read-write entry that still exists is written back.
         let mut written = 0u64;
         for change in changes.iter().filter(|change| !change.read_only) {
-            written += change
-                .encoded_new_value
-                .as_ref()
-                .map_or(0, |v| v.len() as u64);
+            written += change.new_value.as_ref().map_or(0, |v| v.len() as u64);
             if written > self.write_bytes_limit {
                 return Some(core_error(
                     ScError::Budget(ScErrorCode::ExceededLimit),
@@ -406,56 +416,32 @@ fn success_hash(return_value: &[u8], events: &[Vec<u8>]) -> Result<Hash> {
     Ok(Hash(Sha256::digest(bytes).into()))
 }
 
-/// Pre-parse every contract in the footprint, the way stellar-core does.
-///
-/// Since protocol 23 core keeps all contract code parsed in a module cache,
-/// so an invocation is only charged for *instantiating* a module. Without the
-/// cache the host parses each module inside the invocation and charges for it,
-/// which inflates the instruction count by an order of a million per contract
-/// and can push a replay over a limit the network never hit.
-fn module_cache(state: &Reconstructed) -> Result<ModuleCache> {
-    let setup =
-        |e: HostError| RewindError::Replay(format!("could not set up the module cache: {e}"));
-
-    // Parsing is not charged to the transaction; give it room to work.
-    let budget = Budget::try_from_configs(
-        u64::MAX,
-        u64::MAX,
-        state.config.cpu_cost_params.clone(),
-        state.config.mem_cost_params.clone(),
-    )
-    .map_err(setup)?;
-    let context = Host::with_storage_and_budget(Storage::default(), budget);
-    let cache = ModuleCache::new(&context).map_err(setup)?;
-
-    for slot in &state.slots {
-        if slot.missing() || slot.archived() {
-            continue;
-        }
-        let Some(LedgerEntryData::ContractCode(code)) = slot.entry.as_ref().map(|e| &e.data) else {
-            continue;
-        };
-        let cost_inputs = match &code.ext {
-            ContractCodeEntryExt::V0 => VersionedContractCodeCostInputs::V0 {
-                wasm_bytes: code.code.len(),
+/// The contracts in the footprint, for the host's module cache.
+fn contracts(state: &Reconstructed) -> Vec<ContractCode> {
+    state
+        .slots
+        .iter()
+        .filter(|slot| !slot.missing() && !slot.archived())
+        .filter_map(|slot| match slot.entry.as_ref().map(|e| &e.data) {
+            Some(LedgerEntryData::ContractCode(code)) => Some(code),
+            _ => None,
+        })
+        .map(|code| ContractCode {
+            hash: code.hash.0,
+            wasm: code.code.to_vec(),
+            cost_inputs: match &code.ext {
+                ContractCodeEntryExt::V0 => None,
+                ContractCodeEntryExt::V1(v1) => v1.cost_inputs.to_xdr(Limits::none()).ok(),
             },
-            ContractCodeEntryExt::V1(v1) => {
-                VersionedContractCodeCostInputs::V1(v1.cost_inputs.clone())
-            }
-        };
-        // A module that does not parse is simply not cached; the host reports
-        // the problem itself if the transaction goes on to call it.
-        if let Err(e) = cache.parse_and_cache_module(
-            &context,
-            state.ledger_info.protocol_version,
-            &code.hash,
-            &code.code,
-            cost_inputs,
-        ) {
-            log::debug!(target: "replay", "module {} not cached: {e}", hex::encode(code.hash.0));
-        }
-    }
-    Ok(cache)
+        })
+        .collect()
+}
+
+/// Decode a value the host produced in its own XDR. XDR only grows, so the
+/// newest `stellar-xdr` reads what any embedded host writes.
+fn from_host<T: ReadXdr>(bytes: &[u8], what: &'static str) -> Result<T> {
+    T::from_xdr(bytes, Limits::none())
+        .map_err(|e| RewindError::Replay(format!("could not read {what} the host returned: {e}")))
 }
 
 /// A value from the `core_metrics` diagnostics stellar-core appends to every
@@ -589,14 +575,10 @@ mod tests {
         assert_eq!(host_failure_code(&budget(0, 101)), R::ResourceLimitExceeded);
     }
 
-    fn change(read_only: bool, new_value: Option<usize>) -> LedgerEntryChange {
-        LedgerEntryChange {
+    fn change(read_only: bool, new_value: Option<usize>) -> Change {
+        Change {
             read_only,
-            encoded_key: Vec::new(),
-            old_entry_size_bytes_for_rent: 0,
-            encoded_new_value: new_value.map(|n| vec![0; n]),
-            new_entry_size_bytes_for_rent: 0,
-            ttl_change: None,
+            new_value: new_value.map(|n| vec![0; n]),
         }
     }
 

@@ -10,6 +10,9 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 
 ### Added
 
+- Protocols 29 and 30 in one build: sororewind embeds both Soroban hosts and
+  replays each transaction with the one for its ledger's protocol, so testnet
+  and mainnet are covered across an upgrade. `--version` lists them.
 - Fee-bumped Soroban transactions are replayed; the header and JSON say so.
 - `--network futurenet` and `--network local`. An explicit `--network` is
   checked against the RPC's passphrase.
@@ -18,7 +21,7 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 - The footprint report separates value drift, TTL drift, archived entries and
   network-settings drift.
 - `--json` documents carry `schemaVersion: 1`.
-- `sororewind --version` shows the protocol and host version it replays.
+- `sororewind --version` shows the protocols and host versions it replays.
 
 ### Changed
 

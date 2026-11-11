@@ -58,7 +58,7 @@ Run `just` to see the other tasks.
   updated `.snap` files with your change.
 - `just live` runs the live tests against the public RPCs, as the nightly CI
   job does. They check that recent testnet failures replay, and that no
-  network has moved to a protocol newer than the one this build embeds.
+  network has moved to a protocol newer than every host this build embeds.
 
 To test a situation no fixture covers, rewrite a fixture's RPC responses in
 memory with `common::Overlay` instead of recording a new one. See
@@ -79,44 +79,54 @@ just record contract-error <TX_HASH>
 
 ## Protocol upgrades
 
-sororewind embeds one `soroban-env-host`, and the host refuses to execute a
-ledger from any other protocol. The day a network upgrades, this build stops
-replaying its transactions. The nightly `live` job fails when testnet or
-mainnet runs a protocol newer than the embedded one; that is the signal to
-start.
+Each `soroban-env-host` refuses to execute a ledger from any protocol but its
+own. sororewind therefore embeds two hosts, for the previous and the current
+protocol, the way stellar-core does across an upgrade: testnet moves to a new
+protocol weeks before mainnet, and one build covers both. Each transaction is
+replayed by the host for its ledger's protocol (`src/host/`).
 
-Testnet upgrades before mainnet. Between the two upgrades, a build serves only
-one of them: a build for the new protocol cannot replay mainnet until mainnet
-catches up. Keep the previous release available for that window.
+The nightly `live` job fails when testnet or mainnet runs a protocol newer
+than every embedded host; that is the signal to start. The checklist, for a
+new protocol N:
 
-The checklist:
-
-1. **Bump the lockstep pair.** In `Cargo.toml`, move `stellar-xdr` and
-   `soroban-env-host` to the new protocol's major version together (the host's
-   major version is the protocol it executes). Then run:
-
-   ```bash
-   cargo update -p soroban-env-host -p stellar-xdr
-   ```
-
-   Dependabot deliberately leaves these major versions to you.
-2. **Make it build.** New XDR variants show up as non-exhaustive `match`
+1. **Add host N.** In `Cargo.toml`, add
+   `soroban-env-host-pN = { package = "soroban-env-host", version = "=N.x.y" }`,
+   pinned exactly. Copy `src/host/p<N-1>.rs` to `src/host/pN.rs`, change its
+   `use` line, and add it to `mod` and `HOSTS` in `src/host/mod.rs`.
+2. **Drop the oldest host**, so at most two remain: remove its `pNN.rs`, its
+   `HOSTS` entry and its `Cargo.toml` line. Keep it a little longer only if
+   mainnet has not upgraded yet.
+3. **Move `stellar-xdr` to the one host N pins.** The rest of the crate uses
+   only the newest XDR. The host's major version is not always the XDR's: host
+   29 pins `stellar-xdr` 28. Find the right one with
+   `cargo tree -p soroban-env-common@N.x.y -e normal --depth 1`. Dependabot
+   deliberately leaves these versions to you.
+4. **Make it build.** New XDR variants show up as non-exhaustive `match`
    errors; decide what each one means for replay rather than adding a
-   catch-all. Check `replay.rs` for changes to the `invoke_host_function`
-   signature.
-3. **Re-check what replay mirrors from stellar-core.** Review each of these
-   against the new protocol's CAPs and core release notes. Where the comment
-   says when it was last checked, update the date and protocol:
+   catch-all. If the new host changes an API that `src/host/proto.rs` uses,
+   adapt it there for every host, behind a small per-host shim if needed.
+5. **Re-check what replay mirrors from stellar-core**, against the new
+   protocol's CAPs and core release notes. Where a comment says when it was
+   last checked, update the date and protocol. If a rule differs between the
+   two embedded protocols, gate it on `ledger.protocol` instead of changing it
+   for both. What to review:
    - the PRNG seed derivation (`replay::prng_seed`);
    - the post-host checks (`PostHostChecks` in `replay.rs`);
    - the network settings read (`CONFIG_SETTINGS` in `state.rs`);
    - the liveness and TTL rules (top of `state.rs`).
-4. **Re-record every fixture.** Old fixtures now fail with a protocol
-   mismatch. Their hashes are gone from the RPC, so record fresh transactions
-   (README, Fixtures), then review the snapshots with `just snap`.
-5. **Run `just check` and `just live`.**
-6. **Update the docs.** Update protocol mentions in the README, and add the
-   upgrade to `CHANGELOG.md`.
+6. **Fixtures.** Record fixtures for protocol N on testnet (README,
+   Fixtures). Keep the previous protocol's fixtures while its host stays,
+   including a `mainnet-*` one while mainnet runs it, and remove those of a
+   dropped host. Review the snapshots with `just snap`.
+7. **Run `just check` and `just live`.**
+8. **Update the docs.** Update the protocol mentions in the README, and add
+   the upgrade to `CHANGELOG.md`.
+
+The two hosts are linked in one ordinary Cargo build, so their shared
+dependencies resolve to one version each. stellar-core does not do this in
+production builds, because a different transitive version could change what
+the host charges. For a replay tool the fidelity check catches that: a cost
+difference that matters shows up as a divergence, not as a wrong answer.
 
 ## Releases
 

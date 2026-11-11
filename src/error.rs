@@ -81,7 +81,7 @@ pub enum RewindError {
 
     #[error(
         "cannot replay transaction {hash}: it ran on protocol {tx_protocol}, but this build of\n\
-         sororewind embeds protocol {host_protocol} (soroban-env-host {host_version}).\n\
+         sororewind embeds protocols {supported}.\n\
          \n\
          The Soroban host refuses to execute a ledger whose protocol version differs from its own,\n\
          so replay would be meaningless. Use a sororewind build that embeds soroban-env-host \
@@ -93,8 +93,8 @@ pub enum RewindError {
     ProtocolMismatch {
         hash: TxHash,
         tx_protocol: u32,
-        host_protocol: u32,
-        host_version: &'static str,
+        /// The protocols this build replays, with their host versions.
+        supported: String,
         network: NetworkId,
     },
 

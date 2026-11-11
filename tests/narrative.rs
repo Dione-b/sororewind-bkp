@@ -1,7 +1,8 @@
 //! Snapshot tests over the recorded fixtures.
 //!
 //! Every directory under `fixtures/` is a complete offline RPC recording of
-//! one failed testnet transaction (see `src/transport.rs` for the layout).
+//! one failed transaction, on testnet unless its name starts with `mainnet-`
+//! (see `src/transport.rs` for the layout).
 //! Each fixture gets its own test, replayed once, in-process, through the
 //! same pipeline the binary runs; the test pins the narrative, the exit code
 //! and the JSON document together. Nothing here touches the network.
@@ -43,7 +44,12 @@ async fn check(name: &str, expected: Outcome) {
         expected == Outcome::Matched,
         "{name}"
     );
-    assert_eq!(json["network"], "testnet", "{name}");
+    let network = if name.starts_with("mainnet-") {
+        "mainnet"
+    } else {
+        "testnet"
+    };
+    assert_eq!(json["network"], network, "{name}");
     assert_eq!(json["status"], "FAILED", "{name}");
     assert_eq!(
         json["result"]["onchain"]["code"] == json["result"]["local"]["code"],
@@ -81,6 +87,8 @@ fixtures! {
     budget_error: "budget-error" => Matched,
     contract_error: "contract-error" => Matched,
     storage_error: "storage-error" => Matched,
+    // Protocol 29, replayed by the older embedded host.
+    mainnet_auth_error: "mainnet-auth-error" => Matched,
 }
 
 /// A fixture directory without a test is a recording nobody checks.
