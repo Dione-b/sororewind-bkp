@@ -24,7 +24,8 @@ pub struct DecodedTx {
     pub ledger: u32,
     /// The envelope was a fee-bump wrapping the Soroban transaction.
     pub fee_bump: bool,
-    /// One-based position in the ledger's apply order, when the RPC reports it.
+    /// One-based position in the ledger's apply order, when the RPC reports
+    /// it. Zero is not a position: its readers treat it as unknown.
     pub application_order: Option<u32>,
 
     /// The account the host treats as the transaction invoker.
@@ -85,15 +86,15 @@ pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
         hash: hash.clone(),
         reason,
     };
-    let field = |value: &Option<String>, field: &'static str| {
-        value.clone().ok_or(RewindError::MissingField {
+    fn field<'a>(value: &'a Option<String>, field: &'static str) -> Result<&'a str> {
+        value.as_deref().ok_or(RewindError::MissingField {
             method: "getTransaction",
             field,
         })
-    };
+    }
 
     let envelope: TransactionEnvelope =
-        codec::decode(&field(&raw.envelope_xdr, "envelopeXdr")?, "envelopeXdr")?;
+        codec::decode(field(&raw.envelope_xdr, "envelopeXdr")?, "envelopeXdr")?;
 
     // A fee-bump only changes who pays: the Soroban transaction is its inner
     // transaction, and that is what the host executes.
@@ -144,7 +145,7 @@ pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
     })?;
 
     let tx_result: TransactionResult =
-        codec::decode(&field(&raw.result_xdr, "resultXdr")?, "resultXdr")?;
+        codec::decode(field(&raw.result_xdr, "resultXdr")?, "resultXdr")?;
     let onchain_result = extract_invoke_result(&tx_result, hash)?;
 
     let onchain_diagnostic_events = match raw.result_meta_xdr.as_deref() {
@@ -165,7 +166,7 @@ pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
         hash: hash.clone(),
         ledger,
         fee_bump,
-        application_order: raw.application_order.filter(|order| *order > 0),
+        application_order: raw.application_order,
         source_account,
         host_function: invoke.host_function.clone(),
         resources: soroban_data.resources,

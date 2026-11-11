@@ -37,10 +37,14 @@ pub struct Request {
 pub async fn run(rpc: &RpcClient, request: &Request) -> Result<Report> {
     let fetched = fetch(rpc, request).await?;
     let tx = tx::decode(&request.hash, &fetched.raw)?;
-    let ledger = state::read_ledger(rpc, tx.ledger, &fetched.passphrase).await?;
-    guard_protocol(&tx, &ledger, &fetched.network)?;
-    let state = state::reconstruct(rpc, &tx, &ledger).await?;
-    let outcome = replay::replay(&tx, &state, &ledger)?;
+    // The header and the entries do not depend on each other: one round trip.
+    let (ledger, entries) = tokio::try_join!(
+        state::read_ledger(rpc, tx.ledger, &fetched.passphrase),
+        state::fetch(rpc, &tx),
+    )?;
+    let host = embedded_host(&tx, &ledger, &fetched.network)?;
+    let state = state::reconstruct(rpc, &tx, &ledger, entries).await?;
+    let outcome = replay::replay(host, &tx, &state, &ledger)?;
     let fidelity = replay::compare(&tx, &outcome);
     let story = narrate(rpc, request, &state, &outcome).await?;
 
@@ -112,13 +116,15 @@ async fn fetch(rpc: &RpcClient, request: &Request) -> Result<Fetched> {
     }
 }
 
-/// Each host hard-rejects any ledger whose protocol differs from its own, so
-/// checking here turns a cryptic host error into an actionable sentence.
-fn guard_protocol(tx: &DecodedTx, ledger: &LedgerContext, network: &NetworkId) -> Result<()> {
-    if host::for_protocol(ledger.protocol).is_some() {
-        return Ok(());
-    }
-    Err(RewindError::ProtocolMismatch {
+/// The embedded host for the transaction's ledger. Each host hard-rejects
+/// any ledger whose protocol differs from its own, so checking here turns a
+/// cryptic host error into an actionable sentence.
+fn embedded_host(
+    tx: &DecodedTx,
+    ledger: &LedgerContext,
+    network: &NetworkId,
+) -> Result<&'static host::Host> {
+    host::for_protocol(ledger.protocol).ok_or_else(|| RewindError::ProtocolMismatch {
         hash: tx.hash.clone(),
         tx_protocol: ledger.protocol,
         supported: host::describe(),

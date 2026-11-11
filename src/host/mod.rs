@@ -36,18 +36,19 @@ pub struct LedgerInfo {
 
 /// A footprint entry the host should see.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
+pub struct Entry<'a> {
     /// The `LedgerEntry`, XDR-encoded.
-    pub xdr: Vec<u8>,
+    pub xdr: &'a [u8],
     /// Its TTL, for contract data and code; `None` for classic entries.
     pub live_until: Option<u32>,
 }
 
 /// A contract to parse into the module cache before the invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContractCode {
+pub struct ContractCode<'a> {
     pub hash: [u8; 32],
-    pub wasm: Vec<u8>,
+    /// Borrowed from the footprint entry: a contract can be 128 KB.
+    pub wasm: &'a [u8],
     /// `ContractCodeCostInputs`, XDR-encoded, when the entry records them.
     pub cost_inputs: Option<Vec<u8>>,
 }
@@ -65,14 +66,14 @@ pub struct Invocation<'a> {
     pub ledger: LedgerInfo,
     /// One item per footprint key, in footprint order; `None` where the host
     /// should see no entry.
-    pub entries: Vec<Option<Entry>>,
+    pub entries: Vec<Option<Entry<'a>>>,
     pub prng_seed: [u8; 32],
     pub cpu_limit: u64,
     pub mem_limit: u64,
     /// The network's `ContractCostParams`, XDR-encoded.
     pub cpu_cost_params: Vec<u8>,
     pub mem_cost_params: Vec<u8>,
-    pub contracts: Vec<ContractCode>,
+    pub contracts: Vec<ContractCode<'a>>,
 }
 
 /// What one footprint entry became.

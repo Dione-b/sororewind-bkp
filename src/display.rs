@@ -77,16 +77,6 @@ pub fn result_code(result: &InvokeHostFunctionResult) -> &'static str {
     }
 }
 
-/// The same result in the words a person would use.
-pub fn result_label(result: &InvokeHostFunctionResult) -> String {
-    match result {
-        InvokeHostFunctionResult::Success(hash) => {
-            format!("success (result hash {})", hex::encode(hash.0))
-        }
-        other => result_code(other).replace('_', " "),
-    }
-}
-
 // --- values -----------------------------------------------------------------
 
 /// Nesting beyond this is elided as `…`; diagnostics are meant to be skimmed.
@@ -373,21 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn labels_results() {
+    fn names_result_codes() {
         use InvokeHostFunctionResult as R;
-        assert_eq!(result_label(&R::Trapped), "trapped");
-        assert_eq!(
-            result_label(&R::ResourceLimitExceeded),
-            "resource limit exceeded"
-        );
+        assert_eq!(result_code(&R::Trapped), "trapped");
         assert_eq!(
             result_code(&R::InsufficientRefundableFee),
             "insufficient_refundable_fee"
         );
-        assert_eq!(
-            result_label(&R::Success(Hash([0xab; 32]))),
-            format!("success (result hash {})", "ab".repeat(32))
-        );
+        assert_eq!(result_code(&R::Success(Hash([0xab; 32]))), "success");
     }
 
     #[test]

@@ -577,16 +577,15 @@ pub fn sample_report() -> Report {
     let events = [
         fn_call(None, C, "outer", vec![ScVal::U32(1), string("two")]),
         log_event(Some(C), "starting"),
+        // A `try_call` that fails and is recovered from.
         fn_call(Some(C), C, "probe", vec![]),
-        fn_return(C, "probe", ScVal::Void),
+        error_event(Some(C), ScError::Contract(9), "probe failed"),
         fn_call(Some(C), C, "inner", vec![]),
         log_event(Some(C), "about to fail"),
         error_event(Some(C), fatal.clone(), "balance too low"),
         error_event(Some(C), fatal.clone(), "escalating"),
     ];
     let mut story = Story::build(&events, Some(&fatal));
-    // Pretend `probe` was a recovered try_call so that rendering is covered.
-    story.calls[1].recovered = true;
     if let Some(failure) = &mut story.failure {
         failure.name = Some("InsufficientBalance".to_string());
         failure.name_origin = Some("spec enum Error".to_string());

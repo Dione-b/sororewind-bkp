@@ -186,7 +186,9 @@ fn error_of(event: &DiagnosticEvent) -> Option<&ScError> {
     }
 }
 
+/// Re-execute `tx` with `host`, the embedded host for the ledger's protocol.
 pub fn replay(
+    host: &host::Host,
     tx: &DecodedTx,
     state: &Reconstructed,
     ledger: &LedgerContext,
@@ -203,7 +205,7 @@ pub fn replay(
 
     // stellar-core loads the footprint before it invokes the host, and gives
     // up at the first entry it cannot take.
-    if let Some((result, error, event)) = footprint_checks(tx, state)? {
+    if let Some((result, error, event)) = footprint_checks(tx, state) {
         return Ok(ReplayOutcome {
             result,
             error: Some(error),
@@ -213,12 +215,6 @@ pub fn replay(
         });
     }
 
-    let host = host::for_protocol(ledger.protocol).ok_or_else(|| {
-        RewindError::Replay(format!(
-            "no embedded host runs protocol {}",
-            ledger.protocol
-        ))
-    })?;
     let restored_rw_indices = state.restored_rw_indices();
     let invocation = Invocation {
         host_function: tx.encoded_host_function()?,
@@ -227,7 +223,7 @@ pub fn replay(
         auth: tx.encoded_auth()?,
         restored_rw_indices: &restored_rw_indices,
         ledger: state.ledger_info.clone(),
-        entries: state.encoded_entries()?,
+        entries: state.encoded_entries(),
         prng_seed: seed,
         cpu_limit: budget_use.cpu_limit,
         mem_limit: budget_use.mem_limit,
@@ -378,7 +374,7 @@ impl SizeLimits {
 /// stellar-core's `addReads`: walk the footprint in order and fail at the
 /// first entry that is archived, too large, or pushes the bytes read from
 /// disk over what the transaction declared.
-fn footprint_checks(tx: &DecodedTx, state: &Reconstructed) -> Result<Option<Failed>> {
+fn footprint_checks(tx: &DecodedTx, state: &Reconstructed) -> Option<Failed> {
     let sizes = SizeLimits::of(state);
     let disk_read_limit = u64::from(tx.resources.disk_read_bytes);
     let mut disk_read = 0u64;
@@ -386,18 +382,17 @@ fn footprint_checks(tx: &DecodedTx, state: &Reconstructed) -> Result<Option<Fail
     for slot in &state.slots {
         if slot.archived() {
             let (error, event) = archived_entry_error(slot);
-            return Ok(Some((
-                InvokeHostFunctionResult::EntryArchived,
-                error,
-                event,
-            )));
+            return Some((InvokeHostFunctionResult::EntryArchived, error, event));
         }
-        let Some(entry) = slot.entry.as_ref().filter(|_| !slot.missing()) else {
+        let (Some(entry), Some(xdr)) = (&slot.entry, &slot.entry_xdr) else {
             continue;
         };
-        let size = codec::encode(entry, "a footprint entry")?.len() as u64;
+        if slot.missing() {
+            continue;
+        }
+        let size = xdr.len() as u64;
         if let Some(failed) = sizes.check(&entry.data, size) {
-            return Ok(Some(failed));
+            return Some(failed);
         }
         // Since protocol 23 live Soroban entries are served from memory; only
         // classic entries and restored ones are disk reads.
@@ -408,15 +403,15 @@ fn footprint_checks(tx: &DecodedTx, state: &Reconstructed) -> Result<Option<Fail
         if !soroban || slot.restored() {
             disk_read += size;
             if disk_read > disk_read_limit {
-                return Ok(Some(limit_exceeded(
+                return Some(limit_exceeded(
                     "operation byte-read resources exceeds amount specified",
                     disk_read,
                     disk_read_limit,
-                )));
+                ));
             }
         }
     }
-    Ok(None)
+    None
 }
 
 /// What the transaction declared and what the run produced, as the fee
@@ -630,7 +625,7 @@ fn success_hash(return_value: &[u8], events: &[Vec<u8>]) -> Result<Hash> {
 /// Core's cache holds the code that is *live*: an archived contract the
 /// transaction restores is not in it, so the host parses that module inside
 /// the invocation and charges the transaction for it.
-fn contracts(state: &Reconstructed) -> Result<Vec<ContractCode>> {
+fn contracts(state: &Reconstructed) -> Result<Vec<ContractCode<'_>>> {
     state
         .slots
         .iter()
@@ -642,7 +637,7 @@ fn contracts(state: &Reconstructed) -> Result<Vec<ContractCode>> {
         .map(|code| {
             Ok(ContractCode {
                 hash: code.hash.0,
-                wasm: code.code.to_vec(),
+                wasm: code.code.as_slice(),
                 cost_inputs: match &code.ext {
                     ContractCodeEntryExt::V0 => None,
                     ContractCodeEntryExt::V1(v1) => Some(codec::encode(

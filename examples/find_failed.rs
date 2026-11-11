@@ -13,8 +13,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use sororewind::discover::{recent_failures, Search};
-use sororewind::display;
 use sororewind::network::NetworkId;
+use sororewind::report::ResultSummary;
 use sororewind::rpc::RpcClient;
 use sororewind::transport::HttpTransport;
 use sororewind::Network;
@@ -75,7 +75,7 @@ async fn main() -> ExitCode {
                     candidate.category,
                     candidate.hash,
                     candidate.ledger,
-                    display::result_label(&candidate.result)
+                    ResultSummary::from(&candidate.result).label()
                 );
             }
             ExitCode::SUCCESS

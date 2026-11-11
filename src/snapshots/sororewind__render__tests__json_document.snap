@@ -38,6 +38,7 @@ expression: json(&sample_report()).unwrap()
     "function": "inner",
     "depth": 1,
     "trail": [
+      "probe failed",
       "balance too low",
       "escalating"
     ],
@@ -71,8 +72,8 @@ expression: json(&sample_report()).unwrap()
       "function": "probe",
       "args": [],
       "argsXdr": [],
-      "returned": "void",
-      "returnedXdr": "AAAAAQ==",
+      "returned": null,
+      "returnedXdr": null,
       "open": false,
       "recovered": true,
       "failure": false,

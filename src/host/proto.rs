@@ -68,11 +68,11 @@ pub fn invoke(invocation: &Invocation<'_>) -> Result<Output, Failure> {
                 None => None,
                 Some(live_until_ledger) => Some(TtlLedgerEntryMeta {
                     live_until_ledger,
-                    entry_size_for_rent: rent_size(&unmetered, &entry.xdr)
+                    entry_size_for_rent: rent_size(&unmetered, entry.xdr)
                         .ok_or(Failure::Rent(index))?,
                 }),
             };
-            Ok((Some(entry.xdr.as_slice()), ttl))
+            Ok((Some(entry.xdr), ttl))
         })
         .collect::<Result<Vec<_>, Failure>>()?;
 
@@ -283,7 +283,7 @@ fn module_cache(
             &context,
             invocation.ledger.protocol_version,
             &Hash(contract.hash),
-            &contract.wasm,
+            contract.wasm,
             cost_inputs,
         ) {
             log::debug!(target: "replay", "module {} not cached: {e}", hex::encode(contract.hash));

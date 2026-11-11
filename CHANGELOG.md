@@ -70,6 +70,8 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 
 - The minimum supported Rust is 1.89.
 - `getLedgers` fetches one ledger instead of 50 (about 14 MB less per run).
+- The ledger header and the footprint entries are fetched concurrently, and
+  footprint entries and contract code are encoded and copied once.
 - Missing or malformed network settings and durable entries without a TTL are
   errors instead of silent fallbacks.
 - Invalid command-line flags exit with code 1, so `2` always means

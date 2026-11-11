@@ -555,6 +555,9 @@ pub struct FootprintSlot {
     pub key: LedgerKey,
     pub key_xdr: Vec<u8>,
     pub entry: Option<LedgerEntry>,
+    /// `entry`, XDR-encoded once: the bytes the host is handed, and the size
+    /// stellar-core's limits are checked against.
+    pub entry_xdr: Option<Vec<u8>>,
     pub last_modified: Option<u32>,
     pub liveness: Liveness,
     pub ttl_drift: Option<TtlDrift>,
@@ -590,6 +593,7 @@ impl FootprintSlot {
             key,
             key_xdr,
             entry: None,
+            entry_xdr: None,
             last_modified: None,
             liveness: Liveness::Absent,
             ttl_drift: None,
@@ -629,9 +633,10 @@ impl FootprintSlot {
             live_until = past.live_until;
         }
 
-        if slot.entry.is_none() {
+        let Some(entry) = &slot.entry else {
             return Ok(slot);
-        }
+        };
+        slot.entry_xdr = Some(codec::encode(entry, "a footprint entry")?);
         (slot.liveness, slot.ttl_drift) = match durability {
             None => (Liveness::Untracked, None),
             Some(durability) => {
@@ -678,19 +683,16 @@ impl FootprintSlot {
     }
 
     /// The slot as the host should see it; `None` where it sees no entry.
-    fn encoded(&self) -> Result<Option<Entry>> {
+    fn encoded(&self) -> Option<Entry<'_>> {
         let live_until = match self.liveness {
-            Liveness::Absent | Liveness::Expired | Liveness::Archived { .. } => return Ok(None),
+            Liveness::Absent | Liveness::Expired | Liveness::Archived { .. } => return None,
             Liveness::Untracked => None,
             Liveness::Live { live_until } | Liveness::Restored { live_until } => Some(live_until),
         };
-        let Some(entry) = &self.entry else {
-            return Ok(None);
-        };
-        Ok(Some(Entry {
-            xdr: codec::encode(entry, "a footprint entry")?,
+        Some(Entry {
+            xdr: self.entry_xdr.as_deref()?,
             live_until,
-        }))
+        })
     }
 }
 
@@ -710,7 +712,7 @@ pub struct Reconstructed {
 impl Reconstructed {
     /// Encode the slots exactly as `invoke_host_function` wants them: one item
     /// per footprint key, `None` where the host should see no entry.
-    pub fn encoded_entries(&self) -> Result<Vec<Option<Entry>>> {
+    pub fn encoded_entries(&self) -> Vec<Option<Entry<'_>>> {
         self.slots.iter().map(FootprintSlot::encoded).collect()
     }
 
@@ -732,11 +734,18 @@ impl Reconstructed {
     }
 }
 
-pub async fn reconstruct(
-    rpc: &RpcClient,
-    tx: &DecodedTx,
-    ledger: &LedgerContext,
-) -> Result<Reconstructed> {
+/// What `getLedgerEntries` says about the footprint and the network's
+/// settings now. Fetching it needs nothing but the transaction, so it runs
+/// alongside [`read_ledger`].
+#[derive(Debug)]
+pub struct Fetched {
+    footprint: Vec<LedgerKey>,
+    key_xdr: Vec<Vec<u8>>,
+    entries: Vec<Option<RawLedgerEntry>>,
+    config_entries: Vec<Option<RawLedgerEntry>>,
+}
+
+pub async fn fetch(rpc: &RpcClient, tx: &DecodedTx) -> Result<Fetched> {
     let footprint = tx.footprint_keys();
     let key_xdr: Vec<Vec<u8>> = footprint
         .iter()
@@ -761,6 +770,27 @@ pub async fn reconstruct(
 
     let mut entries = rpc.get_ledger_entries(&keys).await?;
     let config_entries = entries.split_off(footprint.len());
+    Ok(Fetched {
+        footprint,
+        key_xdr,
+        entries,
+        config_entries,
+    })
+}
+
+/// Turn what was fetched into the ledger the transaction saw.
+pub async fn reconstruct(
+    rpc: &RpcClient,
+    tx: &DecodedTx,
+    ledger: &LedgerContext,
+    fetched: Fetched,
+) -> Result<Reconstructed> {
+    let Fetched {
+        footprint,
+        key_xdr,
+        entries,
+        config_entries,
+    } = fetched;
     let config = build_config(&config_entries, ledger.sequence)?;
 
     let Rebuild { past, note } = history::rebuild(
@@ -1097,7 +1127,7 @@ mod tests {
         // Classic entry: handed over without TTL metadata.
         let classic = slot_of(&account_entry([1; 32], 10), None, false).unwrap();
         assert_eq!(classic.liveness, Liveness::Untracked);
-        assert_eq!(classic.encoded().unwrap().unwrap().live_until, None);
+        assert_eq!(classic.encoded().unwrap().live_until, None);
 
         // Live durable entry: entry plus TTL.
         let live = slot_of(
@@ -1106,10 +1136,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(
-            live.encoded().unwrap().unwrap().live_until,
-            Some(TX_LEDGER + 5)
-        );
+        assert_eq!(live.encoded().unwrap().live_until, Some(TX_LEDGER + 5));
         assert!(!live.missing() && !live.archived() && !live.restored());
 
         // Expired temporary entry: nothing.
@@ -1120,20 +1147,17 @@ mod tests {
         )
         .unwrap();
         assert!(expired.missing());
-        assert_eq!(expired.encoded().unwrap(), None);
+        assert_eq!(expired.encoded(), None);
 
         // Archived code entry: flagged, and never handed to the host.
         let archived = slot_of(&code_entry(b"wasm", 10), Some(TX_LEDGER - 1), false).unwrap();
         assert!(archived.archived());
-        assert_eq!(archived.encoded().unwrap(), None);
+        assert_eq!(archived.encoded(), None);
 
         // Restorable archived entry: handed over with the restored TTL.
         let restored = slot_of(&code_entry(b"wasm", 10), Some(TX_LEDGER - 1), true).unwrap();
         assert!(restored.restored());
-        assert_eq!(
-            restored.encoded().unwrap().unwrap().live_until,
-            Some(TX_LEDGER + 99)
-        );
+        assert_eq!(restored.encoded().unwrap().live_until, Some(TX_LEDGER + 99));
 
         // Absent entry.
         let key = crate::test_support::key_of(&account_entry([1; 32], 10));
