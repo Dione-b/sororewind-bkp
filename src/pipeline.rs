@@ -91,13 +91,23 @@ async fn fetch(rpc: &RpcClient, request: &Request) -> Result<Fetched> {
             hash: request.hash.clone(),
             network,
             // Only used to word the error, so a failed probe is not an error.
-            retention: match rpc.health().await {
-                Ok(health) if health.ledger_retention_window > 0 => Retention::Reported {
-                    window: health.ledger_retention_window,
-                    oldest: health.oldest_ledger,
-                },
+            retention: match rpc.health().await.map(|health| {
+                (
+                    health.ledger_retention_window.filter(|window| *window > 0),
+                    health.oldest_ledger,
+                )
+            }) {
+                Ok((Some(window), oldest)) => Retention::Reported { window, oldest },
                 _ => Retention::Unknown,
             },
+        }),
+        TxStatus::Unknown => Err(RewindError::Rpc {
+            origin: rpc.origin(),
+            method: "getTransaction".to_string(),
+            code: None,
+            detail: "the transaction has a status this build of sororewind does not know \
+                     (neither SUCCESS, FAILED nor NOT_FOUND)"
+                .to_string(),
         }),
     }
 }

@@ -45,7 +45,9 @@ pub struct Cli {
     #[arg(long, short = 'n', value_enum)]
     pub network: Option<Network>,
 
-    /// Use this RPC endpoint instead of the default for --network
+    /// Use this RPC endpoint instead of the default for --network. Prefer the
+    /// SOROREWIND_RPC_URL environment variable for a URL that holds an API
+    /// key: arguments end up in shell history and process listings
     #[arg(long, value_name = "URL", conflicts_with = "fixture")]
     pub rpc_url: Option<String>,
 
@@ -91,6 +93,15 @@ static VERSION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// The environment variable that names the RPC endpoint when `--rpc-url` is
+/// not given.
+pub const RPC_URL_ENV: &str = "SOROREWIND_RPC_URL";
+
+/// The endpoint an environment value names; an empty value names none.
+fn rpc_url_from(value: Option<String>) -> Option<String> {
+    value.filter(|url| !url.trim().is_empty())
+}
+
 impl Cli {
     pub fn command() -> clap::Command {
         <Cli as CommandFactory>::command().version(VERSION.as_str())
@@ -133,12 +144,16 @@ impl Cli {
                 let hash = self.tx_hash.clone().ok_or(RewindError::InvalidHash {
                     hash: String::new(),
                 })?;
-                let url = self.rpc_url.clone().unwrap_or_else(|| {
-                    self.network
-                        .unwrap_or(Network::Testnet)
-                        .default_rpc_url()
-                        .to_string()
-                });
+                let url = self
+                    .rpc_url
+                    .clone()
+                    .or_else(|| rpc_url_from(std::env::var(RPC_URL_ENV).ok()))
+                    .unwrap_or_else(|| {
+                        self.network
+                            .unwrap_or(Network::Testnet)
+                            .default_rpc_url()
+                            .to_string()
+                    });
                 let http = HttpTransport::new(url)?;
                 let rpc = match &self.record {
                     Some(dir) => RpcClient::new(Recording::create(http, dir, &hash).await?),
@@ -220,6 +235,16 @@ mod tests {
         }
         assert!(parse(&[HASH, "--network", "moon"]).is_err());
         assert_eq!(parse(&[HASH, "-vv"]).unwrap().verbose, 2);
+    }
+
+    #[test]
+    fn the_environment_can_name_the_rpc() {
+        assert_eq!(
+            rpc_url_from(Some("https://rpc.example/key".to_string())).as_deref(),
+            Some("https://rpc.example/key")
+        );
+        assert_eq!(rpc_url_from(Some("  ".to_string())), None);
+        assert_eq!(rpc_url_from(None), None);
     }
 
     #[test]

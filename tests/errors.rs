@@ -215,7 +215,40 @@ async fn rpc_error_response() {
         json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602, "message": "invalid hash" } }),
     );
     let err = fails(overlay, "invalid hash").await;
+    // The JSON-RPC code is kept, and shown.
+    assert!(matches!(
+        err,
+        RewindError::Rpc {
+            code: Some(-32602),
+            ..
+        }
+    ));
+    assert!(err.to_string().ends_with("(JSON-RPC code -32602)"), "{err}");
+}
+
+#[tokio::test]
+async fn transaction_with_an_unknown_status() {
+    let overlay = Overlay::on(FIXTURE)
+        .await
+        .rewrite_result("getTransaction", transaction("status", json!("PENDING")));
+    let err = fails(overlay, "a status this build of sororewind does not know").await;
     assert!(matches!(err, RewindError::Rpc { .. }));
+}
+
+#[tokio::test]
+async fn ledger_outside_the_rpc_window() {
+    // What stellar-rpc answers for a `startLedger` it no longer keeps.
+    let overlay = Overlay::on(FIXTURE).await.respond(
+        "getLedgers",
+        json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32600, "message":
+            "start ledger (5) must be between the oldest ledger: 5559289 and the latest \
+             ledger: 5680248 for this rpc instance" } }),
+    );
+    let err = fails(overlay, "in its retention window").await;
+    assert!(
+        matches!(err, RewindError::LedgerUnavailable { .. }),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]

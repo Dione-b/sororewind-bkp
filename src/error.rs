@@ -36,7 +36,9 @@ pub enum RewindError {
 
     #[error("cannot reach the RPC at {url}: {detail}")]
     RpcUnreachable {
+        /// The endpoint, redacted: see `transport::redact`.
         url: String,
+        /// The whole cause chain, innermost last.
         detail: String,
         #[source]
         source: reqwest::Error,
@@ -45,10 +47,12 @@ pub enum RewindError {
     #[error("could not set up the HTTP client: {0}")]
     HttpClient(#[source] reqwest::Error),
 
-    #[error("the RPC ({origin}) returned an error for {method}: {detail}")]
+    #[error("the RPC ({origin}) returned an error for {method}: {detail}{}", code_suffix(*.code))]
     Rpc {
         origin: String,
         method: String,
+        /// The JSON-RPC error code, when the failure was a JSON-RPC error.
+        code: Option<i64>,
         detail: String,
     },
 
@@ -198,7 +202,22 @@ pub enum RewindError {
     Replay(String),
 }
 
+fn code_suffix(code: Option<i64>) -> String {
+    code.map_or(String::new(), |code| format!(" (JSON-RPC code {code})"))
+}
+
 impl RewindError {
+    /// stellar-rpc's answer to a `startLedger` outside what it keeps: "start
+    /// ledger (N) must be between the oldest ledger: A and the latest ledger:
+    /// B for this rpc instance", code -32600 (checked against testnet and
+    /// mainnet, 2026-11-11).
+    pub fn is_ledger_out_of_range(&self) -> bool {
+        matches!(
+            self,
+            RewindError::Rpc { detail, .. } if detail.contains("must be between the oldest ledger")
+        )
+    }
+
     /// A stable machine name for the kind of failure, for the `--json` error
     /// document. Names are part of the public interface: add, never rename.
     pub fn kind(&self) -> &'static str {
@@ -246,20 +265,26 @@ impl RewindError {
 /// answered at all. Only used to word [`RewindError::NotFound`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retention {
-    Reported { window: u32, oldest: u32 },
+    Reported { window: u32, oldest: Option<u32> },
     Unknown,
 }
 
 impl fmt::Display for Retention {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Retention::Reported { window, oldest } => write!(
-                f,
-                "The RPC only keeps transactions for its retention window ({window} ledgers, \
-                 about {} days).\nOldest ledger available: {oldest}.",
-                // Ledgers close roughly every five seconds.
-                u64::from(*window) * 5 / 86_400
-            ),
+            Retention::Reported { window, oldest } => {
+                write!(
+                    f,
+                    "The RPC only keeps transactions for its retention window ({window} ledgers, \
+                     about {} days).",
+                    // Ledgers close roughly every five seconds.
+                    u64::from(*window) * 5 / 86_400
+                )?;
+                match oldest {
+                    Some(oldest) => write!(f, "\nOldest ledger available: {oldest}."),
+                    None => Ok(()),
+                }
+            }
             Retention::Unknown => write!(
                 f,
                 "The RPC only keeps transactions for its retention window (about 7 days with \

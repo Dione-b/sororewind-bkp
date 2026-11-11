@@ -111,7 +111,7 @@ async fn no_network_is_ahead_of_the_embedded_hosts() {
     for network in [Network::Testnet, Network::Mainnet] {
         let rpc = RpcClient::new(HttpTransport::new(network.default_rpc_url()).unwrap());
         let passphrase = rpc.network().await.unwrap().passphrase;
-        let latest = rpc.health().await.unwrap().latest_ledger;
+        let latest = rpc.health().await.unwrap().latest_ledger.unwrap();
         let ledger = sororewind::state::read_ledger(&rpc, latest, &passphrase)
             .await
             .unwrap();

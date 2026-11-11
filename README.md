@@ -66,6 +66,13 @@ sororewind <TX_HASH> --network mainnet
 sororewind <TX_HASH> --rpc-url <RPC_URL>
 ```
 
+If the RPC URL holds an API key, pass it in the `SOROREWIND_RPC_URL`
+environment variable instead, which keeps it out of your shell history and
+the process list. Either way sororewind only ever shows the scheme and host
+of the endpoint (`https://rpc.provider.io/…`), in the report and in errors.
+Transient RPC failures (connection errors, timeouts, HTTP 429, 502, 503 and
+504) are retried a few times before the run gives up.
+
 The transaction must have failed in the Soroban host, and the RPC must still
 have it: RPCs keep a limited history, typically about a week, and the error
 tells you the window when a hash is too old.

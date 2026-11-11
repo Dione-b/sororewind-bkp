@@ -50,8 +50,17 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 - Muxed addresses are shown as `M…` strkeys and trustlines with their asset.
 - Vectors and maps show their first 8 items and how many more there are.
 
+- Transient RPC failures (connect errors, timeouts, HTTP 429/502/503/504) are
+  retried with backoff, honouring `Retry-After`; connecting has its own
+  10-second timeout.
+- `SOROREWIND_RPC_URL` names the RPC endpoint when `--rpc-url` is not given.
+
 ### Changed
 
+- The RPC endpoint is shown as scheme and host only, in `rpc` (JSON) and in
+  error messages: a path, query or userinfo may hold an API key.
+- RPC errors show the JSON-RPC code and the whole cause chain (DNS, TLS,
+  connection refused), and read a JSON-RPC error sent with a non-2xx status.
 - JSON enum-like values are `snake_case`: `status` is `failed`, `errorType`
   `wasm_vm`, TTL drift reasons `extended_since`, `archived_since`,
   `restored_since`. `failure.depth` is `null` when no frame was open.
@@ -68,6 +77,14 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 
 ### Fixed
 
+- A ledger outside the RPC's window is reported as such instead of as a raw
+  RPC error.
+- A transaction status this build does not know no longer makes the whole
+  response unparseable; `find_failed` skips such transactions.
+- `find_failed` scans the latest ledger too, keeps what it found when the
+  RPC prunes its oldest ledgers mid-scan, refetches fewer pages, and fails
+  when `getHealth` does not report the latest ledger instead of finding
+  nothing.
 - Text chosen by a contract, an RPC or a file (logs, error names, function
   names, custom network names) has its control and text-reordering characters
   escaped before it is printed: it can no longer drive the terminal or forge

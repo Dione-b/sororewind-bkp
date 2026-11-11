@@ -3,7 +3,7 @@
 //! [`Transport`] is the seam between the typed client in `rpc.rs` and the
 //! outside world. Three implementations live here:
 //!
-//! - [`HttpTransport`] talks to a live RPC;
+//! - [`HttpTransport`] talks to a live RPC, retrying transient failures;
 //! - [`FixtureTransport`] answers from a recorded directory, offline;
 //! - [`Recording`] wraps any transport and writes what passes through it.
 //!
@@ -70,37 +70,166 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 
 // --- live RPC ---------------------------------------------------------------
 
+/// How long connecting to the RPC may take.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many times a call is retried after a transient failure.
+pub const MAX_RETRIES: u32 = 3;
+
+/// The first retry waits this long; each later one twice as long as the last.
+const RETRY_BASE: Duration = Duration::from_millis(400);
+
+/// The longest a `Retry-After` header is obeyed.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
+
 pub struct HttpTransport {
     url: String,
+    /// What is shown of `url`: see [`redact`].
+    origin: String,
     http: reqwest::Client,
+    retry_base: Duration,
+}
+
+/// An RPC URL with everything that can hold a credential removed.
+///
+/// Providers put API keys in the path (`/v1/<key>`), the query (`?key=`) or
+/// the userinfo (`https://user:pass@host`). The URL ends up in the JSON
+/// report and in error messages, which people paste into issues, so only the
+/// scheme, host and port are shown; a path or query is replaced by `/…`.
+pub fn redact(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        // Not a URL: nothing in it can be told apart from a secret.
+        return "<unparseable RPC URL>".to_string();
+    };
+    let host = parsed.host_str().unwrap_or("<no host>");
+    let port = parsed
+        .port()
+        .map_or(String::new(), |port| format!(":{port}"));
+    let rest = if matches!(parsed.path(), "" | "/") && parsed.query().is_none() {
+        ""
+    } else {
+        "/…"
+    };
+    format!("{}://{host}{port}{rest}", parsed.scheme())
+}
+
+/// What became of one attempt at a call.
+enum Attempt {
+    Done(String),
+    /// Worth another try: the reason, and how long the server asked us to
+    /// wait, if it did.
+    Transient(RewindError, Option<Duration>),
+    Failed(RewindError),
 }
 
 impl HttpTransport {
     pub fn new(url: impl Into<String>) -> Result<Self> {
+        let url = url.into();
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(concat!("sororewind/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(RewindError::HttpClient)?;
         Ok(Self {
-            url: url.into(),
+            origin: redact(&url),
+            url,
             http,
+            retry_base: RETRY_BASE,
         })
     }
 
+    /// Wait this long before the first retry instead of the default.
+    pub fn with_retry_base(mut self, base: Duration) -> Self {
+        self.retry_base = base;
+        self
+    }
+
     fn unreachable(&self, source: reqwest::Error) -> RewindError {
-        let detail = if source.is_timeout() {
+        // reqwest's own message names the URL and stops there; the reason
+        // (DNS, TLS, connection refused) is further down the source chain.
+        let source = source.without_url();
+        let mut detail = if source.is_timeout() {
             format!("timed out after {}s", REQUEST_TIMEOUT.as_secs())
         } else if source.is_connect() {
-            format!("connection failed: {source}")
+            "connection failed".to_string()
         } else {
             source.to_string()
         };
+        let mut cause = std::error::Error::source(&source);
+        while let Some(inner) = cause {
+            let text = inner.to_string();
+            if !detail.contains(&text) {
+                detail.push_str(": ");
+                detail.push_str(&text);
+            }
+            cause = inner.source();
+        }
         RewindError::RpcUnreachable {
-            url: self.url.clone(),
+            url: self.origin.clone(),
             detail,
             source,
         }
+    }
+
+    async fn attempt(&self, method: &str, body: &Value) -> Attempt {
+        let response = match self.http.post(&self.url).json(body).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                // Nothing was answered: a connect error or a timeout. Every
+                // method sororewind calls is read-only, so trying again is safe.
+                let transient = e.is_connect() || e.is_timeout();
+                let error = self.unreachable(e);
+                return if transient {
+                    Attempt::Transient(error, None)
+                } else {
+                    Attempt::Failed(error)
+                };
+            }
+        };
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => return Attempt::Transient(self.unreachable(e), None),
+        };
+        if status.is_success() {
+            return Attempt::Done(text);
+        }
+        // Some providers answer a JSON-RPC error with a non-2xx status; the
+        // envelope says more than the status does, so let the client read it.
+        let is_envelope = serde_json::from_str::<Value>(&text)
+            .is_ok_and(|body| body.get("error").is_some_and(|error| !error.is_null()));
+        if is_envelope {
+            return Attempt::Done(text);
+        }
+        let error = RewindError::Rpc {
+            origin: self.origin(),
+            method: method.to_string(),
+            code: None,
+            detail: format!("HTTP {status}: {}", truncate(&text, 300)),
+        };
+        match status.as_u16() {
+            429 | 502 | 503 | 504 => Attempt::Transient(error, retry_after),
+            _ => Attempt::Failed(error),
+        }
+    }
+
+    /// How long to wait before retry number `retry` (zero-based): the base
+    /// doubled each time, plus up to half as much again so that concurrent
+    /// calls do not all come back at once.
+    fn backoff(&self, retry: u32) -> Duration {
+        let wait = self.retry_base.saturating_mul(1 << retry.min(8));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |now| u64::from(now.subsec_nanos()));
+        let jitter = wait.as_millis() as u64 / 2;
+        wait + Duration::from_millis(if jitter == 0 { 0 } else { nanos % jitter })
     }
 }
 
@@ -115,30 +244,31 @@ impl Transport for HttpTransport {
             });
             log::trace!(target: "rpc", "→ {method} {params}");
 
-            let response = self
-                .http
-                .post(&self.url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| self.unreachable(e))?;
-            let status = response.status();
-            let text = response.text().await.map_err(|e| self.unreachable(e))?;
-
-            if !status.is_success() {
-                return Err(RewindError::Rpc {
-                    origin: self.origin(),
-                    method: method.to_string(),
-                    detail: format!("HTTP {status}: {}", truncate(&text, 300)),
-                });
+            let mut retry = 0;
+            loop {
+                match self.attempt(method, &body).await {
+                    Attempt::Done(text) => {
+                        log::trace!(target: "rpc", "← {method} {}", truncate(&text, 400));
+                        return Ok(text);
+                    }
+                    Attempt::Transient(error, retry_after) if retry < MAX_RETRIES => {
+                        let wait = retry_after.unwrap_or_else(|| self.backoff(retry));
+                        retry += 1;
+                        log::debug!(
+                            target: "rpc",
+                            "{method} failed ({error}); retry {retry} of {MAX_RETRIES} in {} ms",
+                            wait.as_millis()
+                        );
+                        tokio::time::sleep(wait).await;
+                    }
+                    Attempt::Transient(error, _) | Attempt::Failed(error) => return Err(error),
+                }
             }
-            log::trace!(target: "rpc", "← {method} {}", truncate(&text, 400));
-            Ok(text)
         })
     }
 
     fn origin(&self) -> String {
-        self.url.clone()
+        self.origin.clone()
     }
 }
 
@@ -479,6 +609,157 @@ mod tests {
 
     fn hash() -> TxHash {
         "ab".repeat(32).parse().unwrap()
+    }
+
+    #[test]
+    fn urls_are_redacted_before_they_are_shown() {
+        // Nothing to hide: shown as is.
+        assert_eq!(
+            redact("https://soroban-testnet.stellar.org:443"),
+            "https://soroban-testnet.stellar.org"
+        );
+        assert_eq!(redact("http://localhost:8000"), "http://localhost:8000");
+        assert_eq!(redact("https://rpc.example/"), "https://rpc.example");
+        // Keys in the path, the query or the userinfo are not.
+        for url in [
+            "https://rpc.provider.io/v1/SECRETKEY",
+            "https://rpc.provider.io/?apikey=SECRETKEY",
+            "https://user:SECRETKEY@rpc.provider.io/rpc",
+        ] {
+            let shown = redact(url);
+            assert_eq!(shown, "https://rpc.provider.io/…", "{url}");
+            assert!(!shown.contains("SECRETKEY"));
+        }
+        assert!(!redact("SECRETKEY not a url").contains("SECRETKEY"));
+        // A path with no key in it is still hidden: it cannot be told apart.
+        assert_eq!(
+            redact("http://localhost:8000/rpc"),
+            "http://localhost:8000/…"
+        );
+    }
+
+    /// A one-connection-at-a-time HTTP server answering each request with
+    /// the next canned `(status, extra headers, body)`.
+    fn serve(
+        responses: Vec<(u16, &'static str, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/SECRETKEY", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for (status, headers, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                // Read the request: headers, then `Content-Length` bytes.
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n{headers}\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                served += 1;
+            }
+            served
+        });
+        (url, handle)
+    }
+
+    fn fast(url: &str) -> HttpTransport {
+        HttpTransport::new(url)
+            .unwrap()
+            .with_retry_base(Duration::from_millis(1))
+    }
+
+    #[tokio::test]
+    async fn transient_failures_are_retried() {
+        let ok = r#"{"jsonrpc":"2.0","id":1,"result":{"passphrase":"p"}}"#;
+        let (url, server) = serve(vec![
+            (503, "", "busy"),
+            (429, "retry-after: 0\r\n", "slow down"),
+            (200, "", ok),
+        ]);
+        let text = fast(&url).request("getNetwork", &json!({})).await.unwrap();
+        assert_eq!(text, ok);
+        assert_eq!(server.join().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn retries_give_up_and_never_show_the_key() {
+        let busy = (503, "", "busy");
+        let (url, server) = serve(vec![busy; MAX_RETRIES as usize + 1]);
+        let transport = fast(&url);
+        let err = transport
+            .request("getNetwork", &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(server.join().unwrap(), MAX_RETRIES as usize + 1);
+        let text = err.to_string();
+        assert!(text.contains("HTTP 503") && text.contains("busy"), "{text}");
+        assert!(!text.contains("SECRETKEY"), "{text}");
+        assert!(!transport.origin().contains("SECRETKEY"));
+        assert!(transport.origin().ends_with("/…"));
+    }
+
+    #[tokio::test]
+    async fn other_http_errors_are_not_retried() {
+        let (url, server) = serve(vec![(404, "", "no such route")]);
+        let err = fast(&url)
+            .request("getNetwork", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("HTTP 404"), "{err}");
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_json_rpc_error_behind_an_http_error_is_read() {
+        let envelope = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad params"}}"#;
+        let (url, server) = serve(vec![(400, "", envelope)]);
+        let rpc = crate::rpc::RpcClient::new(fast(&url));
+        let err = rpc.network().await.unwrap_err();
+        assert!(
+            matches!(&err, RewindError::Rpc { code: Some(-32602), detail, .. } if detail == "bad params"),
+            "{err}"
+        );
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_rpc_says_why_and_hides_the_key() {
+        // A port nothing listens on: bind one, then free it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let transport = fast(&format!("http://127.0.0.1:{port}/v1/SECRETKEY"));
+        let err = transport
+            .request("getNetwork", &json!({}))
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, RewindError::RpcUnreachable { .. }), "{text}");
+        assert!(text.contains("connection failed: "), "{text}");
+        assert!(!text.contains("SECRETKEY"), "{text}");
     }
 
     #[test]

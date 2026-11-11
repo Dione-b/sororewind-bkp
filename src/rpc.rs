@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use futures_util::future::try_join_all;
+use futures_util::{StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +22,9 @@ use crate::transport::{truncate, Transport};
 /// <https://developers.stellar.org/docs/data/apis/rpc/api-reference/methods/getLedgerEntries>
 pub const MAX_KEYS_PER_CALL: usize = 200;
 
+/// How many `getLedgerEntries` calls run at once.
+const MAX_CONCURRENT_CALLS: usize = 4;
+
 /// The most transactions one `getTransactions` page returns.
 pub const MAX_TRANSACTIONS_PER_PAGE: u32 = 200;
 
@@ -32,6 +35,9 @@ pub enum TxStatus {
     Success,
     Failed,
     NotFound,
+    /// A status this build does not know: a newer RPC, or a provider's own.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The subset of a `getTransaction` / `getTransactions` record we care about.
@@ -120,15 +126,17 @@ pub struct NetworkInfo {
     pub passphrase: String,
 }
 
+/// `getHealth`. Every field is optional on the wire: a field the RPC leaves
+/// out is `None`, never a made-up zero.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Health {
     #[serde(default)]
-    pub latest_ledger: u32,
+    pub latest_ledger: Option<u32>,
     #[serde(default)]
-    pub oldest_ledger: u32,
+    pub oldest_ledger: Option<u32>,
     #[serde(default)]
-    pub ledger_retention_window: u32,
+    pub ledger_retention_window: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,10 +171,11 @@ impl RpcClient {
         self.transport.origin()
     }
 
-    fn error(&self, method: &str, detail: String) -> RewindError {
+    fn error(&self, method: &str, code: Option<i64>, detail: String) -> RewindError {
         RewindError::Rpc {
             origin: self.origin(),
             method: method.to_string(),
+            code,
             detail,
         }
     }
@@ -177,6 +186,7 @@ impl RpcClient {
         let parsed: RpcEnvelope<T> = serde_json::from_str(&text).map_err(|e| {
             self.error(
                 method,
+                None,
                 format!(
                     "unparseable response: {e}; body was {}",
                     truncate(&text, 300)
@@ -189,17 +199,15 @@ impl RpcClient {
                 (Some(m), Some(d)) => format!("{m} ({d})"),
                 (Some(m), None) => m,
                 (None, Some(d)) => d.to_string(),
-                (None, None) => match err.code {
-                    Some(code) => format!("error code {code}"),
-                    None => "an error with no code or message".to_string(),
-                },
+                (None, None) => "an error with no message".to_string(),
             };
-            return Err(self.error(method, detail));
+            return Err(self.error(method, err.code, detail));
         }
 
         parsed.result.ok_or_else(|| {
             self.error(
                 method,
+                None,
                 "response had neither `result` nor `error`".to_string(),
             )
         })
@@ -228,17 +236,26 @@ impl RpcClient {
     }
 
     /// Fetch up to `limit` consecutive ledgers starting at `start`, metadata
-    /// included. The RPC returns fewer when it has not closed them yet.
+    /// included. The RPC returns fewer when it has not closed them yet, and
+    /// none when `start` is outside the ledgers it keeps.
     pub async fn get_ledgers(&self, start: u32, limit: u32) -> Result<Vec<RawLedger>> {
         // The limit lives under `pagination`; at the top level it is ignored
         // and the RPC falls back to 50 ledgers (~14 MB of metadata).
-        let response: GetLedgersResponse = self
+        let response: Result<GetLedgersResponse> = self
             .call(
                 "getLedgers",
                 json!({ "startLedger": start, "pagination": { "limit": limit } }),
             )
-            .await?;
-        Ok(response.ledgers)
+            .await;
+        match response {
+            Ok(response) => Ok(response.ledgers),
+            // "No such ledger" is an answer, not a failure of the RPC.
+            Err(err) if err.is_ledger_out_of_range() => {
+                log::debug!(target: "rpc", "{err}");
+                Ok(Vec::new())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// One page of transactions, oldest first. Start with `start_ledger`, then
@@ -276,8 +293,16 @@ impl RpcClient {
                 .await?;
             Ok::<_, RewindError>(response.entries)
         });
-        let returned = try_join_all(chunks).await?.into_iter().flatten().collect();
-        Ok(order_entries(keys, returned))
+        // A few at a time: a footprint is rarely more than one chunk, and a
+        // public RPC answers a burst with 429s.
+        let returned: Vec<Vec<RawLedgerEntry>> = futures_util::stream::iter(chunks)
+            .buffered(MAX_CONCURRENT_CALLS)
+            .try_collect()
+            .await?;
+        Ok(order_entries(
+            keys,
+            returned.into_iter().flatten().collect(),
+        ))
     }
 }
 
@@ -423,7 +448,8 @@ mod tests {
         let err = rpc.health().await.unwrap_err().to_string();
         assert_eq!(
             err,
-            "the RPC (memory) returned an error for getHealth: method not found (\"getHealth\")"
+            "the RPC (memory) returned an error for getHealth: method not found (\"getHealth\") \
+             (JSON-RPC code -32601)"
         );
         let err = rpc.network().await.unwrap_err().to_string();
         assert!(err.contains("neither `result` nor `error`"), "{err}");

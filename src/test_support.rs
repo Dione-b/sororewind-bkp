@@ -94,6 +94,7 @@ impl Transport for MemoryTransport {
                 Some(respond) => Ok(respond(params)),
                 None => Err(RewindError::Rpc {
                     origin: self.origin(),
+                    code: None,
                     method: method.to_string(),
                     detail: "no response configured".to_string(),
                 }),
