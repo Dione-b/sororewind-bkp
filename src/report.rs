@@ -12,7 +12,6 @@ use stellar_xdr::InvokeHostFunctionResult;
 use crate::display;
 use crate::hash::TxHash;
 use crate::replay::{BudgetUse, Fidelity, PrngSeed};
-use crate::rpc::TxStatus;
 use crate::state::TtlDrift;
 use crate::story::Story;
 
@@ -37,7 +36,8 @@ pub struct Report {
     pub protocol: u32,
     /// Close time of the transaction's ledger, seconds since the Unix epoch.
     pub close_time: u64,
-    pub status: TxStatus,
+    /// Always `failed`: sororewind only replays failures.
+    pub status: &'static str,
 
     pub fidelity: Fidelity,
     pub result: ResultPair,
@@ -154,7 +154,7 @@ pub struct TtlDriftEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum TtlDriftReason {
     /// The TTL was extended after the transaction ran.
     ExtendedSince,
@@ -185,11 +185,17 @@ impl From<TtlDrift> for TtlDriftReason {
     }
 }
 
-/// Diagnostic events, one rendered line each, for side-by-side comparison.
+/// Diagnostic events, one rendered line each, for side-by-side comparison,
+/// and the events themselves.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Diagnostics {
     pub onchain: Vec<String>,
     pub local: Vec<String>,
+    /// Each on-chain `DiagnosticEvent`, base64 XDR, in the order of `onchain`.
+    pub onchain_xdr: Vec<String>,
+    /// Each local `DiagnosticEvent`, base64 XDR, in the order of `local`.
+    pub local_xdr: Vec<String>,
 }
 
 #[cfg(test)]

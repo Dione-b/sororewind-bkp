@@ -50,7 +50,7 @@ async fn check(name: &str, expected: Outcome) {
         "testnet"
     };
     assert_eq!(json["network"], network, "{name}");
-    assert_eq!(json["status"], "FAILED", "{name}");
+    assert_eq!(json["status"], "failed", "{name}");
     assert_eq!(
         json["result"]["onchain"]["code"] == json["result"]["local"]["code"],
         json["fidelity"]["divergence"] != "result",

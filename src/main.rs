@@ -73,10 +73,8 @@ async fn main() -> ExitCode {
             println!("{document}");
         } else {
             let detail = Detail::from_verbosity(cli.verbose);
-            print!(
-                "{}",
-                render::human(&report, render::use_color(cli.no_color), detail)
-            );
+            let color = render::use_color(cli.color_choice(), &render::ColorEnv::current());
+            print!("{}", render::human(&report, color, detail));
         }
         Ok(())
     });
@@ -84,6 +82,10 @@ async fn main() -> ExitCode {
     match printed {
         Ok(()) => ExitCode::from(code),
         Err(err) => {
+            // A script reading `--json` gets a document either way.
+            if cli.json {
+                println!("{}", render::json_error(&err));
+            }
             eprintln!("sororewind: {err}");
             ExitCode::from(sororewind::EXIT_ERROR)
         }

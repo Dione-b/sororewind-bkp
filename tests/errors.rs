@@ -350,4 +350,30 @@ mod binary {
         let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(json["fidelity"]["match"], true);
     }
+
+    #[test]
+    fn json_mode_reports_errors_as_json() {
+        let missing = super::common::fixtures_root().join("no-such-fixture");
+        let out = sororewind(&["--fixture", &missing.display().to_string(), "--json"]);
+        assert_eq!(out.status.code(), Some(1));
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(json["schemaVersion"], 1);
+        assert_eq!(json["error"]["kind"], "fixture_io");
+        let message = json["error"]["message"].as_str().unwrap();
+        // The same sentence a person gets on stderr.
+        assert!(String::from_utf8_lossy(&out.stderr).contains(message));
+
+        // Without --json, stdout stays empty.
+        let out = sororewind(&["--fixture", &missing.display().to_string()]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn colour_can_be_forced_into_a_pipe() {
+        let plain = sororewind(&["--fixture", &fixture()]);
+        assert!(!plain.stdout.contains(&0x1b));
+        let forced = sororewind(&["--fixture", &fixture(), "--color", "always"]);
+        assert!(forced.stdout.contains(&0x1b));
+    }
 }

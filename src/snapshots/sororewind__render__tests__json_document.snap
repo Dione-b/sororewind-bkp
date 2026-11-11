@@ -11,7 +11,7 @@ expression: json(&sample_report()).unwrap()
   "ledger": 1000,
   "protocol": 30,
   "closeTime": 1700000000,
-  "status": "FAILED",
+  "status": "failed",
   "fidelity": {
     "match": true,
     "divergence": null
@@ -52,7 +52,12 @@ expression: json(&sample_report()).unwrap()
         "1",
         "\"two\""
       ],
+      "argsXdr": [
+        "AAAAAwAAAAE=",
+        "AAAADgAAAAN0d28A"
+      ],
       "returned": null,
+      "returnedXdr": null,
       "open": true,
       "recovered": false,
       "failure": false,
@@ -65,7 +70,9 @@ expression: json(&sample_report()).unwrap()
       "contract": "CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM",
       "function": "probe",
       "args": [],
+      "argsXdr": [],
       "returned": "void",
+      "returnedXdr": "AAAAAQ==",
       "open": false,
       "recovered": true,
       "failure": false,
@@ -76,7 +83,9 @@ expression: json(&sample_report()).unwrap()
       "contract": "CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM",
       "function": "inner",
       "args": [],
+      "argsXdr": [],
       "returned": null,
+      "returnedXdr": null,
       "open": true,
       "recovered": false,
       "failure": true,
@@ -102,7 +111,7 @@ expression: json(&sample_report()).unwrap()
     "ttlDrifted": [
       {
         "entry": "contract data C…AAAA Balance (persistent)",
-        "reason": "extendedSince"
+        "reason": "extended_since"
       }
     ],
     "archived": [],
@@ -121,6 +130,8 @@ expression: json(&sample_report()).unwrap()
     ],
     "local": [
       "fail [-] error, contract error #3 \"balance too low\""
-    ]
+    ],
+    "onchainXdr": [],
+    "localXdr": []
   }
 }

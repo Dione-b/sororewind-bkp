@@ -38,8 +38,23 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 - Stellar Asset Contract errors are named (`#10` is `BalanceError`).
 - `error` and `log` diagnostics keep their arguments: `message [arg, arg]`.
 
+- `--color <auto|always|never>`; `auto` honours `CLICOLOR_FORCE` and
+  `TERM=dumb`. `--no-color` stays as an alias of `--color never`.
+- In `--json` mode a failed run prints `{"schemaVersion", "error": {"kind",
+  "message"}}` on stdout, with a stable `kind` per failure.
+- JSON carries values whole next to their display strings: `calls[].argsXdr`,
+  `calls[].returnedXdr`, `diagnostics.onchainXdr` and `diagnostics.localXdr`.
+- Open frames are marked `(no return)` and recovered ones `(recovered by
+  try_call)` at every verbosity, and the call tree is drawn with real
+  connectors, so it reads the same without colour.
+- Muxed addresses are shown as `M…` strkeys and trustlines with their asset.
+- Vectors and maps show their first 8 items and how many more there are.
+
 ### Changed
 
+- JSON enum-like values are `snake_case`: `status` is `failed`, `errorType`
+  `wasm_vm`, TTL drift reasons `extended_since`, `archived_since`,
+  `restored_since`. `failure.depth` is `null` when no frame was open.
 - `failure.nameOrigin` is only set when a name was found, and says where the
   spec was read from (the ledger or `--wasm-debug`). A code declared by
   several error enums lists every candidate.
@@ -53,6 +68,11 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 
 ### Fixed
 
+- Text chosen by a contract, an RPC or a file (logs, error names, function
+  names, custom network names) has its control and text-reordering characters
+  escaped before it is printed: it can no longer drive the terminal or forge
+  lines of the report.
+- An empty `NO_COLOR` no longer disables colour.
 - The failure is attributed to the last escalation, not to an earlier error
   with the same code that a `try_call` recovered from.
 - The call tree no longer nests later calls under a dead frame after a

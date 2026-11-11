@@ -9,6 +9,7 @@ use crate::error::{Result, RewindError};
 use crate::hash::TxHash;
 use crate::network::Network;
 use crate::pipeline::Request;
+use crate::render::ColorChoice;
 use crate::rpc::RpcClient;
 use crate::transport::{FixtureManifest, FixtureTransport, HttpTransport, Recording};
 
@@ -57,9 +58,13 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub wasm_debug: Option<PathBuf>,
 
-    /// Disable ANSI colour output (also off when stdout is not a terminal or
-    /// NO_COLOR is set)
-    #[arg(long)]
+    /// When to colour the narrative: auto colours a terminal, and honours
+    /// NO_COLOR, CLICOLOR_FORCE and TERM=dumb
+    #[arg(long, value_enum, value_name = "WHEN", default_value = "auto")]
+    pub color: ColorChoice,
+
+    /// Same as --color never
+    #[arg(long, conflicts_with = "color")]
     pub no_color: bool,
 
     /// Repeat for more detail: -v adds budget and footprint detail, -vv adds
@@ -100,6 +105,15 @@ impl Cli {
     {
         let matches = Cli::command().try_get_matches_from(args)?;
         Cli::from_arg_matches(&matches)
+    }
+
+    /// The colour choice the flags amount to.
+    pub fn color_choice(&self) -> ColorChoice {
+        if self.no_color {
+            ColorChoice::Never
+        } else {
+            self.color
+        }
     }
 
     /// Open the source of RPC responses the arguments ask for, and work out
@@ -206,6 +220,23 @@ mod tests {
         }
         assert!(parse(&[HASH, "--network", "moon"]).is_err());
         assert_eq!(parse(&[HASH, "-vv"]).unwrap().verbose, 2);
+    }
+
+    #[test]
+    fn colour_flags() {
+        assert_eq!(parse(&[HASH]).unwrap().color_choice(), ColorChoice::Auto);
+        for (flags, choice) in [
+            (&["--color", "always"][..], ColorChoice::Always),
+            (&["--color=never"][..], ColorChoice::Never),
+            (&["--color", "auto"][..], ColorChoice::Auto),
+            (&["--no-color"][..], ColorChoice::Never),
+        ] {
+            let args = [&[HASH][..], flags].concat();
+            assert_eq!(parse(&args).unwrap().color_choice(), choice, "{flags:?}");
+        }
+        assert!(parse(&[HASH, "--color", "sometimes"]).is_err());
+        let err = parse(&[HASH, "--no-color", "--color", "always"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 
     #[test]

@@ -130,7 +130,8 @@ the usual `2`, so a script can treat `2` strictly as "diverged".
 | `--rpc-url <URL>` | Use this RPC instead of the network's default. |
 | `--json` | Print a JSON document instead of the narrative. |
 | `--wasm-debug <PATH>` | For a contract error, read the contract's error names from a local WASM file instead of the ledger. |
-| `--no-color` | Disable colour. It is also off when stdout is not a terminal or `NO_COLOR` is set. |
+| `--color <auto\|always\|never>` | When to colour the narrative. `auto` (the default) colours a terminal, and honours a non-empty `NO_COLOR`, `CLICOLOR_FORCE` and `TERM=dumb`. `always` keeps colour in a pager: `sororewind … --color always \| less -R`. |
+| `--no-color` | Same as `--color never`. |
 | `-v, --verbose` | Repeat for more detail (`-v`, `-vv`). |
 | `--fixture <DIR>` | Replay from a recorded fixture directory, offline. The hash is optional, since the fixture records it. Cannot be combined with `--rpc-url`. |
 
@@ -155,12 +156,31 @@ main fields:
 | `fidelity.match`, `fidelity.divergence` | Whether the replay matched, and if not, how it diverged. |
 | `result.onchain`, `result.local` | Each side's result, as `{ code, resultHash }`. |
 | `failure` | The error that ended the transaction, with the contract, function and depth it came from; `null` when there is none. `failure.cause` is the contract error a host error was raised in answer to, when there is one. |
-| `calls` | The call tree, one entry per call, with arguments, return value and logs. |
+| `calls` | The call tree, one entry per call, with arguments, return value and logs. `args` and `returned` are abbreviated for reading; `argsXdr` and `returnedXdr` hold the same values whole, as base64 `ScVal` XDR. |
 | `budget`, `footprint`, `prngSeed` | Resource use, the footprint and its drift, and how the random-number seed was obtained. |
-| `diagnostics` | The raw on-chain and local diagnostic events. |
+| `diagnostics` | The on-chain and local diagnostic events, one line each (`onchain`, `local`) and as base64 `DiagnosticEvent` XDR (`onchainXdr`, `localXdr`). |
+
+Enum-like values are lower `snake_case` throughout (`"status": "failed"`,
+`"errorType": "wasm_vm"`, `"reason": "extended_since"`).
 
 Exit codes are the same as for the narrative, so a script can branch on the
 exit code and read the details from the document.
+
+When sororewind cannot replay the transaction (exit `1`), `--json` still
+prints a document, next to the message on stderr:
+
+```json
+{
+  "schemaVersion": 1,
+  "error": { "kind": "not_found", "message": "transaction … not found on testnet. …" }
+}
+```
+
+`kind` is stable: `not_found`, `not_a_failure`, `not_soroban`,
+`never_reached_host`, `protocol_mismatch`, `network_mismatch`,
+`ledger_unavailable`, `rpc_unreachable`, `rpc_error`, and others for
+malformed responses and fixtures. Invalid command-line arguments are reported
+by the argument parser, as text.
 
 ## Why a replay can diverge
 

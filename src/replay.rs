@@ -84,7 +84,7 @@ pub struct BudgetUse {
 
 /// Where the host's PRNG seed came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum PrngSeed {
     /// Derived exactly as the network derives it.
     Derived,
@@ -129,7 +129,7 @@ pub struct Fidelity {
 
 /// How the local run differs from the network's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum Divergence {
     /// A different `InvokeHostFunctionResult`.
     Result,

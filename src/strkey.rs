@@ -38,22 +38,39 @@ pub fn parse_contract(strkey: &str) -> Option<ContractId> {
 /// First character, an ellipsis, and the last `tail` characters: `C…XYZW`.
 /// Enough to recognise an identifier without burning a line of width.
 pub fn shorten(strkey: &str, tail: usize) -> String {
-    if strkey.len() <= tail + 2 {
+    let length = strkey.chars().count();
+    if length <= tail + 2 {
         return strkey.to_string();
     }
-    format!("{}…{}", &strkey[..1], &strkey[strkey.len() - tail..])
+    let first: String = strkey.chars().take(1).collect();
+    let last: String = strkey.chars().skip(length - tail).collect();
+    format!("{first}…{last}")
 }
 
 pub fn address(addr: &ScAddress) -> String {
     match addr {
         ScAddress::Account(id) => account_id(id),
         ScAddress::Contract(c) => contract(&c.0 .0),
-        ScAddress::MuxedAccount(m) => account(&m.ed25519.0),
+        // The `M…` strkey carries the mux id, so two sub-accounts of one
+        // account stay distinct.
+        ScAddress::MuxedAccount(m) => format!(
+            "{}",
+            ed25519::MuxedAccount {
+                ed25519: m.ed25519.0,
+                id: m.id,
+            }
+        ),
         ScAddress::ClaimableBalance(ClaimableBalanceId::ClaimableBalanceIdTypeV0(h)) => {
             claimable_balance(&h.0)
         }
         ScAddress::LiquidityPool(pool) => liquidity_pool(&pool.0 .0),
-        ScAddress::MuxedContract(m) => contract(&m.contract_id.0 .0),
+        ScAddress::MuxedContract(m) => format!(
+            "{}",
+            stellar_strkey::MuxedContract {
+                contract_id: m.contract_id.0 .0,
+                id: m.id,
+            }
+        ),
     }
 }
 
@@ -68,6 +85,8 @@ mod tests {
     #[test]
     fn shortens_only_long_strings() {
         assert_eq!(shorten("CABCDEFGHIJ", 4), "C…GHIJ");
+        // Not only ASCII: characters are counted, never bytes.
+        assert_eq!(shorten("éàèùçâêîôû", 3), "é…îôû");
         assert_eq!(shorten("CABCDE", 4), "CABCDE");
         assert_eq!(shorten("", 4), "");
     }

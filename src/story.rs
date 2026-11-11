@@ -20,8 +20,13 @@ pub struct Call {
     pub contract: Option<String>,
     pub function: String,
     pub args: Vec<String>,
+    /// The arguments whole, each an `ScVal` in base64 XDR: `args` abbreviates
+    /// long byte strings, large collections and deep nesting.
+    pub args_xdr: Vec<String>,
     /// What the frame returned, when it returned at all.
     pub returned: Option<String>,
+    /// The return value whole, an `ScVal` in base64 XDR.
+    pub returned_xdr: Option<String>,
     /// Still open when the replay ended: this frame is on the failure path.
     pub open: bool,
     /// An inner frame failed and its caller carried on — the signature of a
@@ -40,7 +45,7 @@ pub struct Call {
 pub struct Failure {
     #[serde(skip)]
     pub error: ScError,
-    /// Error category: `contract`, `auth`, `storage`, …
+    /// Error category: `contract`, `auth`, `storage`, `wasm_vm`, …
     pub error_type: &'static str,
     /// Host-defined code such as `InvalidAction`; `null` for contract errors.
     pub error_code: Option<&'static str>,
@@ -56,7 +61,9 @@ pub struct Failure {
     pub message: String,
     pub contract: Option<String>,
     pub function: Option<String>,
-    pub depth: usize,
+    /// Depth of the frame the error was raised in; `null` when no frame was
+    /// open.
+    pub depth: Option<usize>,
     /// Every `error` diagnostic, oldest first — the escalation trail.
     pub trail: Vec<String>,
     /// The contract error behind a host error that only wraps it: a custom
@@ -80,7 +87,7 @@ pub struct Cause {
     pub message: String,
     pub contract: Option<String>,
     pub function: Option<String>,
-    pub depth: usize,
+    pub depth: Option<usize>,
 }
 
 /// An `error` diagnostic and the frame that was open when it fired.
@@ -144,8 +151,10 @@ impl Story {
                         depth: stack.len(),
                         contract,
                         function: topics.get(2).and_then(symbol).unwrap_or_default(),
-                        args: call_args(data),
+                        args: call_args(data).iter().map(scval).collect(),
+                        args_xdr: call_args(data).iter().filter_map(xdr).collect(),
                         returned: None,
+                        returned_xdr: None,
                         open: true,
                         recovered: false,
                         is_failure: false,
@@ -161,7 +170,7 @@ impl Story {
                         &mut stack,
                         function.as_deref(),
                         emitter.as_deref(),
-                        scval(data),
+                        data,
                     );
                 }
                 "error" => {
@@ -264,7 +273,7 @@ fn close_frame(
     stack: &mut Vec<usize>,
     function: Option<&str>,
     contract: Option<&str>,
-    value: String,
+    value: &ScVal,
 ) {
     let returning = |call: &Call| {
         function.is_some_and(|f| call.function == f)
@@ -290,7 +299,8 @@ fn close_frame(
         calls[abandoned].recovered = true;
     }
     let frame = stack[position];
-    calls[frame].returned = Some(value);
+    calls[frame].returned = Some(scval(value));
+    calls[frame].returned_xdr = xdr(value);
     calls[frame].open = false;
     stack.truncate(position);
 }
@@ -348,14 +358,14 @@ fn build_failure(
             message: event.message.clone(),
             contract: frame.and_then(|call| call.contract.clone()),
             function: frame.map(|call| call.function.clone()),
-            depth: frame.map_or(0, |call| call.depth),
+            depth: frame.map(|call| call.depth),
         }
     });
     let cause_frame = cause_event.and_then(|(_, event)| event.open_frame);
 
     Failure {
         error: fatal.clone(),
-        error_type: display::error_type_name(fatal.discriminant()),
+        error_type: display::error_type_code(fatal.discriminant()),
         error_code: display::error_code(fatal).map(|code| code.name()),
         contract_code: match fatal {
             ScError::Contract(code) => Some(*code),
@@ -367,19 +377,26 @@ fn build_failure(
         message,
         contract: frame.and_then(|call| call.contract.clone()),
         function: frame.map(|call| call.function.clone()),
-        depth: frame.map_or(0, |call| call.depth),
+        depth: frame.map(|call| call.depth),
         trail: errors.iter().map(|e| e.message.clone()).collect(),
         cause,
         call_index: cause_frame.or(call_index),
     }
 }
 
-fn call_args(data: &ScVal) -> Vec<String> {
+fn call_args(data: &ScVal) -> &[ScVal] {
     match data {
-        ScVal::Void => Vec::new(),
-        ScVal::Vec(Some(items)) => items.0.iter().map(scval).collect(),
-        other => vec![scval(other)],
+        ScVal::Void => &[],
+        ScVal::Vec(Some(items)) => items.0.as_slice(),
+        other => std::slice::from_ref(other),
     }
+}
+
+/// A value whole, in base64 XDR, for the JSON document.
+fn xdr(value: &ScVal) -> Option<String> {
+    crate::codec::encode(value, "a value")
+        .ok()
+        .map(|bytes| crate::codec::b64_encode(&bytes))
 }
 
 /// The `error` and `log` diagnostics carry their message as the first data
@@ -500,7 +517,7 @@ mod tests {
         assert_eq!(failure.contract.as_deref(), Some(id(B).as_str()));
         assert_eq!(
             (failure.function.as_deref(), failure.depth),
-            (Some("inner"), 1)
+            (Some("inner"), Some(1))
         );
 
         assert!(story.calls[0].open && !story.calls[0].is_failure);
@@ -576,7 +593,7 @@ mod tests {
         );
         let failure = story.failure.unwrap();
         assert_eq!(failure.function.as_deref(), Some("outer"));
-        assert_eq!(failure.depth, 0);
+        assert_eq!(failure.depth, Some(0));
         assert!(story.calls[0].is_failure && !story.calls[1].is_failure);
     }
 
@@ -650,7 +667,7 @@ mod tests {
         assert_eq!(failure.message, "bad signature");
         assert_eq!(
             (failure.contract, failure.function, failure.depth),
-            (None, None, 0)
+            (None, None, None)
         );
         assert_eq!(failure.call_index, None);
     }
@@ -785,7 +802,7 @@ mod tests {
         assert_eq!(cause.contract.as_deref(), Some(id(B).as_str()));
         assert_eq!(
             (cause.function.as_deref(), cause.depth),
-            (Some("__check_auth"), 1)
+            (Some("__check_auth"), Some(1))
         );
         // The frame that failed is the one the cause was raised in.
         assert!(story.calls[1].is_failure && !story.calls[0].is_failure);

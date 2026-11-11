@@ -9,7 +9,7 @@ use std::fmt::{self, Write};
 
 use stellar_xdr::{
     ClaimableBalanceId, ContractDataDurability, ContractEvent, ContractEventBody, DiagnosticEvent,
-    InvokeHostFunctionResult, LedgerKey, ScError, ScErrorCode, ScErrorType, ScVal,
+    InvokeHostFunctionResult, LedgerKey, ScError, ScErrorCode, ScErrorType, ScVal, TrustLineAsset,
 };
 
 use crate::strkey;
@@ -93,6 +93,9 @@ pub fn result_label(result: &InvokeHostFunctionResult) -> String {
 const MAX_DEPTH: usize = 4;
 /// Byte strings longer than this are abbreviated to a prefix and a length.
 const MAX_INLINE_BYTES: usize = 16;
+/// Vectors and maps show this many items, then how many more there are. The
+/// JSON document carries every value whole, as XDR.
+const MAX_ITEMS: usize = 8;
 
 /// A one-line rendering of an `ScVal`.
 pub fn scval(value: &ScVal) -> String {
@@ -149,18 +152,19 @@ fn write_scval(value: &ScVal, out: &mut String, depth: usize) -> fmt::Result {
         ScVal::Vec(items) => {
             out.write_char('[')?;
             let items = items.as_ref().map_or(&[][..], |v| v.0.as_slice());
-            for (i, item) in items.iter().enumerate() {
+            for (i, item) in items.iter().take(MAX_ITEMS).enumerate() {
                 if i > 0 {
                     out.write_str(", ")?;
                 }
                 write_scval(item, out, depth + 1)?;
             }
+            write_elided(out, items.len())?;
             out.write_char(']')
         }
         ScVal::Map(entries) => {
             out.write_char('{')?;
             let entries = entries.as_ref().map_or(&[][..], |m| m.0.as_slice());
-            for (i, entry) in entries.iter().enumerate() {
+            for (i, entry) in entries.iter().take(MAX_ITEMS).enumerate() {
                 if i > 0 {
                     out.write_str(", ")?;
                 }
@@ -168,9 +172,18 @@ fn write_scval(value: &ScVal, out: &mut String, depth: usize) -> fmt::Result {
                 out.write_str(": ")?;
                 write_scval(&entry.val, out, depth + 1)?;
             }
+            write_elided(out, entries.len())?;
             out.write_char('}')
         }
     }
+}
+
+/// `, … 992 more` after the items of a collection that were shown.
+fn write_elided(out: &mut String, total: usize) -> fmt::Result {
+    if total > MAX_ITEMS {
+        write!(out, ", … {} more", total - MAX_ITEMS)?;
+    }
+    Ok(())
 }
 
 /// Decimal digits of a 256-bit unsigned integer given as big-endian limbs.
@@ -243,7 +256,11 @@ pub fn diagnostic(event: &DiagnosticEvent) -> String {
 pub fn ledger_key(key: &LedgerKey) -> String {
     match key {
         LedgerKey::Account(k) => format!("account {}", strkey::account_id(&k.account_id)),
-        LedgerKey::Trustline(k) => format!("trustline {}", strkey::account_id(&k.account_id)),
+        LedgerKey::Trustline(k) => format!(
+            "trustline {} {}",
+            strkey::account_id(&k.account_id),
+            trustline_asset(&k.asset)
+        ),
         LedgerKey::Offer(k) => format!(
             "offer {} of {}",
             k.offer_id,
@@ -276,6 +293,34 @@ pub fn ledger_key(key: &LedgerKey) -> String {
         LedgerKey::ContractCode(k) => format!("contract code {}", hex_prefix(&k.hash.0)),
         LedgerKey::ConfigSetting(k) => format!("config setting {}", k.config_setting_id),
         LedgerKey::Ttl(k) => format!("ttl {}", hex_prefix(&k.key_hash.0)),
+    }
+}
+
+/// `USDC:G…ABCD`, `native`, or `pool 1a2b…`: enough to tell two trustlines
+/// of one account apart.
+fn trustline_asset(asset: &TrustLineAsset) -> String {
+    let credit = |code: &[u8], issuer: &stellar_xdr::AccountId| {
+        let code = String::from_utf8_lossy(code);
+        format!(
+            "{}:{}",
+            code.trim_end_matches('\0').escape_debug(),
+            strkey::shorten(&strkey::account_id(issuer), 4)
+        )
+    };
+    match asset {
+        TrustLineAsset::Native => "native".to_string(),
+        TrustLineAsset::CreditAlphanum4(a) => credit(&a.asset_code.0, &a.issuer),
+        TrustLineAsset::CreditAlphanum12(a) => credit(&a.asset_code.0, &a.issuer),
+        TrustLineAsset::PoolShare(pool) => format!("pool {}", hex_prefix(&pool.0 .0)),
+    }
+}
+
+/// Machine name of an error category, as the JSON document carries it:
+/// [`error_type_name`] without spaces.
+pub fn error_type_code(error_type: ScErrorType) -> &'static str {
+    match error_type {
+        ScErrorType::WasmVm => "wasm_vm",
+        other => error_type_name(other),
     }
 }
 
@@ -479,5 +524,81 @@ mod tests {
             key_hash: Hash([0xef; 32]),
         });
         assert_eq!(ledger_key(&ttl), "ttl efefefefefefefef…");
+    }
+
+    #[test]
+    fn large_collections_are_capped() {
+        let numbers = |n: u32| -> ScVal {
+            ScVal::Vec(Some(ScVec(
+                (0..n)
+                    .map(ScVal::U32)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+            )))
+        };
+        assert_eq!(scval(&numbers(8)), "[0, 1, 2, 3, 4, 5, 6, 7]");
+        assert_eq!(scval(&numbers(9)), "[0, 1, 2, 3, 4, 5, 6, 7, … 1 more]");
+        assert_eq!(
+            scval(&numbers(5_000)),
+            "[0, 1, 2, 3, 4, 5, 6, 7, … 4992 more]"
+        );
+
+        let map = ScVal::Map(Some(ScMap(
+            (0..10u32)
+                .map(|n| ScMapEntry {
+                    key: ScVal::U32(n),
+                    val: ScVal::Bool(true),
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        )));
+        assert!(
+            scval(&map).ends_with("7: true, … 2 more}"),
+            "{}",
+            scval(&map)
+        );
+    }
+
+    #[test]
+    fn muxed_addresses_keep_their_id() {
+        use stellar_xdr::{MuxedEd25519Account, Uint256};
+        let muxed = |id| {
+            scval(&ScVal::Address(ScAddress::MuxedAccount(
+                MuxedEd25519Account {
+                    id,
+                    ed25519: Uint256([7; 32]),
+                },
+            )))
+        };
+        assert!(muxed(1).starts_with('M'), "{}", muxed(1));
+        assert_ne!(muxed(1), muxed(2));
+    }
+
+    #[test]
+    fn trustlines_name_their_asset() {
+        use stellar_xdr::{
+            AccountId, AlphaNum4, AssetCode4, LedgerKeyTrustLine, PublicKey, TrustLineAsset,
+            Uint256,
+        };
+        let account = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32])));
+        let trustline = |asset| {
+            ledger_key(&LedgerKey::Trustline(LedgerKeyTrustLine {
+                account_id: account.clone(),
+                asset,
+            }))
+        };
+        let usdc = trustline(TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2; 32]))),
+        }));
+        let eur = trustline(TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2; 32]))),
+        }));
+        assert!(usdc.contains(" USDC:G…"), "{usdc}");
+        assert!(eur.contains(" EUR:G…"), "{eur}");
+        assert_ne!(usdc, eur);
     }
 }

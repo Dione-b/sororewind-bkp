@@ -602,7 +602,7 @@ pub fn sample_report() -> Report {
         ledger: 1_000,
         protocol: 30,
         close_time: 1_700_000_000,
-        status: TxStatus::Failed,
+        status: "failed",
         fidelity: Fidelity::MATCH,
         result: ResultPair {
             onchain: trapped.clone(),
@@ -631,6 +631,7 @@ pub fn sample_report() -> Report {
         diagnostics: Diagnostics {
             onchain: vec![diagnostic.clone()],
             local: vec![diagnostic],
+            ..Diagnostics::default()
         },
     }
 }

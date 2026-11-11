@@ -244,7 +244,7 @@ fn assemble(run: Replayed<'_>) -> Report {
         ledger: run.ledger.sequence,
         protocol: run.ledger.protocol,
         close_time: run.ledger.close_time,
-        status: TxStatus::Failed,
+        status: "failed",
         fidelity: run.fidelity,
         result: ResultPair {
             onchain: (&run.tx.onchain_result).into(),
@@ -262,12 +262,22 @@ fn assemble(run: Replayed<'_>) -> Report {
         diagnostics: Diagnostics {
             onchain: lines(&run.tx.onchain_diagnostic_events),
             local: lines(&run.outcome.diagnostics),
+            onchain_xdr: raw(&run.tx.onchain_diagnostic_events),
+            local_xdr: raw(&run.outcome.diagnostics),
         },
     }
 }
 
 fn lines(events: &[stellar_xdr::DiagnosticEvent]) -> Vec<String> {
     events.iter().map(display::diagnostic).collect()
+}
+
+fn raw(events: &[stellar_xdr::DiagnosticEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| crate::codec::encode(event, "a diagnostic event").ok())
+        .map(|bytes| crate::codec::b64_encode(&bytes))
+        .collect()
 }
 
 fn footprint_report(state: &Reconstructed, tx_ledger: u32, fee_decided: bool) -> FootprintReport {

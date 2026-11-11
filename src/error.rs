@@ -199,6 +199,38 @@ pub enum RewindError {
 }
 
 impl RewindError {
+    /// A stable machine name for the kind of failure, for the `--json` error
+    /// document. Names are part of the public interface: add, never rename.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RewindError::InvalidHash { .. } => "invalid_hash",
+            RewindError::NotFound { .. } => "not_found",
+            RewindError::RpcUnreachable { .. } => "rpc_unreachable",
+            RewindError::HttpClient(_) => "http_client",
+            RewindError::Rpc { .. } => "rpc_error",
+            RewindError::NetworkMismatch { .. } => "network_mismatch",
+            RewindError::NotSoroban { .. } => "not_soroban",
+            RewindError::NeverReachedHost { .. } => "never_reached_host",
+            RewindError::ProtocolMismatch { .. } => "protocol_mismatch",
+            RewindError::NotAFailure { .. } => "not_a_failure",
+            RewindError::LedgerUnavailable { .. } => "ledger_unavailable",
+            RewindError::ConfigSettingMissing { .. } => "config_setting_missing",
+            RewindError::ConfigSettingMalformed { .. } => "config_setting_malformed",
+            RewindError::MissingTtl { .. } => "missing_ttl",
+            RewindError::FixtureIo { .. } => "fixture_io",
+            RewindError::FixtureInvalid { .. } => "fixture_invalid",
+            RewindError::FixtureMissing { .. } => "fixture_missing",
+            RewindError::RecordIo { .. } => "record_io",
+            RewindError::WasmFile { .. } => "wasm_file",
+            RewindError::XdrDecode { .. } | RewindError::Base64 { .. } => "malformed_response",
+            RewindError::XdrEncode { .. } => "xdr_encode",
+            RewindError::MissingField { .. } => "missing_field",
+            RewindError::SpecMissing { .. } => "spec_missing",
+            RewindError::ContractCode { .. } => "contract_code",
+            RewindError::Replay(_) => "replay",
+        }
+    }
+
     pub(crate) fn fixture_path(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> Self {
         let path = path.into();
         move |source| RewindError::FixtureIo { path, source }

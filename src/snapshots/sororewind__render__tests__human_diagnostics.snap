@@ -17,9 +17,9 @@ where it broke
   2 error diagnostics: balance too low → escalating
 
 call tree
-CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::outer(1, "two")
+CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::outer(1, "two")  (no return)
     · starting
-└─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::probe() → void (recovered by try_call)
+├─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::probe() → void  (recovered by try_call)
 └─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::inner()  ✗
        · about to fail
 
