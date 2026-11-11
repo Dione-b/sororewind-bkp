@@ -24,18 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - run: cargo fmt --all --check
 
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
 
@@ -47,7 +45,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 
@@ -58,7 +57,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --all-targets
+      # `+1.89` overrides rust-toolchain.toml, which would otherwise win.
+      - run: cargo +1.89 check --locked --all-targets
 
   # Advisories, licences, banned crates and sources; see deny.toml.
   deny:
@@ -75,6 +75,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --test live -- --ignored --nocapture

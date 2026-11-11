@@ -1,2 +1,3 @@
 /target
+# Local tool binaries (e.g. the stellar CLI); not needed to build or test.
 .tools/

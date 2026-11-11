@@ -95,3 +95,41 @@ async fn recent_failures_replay_and_match() {
         candidates.len()
     );
 }
+
+/// The nightly signal for a protocol upgrade: this build replays one protocol,
+/// so the day a network moves past it, sororewind stops working there until
+/// the host is bumped (see CONTRIBUTING.md, "Protocol upgrades").
+///
+/// A network still *behind* the embedded protocol is only reported: testnet
+/// upgrades first, and mainnet catches up on its own schedule.
+#[tokio::test]
+#[ignore = "requires network access to the testnet and mainnet RPCs"]
+async fn no_network_is_ahead_of_the_embedded_protocol() {
+    let host = sororewind::host_protocol();
+    let mut ahead = Vec::new();
+    for network in [Network::Testnet, Network::Mainnet] {
+        let rpc = RpcClient::new(HttpTransport::new(network.default_rpc_url()).unwrap());
+        let passphrase = rpc.network().await.unwrap().passphrase;
+        let latest = rpc.health().await.unwrap().latest_ledger;
+        let ledger = sororewind::state::read_ledger(&rpc, latest, &passphrase)
+            .await
+            .unwrap();
+        let protocol = ledger.protocol;
+        match protocol.cmp(&host) {
+            std::cmp::Ordering::Equal => println!("{network:?}: protocol {protocol}, replayable"),
+            std::cmp::Ordering::Less => println!(
+                "{network:?}: protocol {protocol}, behind the embedded {host}; \
+                 its transactions cannot be replayed by this build"
+            ),
+            std::cmp::Ordering::Greater => {
+                ahead.push(format!("{network:?} runs protocol {protocol}"));
+            }
+        }
+    }
+    assert!(
+        ahead.is_empty(),
+        "this build embeds protocol {host}, but {}; bump soroban-env-host and \
+         stellar-xdr (CONTRIBUTING.md, \"Protocol upgrades\")",
+        ahead.join(" and ")
+    );
+}
