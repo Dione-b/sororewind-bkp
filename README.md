@@ -61,7 +61,7 @@ sororewind <TX_HASH> --network mainnet
 ```
 
 ```bash
-sororewind <TX_HASH> --rpc-url https://my-rpc.example.org
+sororewind <TX_HASH> --rpc-url <RPC_URL>
 ```
 
 The transaction must have failed in the Soroban host, and the RPC must still
@@ -188,7 +188,8 @@ why:
 - **Too old.** The RPC no longer has the transaction or the ledger it ran in.
 - **Another protocol version.** The host refuses to execute a ledger from a
   different protocol. Each build replays one protocol, shown by
-  `sororewind --version`; the error names the host version you would need.
+  `sororewind --version`; the error names the host version you would need. Testnet upgrades before mainnet, so between the two upgrades a build
+  replays only one of them.
 - **Failed before the host.** A transaction that stellar-core rejected during
   validation or fee processing ran no contract code, so there is nothing to
   replay.
@@ -197,6 +198,10 @@ sororewind replays and explains. It does not suggest fixes or profile
 contracts.
 
 ## Development
+
+Setup, the checks a pull request must pass, and the protocol-upgrade
+checklist are in [CONTRIBUTING.md](CONTRIBUTING.md). With `just` installed,
+`just check` runs what CI enforces. The individual commands:
 
 ```bash
 cargo build
