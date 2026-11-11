@@ -1,138 +1,271 @@
 # sororewind
 
-Replay a failed Soroban transaction locally and narrate the call tree to the
-point of failure.
+Replay a failed Soroban transaction locally and see exactly where, and why, it
+broke.
 
 ```
-$ sororewind 015b092ded2eec4838dee20a5d172c428faa863a74e3706cd3aeb6581df0fd16
-sororewind  015b09…fd16  testnet
-ledger 5659599 · protocol 30 · 2026-11-10 14:40:38 UTC
+$ sororewind --fixture fixtures/contract-error
+sororewind  dd1f9b…53db  testnet
+ledger 5672381 · protocol 30 · 2026-11-11 08:25:48 UTC
 
 ✓ replay matches network
   on-chain  trapped
   local     trapped
 
 where it broke
-  auth error InvalidAction
-  "Unauthorized function call for address"
-  in CD4KFB23CQLJ47RIPESVBTQ444R75M6QVEZULWXHHFYYZT7SS2VGXOPW::write_prices (depth 0)
+  contract error #10
+  "resulting balance is not within the allowed range"
+  in CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer (depth 0)
 
 call tree
-CD4KFB23CQLJ47RIPESVBTQ444R75M6QVEZULWXHHFYYZT7SS2VGXOPW::write_prices(GBV54BUA…ZTFB, ["ETH"], 0x455448…(335 bytes))  ✗
-    · VM call trapped with HostError
+CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer(GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000)  ✗
 ```
 
-sororewind fetches the transaction from a Soroban RPC, rebuilds the ledger
-state it ran against (footprint entries, TTLs, network cost parameters,
-ledger header), re-executes it with the **same `soroban-env-host` version the
-network runs**, and prints what happened. When the local outcome matches the
-on-chain `resultXdr` you know the narration is telling the truth; when it
-does not, sororewind says so instead of guessing.
+A failed transaction on Stellar leaves you a result code and a pile of
+diagnostic events. sororewind turns that into an answer: it fetches the
+transaction from a Soroban RPC, rebuilds the ledger state it ran against
+(footprint entries, TTLs, network cost settings, ledger header), runs it again
+with the same `soroban-env-host` the network uses, and narrates the call tree
+up to the point of failure.
+
+Then it checks its own work. The local result is compared with the result the
+network recorded. When they match, the call tree and error you are reading are
+the ones the network executed. When they don't, sororewind tells you so and
+shows what changed, rather than guessing.
 
 ## Install
 
-```
-cargo install sororewind
-```
+sororewind has not been published to crates.io yet. Install it from source
+with Rust 1.89 or newer:
 
-or grab a prebuilt binary from the [releases page](https://github.com/example/sororewind/releases).
-
-## Usage
-
-```
-sororewind <TX_HASH> [OPTIONS]
-
-Arguments:
-  <TX_HASH>                  Hash of the failed transaction (hex, with or without 0x)
-
-Options:
-  -n, --network <NETWORK>    testnet (default) or mainnet
-      --rpc-url <URL>        Override the RPC endpoint
-      --json                 Machine-readable JSON instead of the human narrative
-      --wasm-debug <PATH>    Load contract code from a local WASM file (debugging aid)
-      --no-color             Disable ANSI colour (also auto-detected from TTY)
-  -v, --verbose...           -v adds budget/footprint detail, -vv adds raw diagnostics
-      --fixture <DIR>        Replay from a recorded RPC fixture directory (offline)
-      --record <DIR>         Write every RPC response into DIR while running (hidden)
+```bash
+cargo install --git https://github.com/Dione-b/sororewind
 ```
 
-### Exit codes
+`sororewind --version` prints the Stellar protocol and host version the build
+replays.
 
-| code | meaning |
+## Quick start
+
+Replay a live transaction by its hash, 64 hex characters with or without
+`0x`. Testnet is the default:
+
+```bash
+sororewind <TX_HASH>
+```
+
+Pick another network, or point at your own RPC:
+
+```bash
+sororewind <TX_HASH> --network mainnet
+```
+
+```bash
+sororewind <TX_HASH> --rpc-url https://my-rpc.example.org
+```
+
+The transaction must have failed in the Soroban host, and the RPC must still
+have it: RPCs keep a limited history, typically about a week, and the error
+tells you the window when a hash is too old.
+
+To try sororewind without the network, replay one of the recordings shipped in
+the repository, from a clone:
+
+```bash
+git clone https://github.com/Dione-b/sororewind && cd sororewind
+```
+
+```bash
+cargo run -- --fixture fixtures/contract-error
+```
+
+## Reading the output
+
+Every narrative has a header, a fidelity verdict, and a call tree. The other
+parts appear when they have something to say, or when you ask for detail:
+
+- **Header.** The transaction hash, the network, and the ledger it ran in, with
+  its protocol version and close time.
+- **Fidelity.** `✓ replay matches network` means the local run produced the
+  same result as the network, so everything below can be trusted.
+  `⚠ replay diverged` means it did not; the line says how (a different result
+  code, or the same code with a different error). A separate warning appears
+  if the network's settings changed since the transaction ran.
+- **Where it broke.** The error that ended the transaction: its type (contract,
+  auth, storage, budget, …), the contract's own error name when the contract
+  declares one, the message the host logged, and the contract function and
+  call depth where it was raised.
+- **Call tree.** Every contract call in order, with decoded arguments. Nested
+  calls are indented with `└─`, `✗` marks the call that failed, and lines
+  starting with `·` are the contract's log messages.
+- **Footprint.** The number of entries the transaction touched, which of them
+  changed at or after its ledger (value, TTL, or archived), how many were
+  missing, and whether the random-number seed was derived or fixed. It is
+  printed when the replay diverges, and always with `-v`.
+
+`-v` adds return values, the CPU and memory budget (local against the limits,
+and what the network used), and the full footprint lists. `-vv` also prints
+the raw on-chain and local diagnostic events, plus an RPC trace on stderr.
+
+## Exit codes
+
+| Code | Meaning |
 |------|---------|
-| `0`  | replay ran and **matched** the network's recorded result |
-| `1`  | tool error: bad hash, unreachable RPC, non-Soroban tx, protocol mismatch, un-replayable state |
-| `2`  | replay ran but **diverged** from the network — the state under us has moved |
+| `0`  | The replay ran and **matched** the result the network recorded. |
+| `1`  | sororewind could not replay the transaction, for example: bad hash or flags, unreachable RPC, wrong network, a transaction that succeeded or is not a Soroban transaction, another protocol version, missing state. |
+| `2`  | The replay ran but **diverged** from the network. |
 
-`2` is a real answer, not a crash: it means the ledger changed between the
-transaction and now (an entry was written or archived since), so the local
-replay is running against different state than the network saw.
+`2` is an answer, not a crash: the narrative is printed, but the local run did
+not reproduce the network's result, so read it with care. See [Why a replay
+can diverge](#why-a-replay-can-diverge). Invalid flags exit `1` rather than
+the usual `2`, so a script can treat `2` strictly as "diverged".
 
-## What it can and cannot tell you
+## Options
 
-**Trust the output when it says `✓ replay matches network`.** The fidelity
-check compares the local result against the on-chain `resultXdr`; a match
-means the call tree, arguments, and error you are reading are the ones the
-network actually executed.
+| Option | Description |
+|--------|-------------|
+| `-n, --network <NETWORK>` | `testnet` (default), `mainnet`, `futurenet`, or `local` (a quickstart or standalone node). Selects the default RPC. |
+| `--rpc-url <URL>` | Use this RPC instead of the network's default. |
+| `--json` | Print a JSON document instead of the narrative. |
+| `--wasm-debug <PATH>` | For a contract error, read the contract's error names from a local WASM file instead of the ledger. |
+| `--no-color` | Disable colour. It is also off when stdout is not a terminal or `NO_COLOR` is set. |
+| `-v, --verbose` | Repeat for more detail (`-v`, `-vv`). |
+| `--fixture <DIR>` | Replay from a recorded fixture directory, offline. The hash is optional, since the fixture records it. Cannot be combined with `--rpc-url`. |
 
-Limitations, in rough order of how often they matter:
+The default RPCs are `https://soroban-testnet.stellar.org` (testnet),
+`https://mainnet.sorobanrpc.com` (mainnet, run by a third party),
+`https://rpc-futurenet.stellar.org` (futurenet) and
+`http://localhost:8000/rpc` (local).
 
-- **State drift.** The RPC only serves *current* entry state. If any footprint
-  entry changed after the transaction ran, replay may diverge (exit `2`).
-  sororewind reports exactly which entries drifted.
-- **PRNG seed.** The network seeds the host PRNG from the transaction-set
-  hash, which is not retrievable from the RPC. sororewind uses a fixed seed.
-  A contract that draws random numbers will diverge; the fidelity check is
-  what surfaces that.
-- **Core-level fee failures.** A transaction rejected by stellar-core's
-  refundable-fee/storage-rent check (`insufficient refundable fee`) never
-  reaches the host on-chain, so host replay cannot reproduce it. sororewind
-  will report divergence and show what the host *would* have done.
-- **Retention window.** The RPC keeps ~7 days of history (`120960` ledgers on
-  testnet). Older transactions are gone.
-- **Protocol lockstep.** `soroban-env-host` refuses to execute a ledger whose
-  protocol differs from its own, so this build replays protocol-30
-  transactions only; it tells you which host version it embedded and which
-  one you need.
-- **No fix suggestions, no profiling, no GUI** — this is a replay tool.
+When you pass `--network` explicitly, sororewind checks it against the
+passphrase the RPC reports and stops with an error if they differ, instead of
+producing a mislabelled report.
 
-## Fixtures
+## JSON output
 
-`fixtures/` holds recorded RPC responses for five failed testnet transactions:
-contract error, two authorization paths, budget limit, and a storage/footprint
-error. The current set does not yet include a panic or an archived-entry
-failure. Fixtures exist because the RPC forgets:
+`--json` prints the full report as one document, whatever the verbosity. Its
+main fields:
 
-- `scripts/record-fixtures.sh` re-records a fixture from the network.
-- `tests/narrative.rs` drives the real binary against `--fixture` and
-  snapshots the narrative; every fixture must still replay-match (exit 0).
+| Field | Content |
+|-------|---------|
+| `schemaVersion` | Version of the document's shape; currently `1`. It changes only when a field is removed, renamed, or changes meaning; new fields do not change it. |
+| `hash`, `network`, `ledger`, `protocol`, `closeTime` | Which transaction ran, and where. |
+| `fidelity.match`, `fidelity.divergence` | Whether the replay matched, and if not, how it diverged. |
+| `result.onchain`, `result.local` | Each side's result, as `{ code, resultHash }`. |
+| `failure` | The error that ended the transaction, with the contract, function and depth it came from; `null` when there is none. |
+| `calls` | The call tree, one entry per call, with arguments, return value and logs. |
+| `budget`, `footprint`, `prngSeed` | Resource use, the footprint and its drift, and how the random-number seed was obtained. |
+| `diagnostics` | The raw on-chain and local diagnostic events. |
 
-The recording script stages each capture before replacing the old directory,
-so an RPC or decode error does not destroy a usable fixture. Fixture recordings
-are testnet-only. They expire with the RPC's retention window (~7 days); the
-nightly CI job checks one live transaction, but does not generate replacement
-failure transactions. Refresh hashes in `fixtures/MANIFEST` when they age out.
+Exit codes are the same as for the narrative, so a script can branch on the
+exit code and read the details from the document.
 
-The offline replay acceptance test enforces a five-second limit per fixture.
-The live RPC check has a wider timeout because network latency is outside the
-local replay budget.
+## Why a replay can diverge
+
+A divergence (exit `2`) means the local run did not reproduce what the network
+recorded. These are the known causes:
+
+- **The state moved on.** The RPC only serves the *current* value of a ledger
+  entry, not its value when the transaction ran. If an entry in the footprint
+  was written after that, the replay runs against different data. The
+  footprint section lists the entries that changed, so you can tell. Replay
+  soon after the failure for the best odds; contracts that rewrite the same
+  entry every few ledgers, such as price oracles, will rarely match.
+- **Checks stellar-core makes around the host.** The refundable-fee check
+  (`insufficient refundable fee`), the disk-read byte limit for classic
+  entries, and per-entry size limits need fee state the replay does not
+  rebuild. Transactions that failed on one of these replay as if they had not.
+- **Unknown apply order.** The host's random-number seed is derived the way the
+  network derives it, from the ledger's transaction set and the transaction's
+  position in it. If the RPC does not report that position, a fixed seed is
+  used (`prng seed fixed (apply order unknown)` in the footprint line,
+  `"prngSeed": "fixed"` in JSON), and a contract that draws random numbers can
+  diverge.
+
+Some transactions cannot be replayed at all. sororewind exits `1` and explains
+why:
+
+- **Too old.** The RPC no longer has the transaction or the ledger it ran in.
+- **Another protocol version.** The host refuses to execute a ledger from a
+  different protocol. Each build replays one protocol, shown by
+  `sororewind --version`; the error names the host version you would need.
+- **Failed before the host.** A transaction that stellar-core rejected during
+  validation or fee processing ran no contract code, so there is nothing to
+  replay.
+
+sororewind replays and explains. It does not suggest fixes or profile
+contracts.
 
 ## Development
 
-```
+```bash
 cargo build
-cargo test              # unit + fixture snapshot tests, fully offline
-cargo test -- --ignored # nightly: live-RPC end-to-end test
 ```
 
-Pipeline stages, one module each:
-
-```
-fetch (rpc.rs) → decode (tx.rs) → reconstruct (state.rs) → replay (replay.rs)
-      → narrate (story.rs) → render (render.rs)
+```bash
+cargo test
 ```
 
-`pipeline.rs` wires them together and owns the exit codes.
+```bash
+cargo test --test live -- --ignored --nocapture
+```
+
+`cargo test` is fully offline: unit tests plus a snapshot of the narrative for
+every fixture. The last command is the live test that CI runs nightly: it finds
+recent failed transactions on testnet and checks that they replay quickly and
+that at least one matches.
+
+CI also runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+the tests on Linux, macOS and Windows, a `cargo check` on the minimum
+supported Rust (1.89), and `cargo deny check`.
+
+### How the code is organised
+
+`src/pipeline.rs` runs the stages in order; `src/lib.rs` maps the outcome to
+an exit code. Each stage lives in its own module:
+
+| Stage | Module | What it does |
+|-------|--------|--------------|
+| Fetch | `rpc.rs`, `transport.rs` | Talk to the RPC, or answer from a fixture. |
+| Decode | `tx.rs` | Read the envelope, footprint and on-chain result. |
+| Reconstruct | `state.rs` | Rebuild ledger entries, TTLs, network settings and the ledger header. |
+| Replay | `replay.rs` | Run the host and compare its result with the network's. |
+| Narrate | `story.rs`, `spec.rs` | Turn diagnostic events into a call tree and a failure; read error names from the contract's spec. |
+| Report | `report.rs`, `render.rs` | Hold the outcome as data (the JSON schema), and print the narrative or the document. |
+
+`discover.rs` finds recent failed transactions on a live network, for the
+fixture tooling and the live test.
+
+### Fixtures
+
+A fixture is a complete offline recording of every RPC response one replay
+needs. Each directory under `fixtures/` holds one failed testnet transaction;
+`tests/narrative.rs` pins its narrative and exit code and checks the main JSON
+fields. The layout is documented at the top of `src/transport.rs`.
+
+Fixtures must replay as a match, so they have to be recorded soon after the
+transaction ran. List recent failures; the first column is the category, which
+is also the usual fixture name:
+
+```bash
+cargo run --example find_failed
+```
+
+Then record one. An existing name refreshes that fixture, a new name adds one:
+
+```bash
+cargo run --example record_fixture -- contract-error <TX_HASH>
+```
+
+By default `record_fixture` keeps a recording only if it replays as a match
+(`--allow-diverged` keeps a divergence on purpose), and it never replaces a
+working fixture with a failed one. Without arguments it re-records every
+fixture from the hash it was made for, which only works while the RPC still
+has those transactions.
+
+A new fixture also needs a line in the `fixtures!` list in
+`tests/narrative.rs` and an accepted snapshot: run `cargo insta review`, after
+`cargo install cargo-insta`.
 
 ## License
 
