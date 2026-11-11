@@ -1,271 +1,266 @@
-//! the pipeline: fetch → decode → reconstruct → replay → narrate → render.
+//! the pipeline: fetch → decode → reconstruct → replay → narrate → report.
 //!
-//! One function, because the order is the product: every stage exists to feed
-//! the next one exactly what it needs, and the fidelity check at the end is
-//! only meaningful if nothing upstream quietly substituted a guess for a fact.
+//! The order is the product: every stage exists to feed the next one exactly
+//! what it needs, and the fidelity check at the end is only meaningful if
+//! nothing upstream quietly substituted a guess for a fact. [`run`] keeps that
+//! order on one screen; each stage is a function with a typed result.
 
-use stellar_strkey::Contract as ContractStrkey;
-use stellar_xdr::ScError;
+use std::path::PathBuf;
 
-use crate::cli::Cli;
-use crate::error::{Result, RewindError};
-use crate::render::{self, BudgetReport, DriftReport, Report};
-use crate::replay::{self, Fidelity};
-use crate::rpc::RpcClient;
-use crate::state;
-use crate::story::Story;
-use crate::{spec, strkey, tx};
+use crate::display;
+use crate::error::{Result, Retention, RewindError};
+use crate::hash::TxHash;
+use crate::network::{Network, NetworkId};
+use crate::replay::{self, Fidelity, ReplayOutcome};
+use crate::report::{
+    Diagnostics, FootprintReport, Report, ResultPair, TtlDriftEntry, SCHEMA_VERSION,
+};
+use crate::rpc::{RawTransaction, RpcClient, TxStatus};
+use crate::state::{self, LedgerContext, Reconstructed};
+use crate::story::{Failure, Story};
+use crate::tx::{self, DecodedTx};
+use crate::{spec, strkey, HOST_VERSION};
 
-/// Everything went fine and the local replay reproduced the network.
-pub const EXIT_OK: i32 = 0;
-/// The tool itself failed: bad input, unreachable RPC, un-replayable state.
-pub const EXIT_ERROR: i32 = 1;
-/// The replay ran but disagreed with the network — state has drifted.
-pub const EXIT_DIVERGED: i32 = 2;
+/// What to replay.
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub hash: TxHash,
+    /// The network the caller believes the RPC serves. When set, a different
+    /// passphrase is an error instead of a silently mislabelled report.
+    pub network: Option<Network>,
+    /// Read the failing contract's error names from this WASM instead of the
+    /// ledger.
+    pub wasm_debug: Option<PathBuf>,
+}
 
-/// Version of the embedded `soroban-env-host`, filled in by `build.rs` from
-/// `Cargo.lock` so the protocol-guard message can name it accurately.
-const HOST_VERSION: &str = env!("SOROBAN_ENV_HOST_VERSION");
+pub async fn run(rpc: &RpcClient, request: &Request) -> Result<Report> {
+    let fetched = fetch(rpc, request).await?;
+    let tx = tx::decode(&request.hash, &fetched.raw)?;
+    let ledger = state::read_ledger(rpc, tx.ledger, &fetched.passphrase).await?;
+    guard_protocol(&tx, &ledger, &fetched.network)?;
+    let state = state::reconstruct(rpc, &tx, &ledger).await?;
+    let outcome = replay::replay(&tx, &state, &ledger)?;
+    let fidelity = replay::compare(&tx, &outcome);
+    let story = narrate(rpc, request, &state, &outcome).await?;
 
-pub async fn run(cli: &Cli) -> Result<i32> {
-    let hash = normalize_hash(&cli.tx_hash)?;
-    let rpc = RpcClient::new(
-        cli.network,
-        cli.rpc_url.clone(),
-        cli.verbose,
-        cli.fixture.clone(),
-        cli.record.clone(),
-    );
-
-    // --- fetch ------------------------------------------------------------
-    let (response, network) = tokio::try_join!(rpc.get_transaction(&hash), rpc.network_info())?;
-    let raw = response.tx;
-
-    if raw.status == "NOT_FOUND" {
-        // Only used to word the error; a failed health probe still leaves a
-        // sensible retention window behind.
-        let health = rpc.health().await.ok();
-        return Err(RewindError::NotFound {
-            hash,
-            network: cli.network.name().to_string(),
-            window: health
-                .as_ref()
-                .map(|h| h.ledger_retention_window)
-                .unwrap_or(120_960),
-            oldest: health.as_ref().map(|h| h.oldest_ledger).unwrap_or(0),
-        });
-    }
-    if raw.status != "FAILED" {
-        return Err(RewindError::NotAFailure {
-            hash,
-            status: raw.status.clone(),
-        });
-    }
-
-    // --- decode -----------------------------------------------------------
-    let tx = tx::decode(&hash, &raw)?;
-
-    // --- protocol guard ---------------------------------------------------
-    // The host hard-rejects any ledger whose protocol differs from its own, so
-    // checking here turns a cryptic host error into an actionable sentence.
-    let (header, close_time) = state::read_ledger_header(&rpc, tx.ledger).await?;
-    let host_protocol = soroban_env_host::meta::INTERFACE_VERSION.protocol;
-    if header.ledger_version != host_protocol {
-        return Err(RewindError::ProtocolMismatch {
-            hash,
-            tx_protocol: header.ledger_version,
-            host_protocol,
-            host_version: HOST_VERSION,
-            wanted: host_protocol,
-            network: cli.network.name().to_string(),
-        });
-    }
-
-    // --- reconstruct ------------------------------------------------------
-    let footprint = tx.footprint_keys();
-    let state = state::reconstruct(
-        &rpc,
-        &footprint,
-        tx.ledger,
-        &network.passphrase,
-        header.ledger_version,
-        header.base_reserve,
-        close_time,
-    )
-    .await?;
-
-    // --- replay -----------------------------------------------------------
-    let outcome = replay::replay(&tx, &state)?;
-    let local_result = outcome.local_result_code();
-    let fidelity = replay::compare(&tx.onchain_result, &local_result);
-
-    // --- narrate ----------------------------------------------------------
-    let host_error: Option<&soroban_env_host::HostError> = outcome.invoke_result.as_ref().err();
-    let sc_error: Option<ScError> = host_error.and_then(|e| e.try_into().ok());
-    let story = Story::build(&outcome.diagnostics, sc_error.as_ref());
-    let (error_name, error_origin) = resolve_error_names(cli, &rpc, &state, &story).await?;
-
-    // --- render -----------------------------------------------------------
-    let drifted: Vec<String> = state
-        .drifted(tx.ledger)
-        .iter()
-        .map(|&i| strkey::ledger_key(&state.slots[i].key))
-        .collect();
-
-    let report = Report {
-        hash: tx.hash.clone(),
-        network: cli.network.name().to_string(),
-        rpc_url: rpc.url(),
-        ledger: tx.ledger,
-        protocol: header.ledger_version,
-        close_time,
-        status: tx.status.clone(),
-        fidelity: fidelity.clone(),
-        onchain_label: replay::result_label(&tx.onchain_result),
-        local_label: outcome.local_result_label().to_string(),
+    Ok(assemble(Replayed {
+        rpc,
+        network: fetched.network,
+        tx,
+        ledger,
+        state,
+        outcome,
+        fidelity,
         story,
-        error_name,
-        error_origin,
-        budget: BudgetReport {
-            cpu_insns: outcome.cpu_insns,
-            cpu_limit: outcome.cpu_limit,
-            mem_bytes: outcome.mem_bytes,
-            mem_limit: outcome.mem_limit,
-        },
-        drift: DriftReport {
-            drifted,
-            missing: state.missing().len(),
-            total: state.slots.len(),
-            config_from_ledger: state.config.from_ledger,
-        },
-        onchain_diagnostics: tx::diagnostic_summary(&tx.onchain_diagnostic_events),
-        local_diagnostics: tx::diagnostic_summary(&outcome.diagnostics),
-    };
+    }))
+}
 
-    if cli.json {
-        println!("{}", render::json(&report));
-    } else {
-        print!(
-            "{}",
-            render::human(&report, render::use_color(cli.no_color), cli.verbose)
-        );
+/// A failed transaction and the network it was found on.
+struct Fetched {
+    raw: RawTransaction,
+    passphrase: String,
+    network: NetworkId,
+}
+
+async fn fetch(rpc: &RpcClient, request: &Request) -> Result<Fetched> {
+    let (raw, info) = tokio::try_join!(rpc.get_transaction(&request.hash), rpc.network())?;
+
+    // The passphrase is the network's identity; `--network` is only a claim.
+    let network = NetworkId::from_passphrase(&info.passphrase);
+    if let Some(expected) = request.network {
+        if network != NetworkId::Known(expected) {
+            return Err(RewindError::NetworkMismatch {
+                expected,
+                actual: network,
+                origin: rpc.origin(),
+            });
+        }
     }
 
-    Ok(match fidelity {
-        Fidelity::Match => EXIT_OK,
-        Fidelity::Diverged { .. } => EXIT_DIVERGED,
+    match raw.status {
+        TxStatus::Failed => Ok(Fetched {
+            raw,
+            passphrase: info.passphrase,
+            network,
+        }),
+        TxStatus::Success => Err(RewindError::NotAFailure {
+            hash: request.hash.clone(),
+        }),
+        TxStatus::NotFound => Err(RewindError::NotFound {
+            hash: request.hash.clone(),
+            network,
+            // Only used to word the error, so a failed probe is not an error.
+            retention: match rpc.health().await {
+                Ok(health) if health.ledger_retention_window > 0 => Retention::Reported {
+                    window: health.ledger_retention_window,
+                    oldest: health.oldest_ledger,
+                },
+                _ => Retention::Unknown,
+            },
+        }),
+    }
+}
+
+/// The host hard-rejects any ledger whose protocol differs from its own, so
+/// checking here turns a cryptic host error into an actionable sentence.
+fn guard_protocol(tx: &DecodedTx, ledger: &LedgerContext, network: &NetworkId) -> Result<()> {
+    let host_protocol = crate::host_protocol();
+    if ledger.protocol == host_protocol {
+        return Ok(());
+    }
+    Err(RewindError::ProtocolMismatch {
+        hash: tx.hash.clone(),
+        tx_protocol: ledger.protocol,
+        host_protocol,
+        host_version: HOST_VERSION,
+        network: network.clone(),
     })
 }
 
-/// Give the failing `ScError::Contract(n)` its own name, if the contract is
-/// willing to tell us one.
+/// Build the call tree and, for a contract error, give the number its name.
+async fn narrate(
+    rpc: &RpcClient,
+    request: &Request,
+    state: &Reconstructed,
+    outcome: &ReplayOutcome,
+) -> Result<Story> {
+    let mut story = Story::build(&outcome.diagnostics, outcome.error.as_ref());
+    let Some(code) = story.failure.as_ref().and_then(|f| f.contract_code) else {
+        return Ok(story);
+    };
+
+    let wasm = match &request.wasm_debug {
+        Some(path) => tokio::fs::read(path)
+            .await
+            .map_err(|source| RewindError::WasmFile {
+                path: path.clone(),
+                source,
+            })?,
+        None => match failing_contract_wasm(rpc, state, &story).await {
+            Some(wasm) => wasm,
+            None => return Ok(story),
+        },
+    };
+
+    // A contract without a readable spec still has a number; not an error.
+    match spec::from_wasm(&wasm) {
+        Ok(names) => {
+            if let Some(failure) = &mut story.failure {
+                failure.name = names.name(code).map(str::to_string);
+                failure.name_origin = names.origin;
+            }
+        }
+        Err(err) => log::debug!(target: "spec", "{err}"),
+    }
+    Ok(story)
+}
+
+/// The WASM of the contract the error was raised in, falling back to the
+/// outermost call when the failure happened before any frame opened.
 ///
-/// The contract's WASM is usually already in the footprint; when it is not, it
+/// The contract's code is usually already in the footprint; when it is not, it
 /// costs two extra `getLedgerEntries` calls, which is still cheap next to the
 /// value of printing `InsufficientBalance` instead of `#3`.
-async fn resolve_error_names(
-    cli: &Cli,
+async fn failing_contract_wasm(
     rpc: &RpcClient,
-    state: &state::Reconstructed,
+    state: &Reconstructed,
     story: &Story,
-) -> Result<(Option<String>, Option<String>)> {
-    let Some(failure) = &story.failure else {
-        return Ok((None, None));
-    };
-    let Some(code) = failure.contract_error_code() else {
-        return Ok((None, None));
-    };
-
-    let wasm = if let Some(path) = &cli.wasm_debug {
-        std::fs::read(path).map_err(|e| {
-            RewindError::State(format!(
-                "could not read --wasm-debug {}: {e}",
-                path.display()
-            ))
-        })?
-    } else {
-        let Some(contract) = failing_contract(story) else {
-            return Ok((None, None));
-        };
-        let Some(contract_id) = decode_contract(&contract) else {
-            return Ok((None, None));
-        };
-        match spec::contract_wasm(rpc, state, &contract_id).await {
-            Ok(wasm) => wasm,
-            Err(err) => {
-                if cli.verbose > 0 {
-                    eprintln!("[spec] {err}");
-                }
-                return Ok((None, None));
-            }
-        }
-    };
-
-    match spec::from_wasm(&wasm) {
-        Ok(names) => Ok((names.name(code).map(str::to_string), names.origin)),
-        Err(err) => {
-            if cli.verbose > 0 {
-                eprintln!("[spec] {err}");
-            }
-            Ok((None, None))
-        }
-    }
-}
-
-/// The contract the error was raised in, falling back to the outermost call
-/// when the failure happened before any frame opened.
-fn failing_contract(story: &Story) -> Option<String> {
-    story
+) -> Option<Vec<u8>> {
+    let contract = story
         .failure
         .as_ref()
-        .and_then(|f| f.contract.clone())
-        .or_else(|| story.calls.first().and_then(|c| c.contract.clone()))
-}
-
-fn decode_contract(strkey: &str) -> Option<stellar_xdr::ContractId> {
-    let contract = ContractStrkey::from_string(strkey).ok()?;
-    Some(stellar_xdr::ContractId(stellar_xdr::Hash(contract.0)))
-}
-
-/// Accept the hash the way a person would paste it: optional `0x`, any case,
-/// but nothing else.
-fn normalize_hash(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    let bare = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
-
-    if bare.len() != 64 || !bare.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(RewindError::InvalidHash {
-            hash: raw.to_string(),
-            reason: "expected 64 hexadecimal characters (32 bytes)".to_string(),
-        });
+        .and_then(|failure: &Failure| failure.contract.as_deref())
+        .or_else(|| {
+            story
+                .calls
+                .first()
+                .and_then(|call| call.contract.as_deref())
+        })?;
+    let contract_id = strkey::parse_contract(contract)?;
+    match spec::contract_wasm(rpc, state, &contract_id).await {
+        Ok(wasm) => Some(wasm),
+        Err(err) => {
+            log::debug!(target: "spec", "{err}");
+            None
+        }
     }
-    // The RPC is case-sensitive about hashes and always reports them lowercase.
-    Ok(bare.to_ascii_lowercase())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Everything the stages produced, ready to be summarised.
+struct Replayed<'a> {
+    rpc: &'a RpcClient,
+    network: NetworkId,
+    tx: DecodedTx,
+    ledger: LedgerContext,
+    state: Reconstructed,
+    outcome: ReplayOutcome,
+    fidelity: Fidelity,
+    story: Story,
+}
 
-    #[test]
-    fn accepts_hex_with_prefix() {
-        let hash = "a".repeat(64);
-        assert_eq!(normalize_hash(&hash).unwrap(), hash);
-        assert_eq!(normalize_hash(&format!("0x{hash}")).unwrap(), hash);
-        assert_eq!(
-            normalize_hash(&format!("0X{}", hash.to_uppercase())).unwrap(),
-            hash
-        );
+fn assemble(run: Replayed<'_>) -> Report {
+    Report {
+        schema_version: SCHEMA_VERSION,
+        hash: run.tx.hash.clone(),
+        fee_bump: run.tx.fee_bump,
+        network: match &run.network {
+            NetworkId::Known(network) => network.name().to_string(),
+            NetworkId::Custom(passphrase) => passphrase.clone(),
+        },
+        rpc: run.rpc.origin(),
+        ledger: run.ledger.sequence,
+        protocol: run.ledger.protocol,
+        close_time: run.ledger.close_time,
+        status: TxStatus::Failed,
+        fidelity: run.fidelity,
+        result: ResultPair {
+            onchain: (&run.tx.onchain_result).into(),
+            local: (&run.outcome.result).into(),
+        },
+        story: run.story,
+        budget: run.outcome.budget,
+        footprint: footprint_report(&run.state, run.ledger.sequence),
+        prng_seed: run.outcome.prng_seed,
+        diagnostics: Diagnostics {
+            onchain: lines(&run.tx.onchain_diagnostic_events),
+            local: lines(&run.outcome.diagnostics),
+        },
     }
+}
 
-    #[test]
-    fn rejects_nonsense() {
-        assert!(normalize_hash("").is_err());
-        assert!(normalize_hash("deadbeef").is_err());
-        assert!(normalize_hash(&"z".repeat(64)).is_err());
-        assert!(normalize_hash(&"a".repeat(65)).is_err());
+fn lines(events: &[stellar_xdr::DiagnosticEvent]) -> Vec<String> {
+    events.iter().map(display::diagnostic).collect()
+}
+
+fn footprint_report(state: &Reconstructed, tx_ledger: u32) -> FootprintReport {
+    let labels = |keep: &dyn Fn(&state::FootprintSlot) -> bool| -> Vec<String> {
+        state
+            .slots
+            .iter()
+            .filter(|slot| keep(slot))
+            .map(|slot| display::ledger_key(&slot.key))
+            .collect()
+    };
+    FootprintReport {
+        entries: state.slots.len(),
+        missing: state.slots.iter().filter(|slot| slot.missing()).count(),
+        drifted: labels(&|slot| slot.value_drifted(tx_ledger)),
+        ttl_drifted: state
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                Some(TtlDriftEntry {
+                    entry: display::ledger_key(&slot.key),
+                    reason: slot.ttl_drift?.into(),
+                })
+            })
+            .collect(),
+        archived: labels(&|slot| slot.archived()),
+        config_drifted: state
+            .config
+            .drifted
+            .iter()
+            .map(|setting| setting.to_string())
+            .collect(),
     }
 }

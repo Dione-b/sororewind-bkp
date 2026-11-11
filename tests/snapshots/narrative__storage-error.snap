@@ -1,10 +1,10 @@
 ---
 source: tests/narrative.rs
-expression: human_report(&fixture)
+expression: "common::transcript(&result, &human)"
 ---
 --- exit code: 0
-sororewind  fbca2b…febb  testnet
-ledger 5640280 · protocol 30 · 2026-11-09 11:50:42 UTC
+sororewind  974594…eeae  testnet
+ledger 5672305 · protocol 30 · 2026-11-11 08:19:28 UTC
 
 ✓ replay matches network
   on-chain  trapped
@@ -12,8 +12,9 @@ ledger 5640280 · protocol 30 · 2026-11-09 11:50:42 UTC
 
 where it broke
   storage error ExceededLimit
-  "trying to access contract code outside of the footprint"
-  in CC2UPOKB4ACKNYUG7JUCR5HZ6HY6VGVCXHQNSCKHUOILHO4P2PHWFLUQ::play (depth 0)
+  "trying to access contract data key outside of the footprint"
+  in CBLLSKUH6N6HGFV5MSAMMJWJFYNUFEH7EGH2T4HJKOVMIZNJ23BZSMCM::withdraw_position (depth 0)
 
 call tree
-CC2UPOKB4ACKNYUG7JUCR5HZ6HY6VGVCXHQNSCKHUOILHO4P2PHWFLUQ::play(GALVNSBWJHKAPRSB6M2S4B6UC2QFAT5JNA7IDUYLOZBPMQ2HYTDZ7VSR, 8, 11, 2, 255)  ✗
+CBLLSKUH6N6HGFV5MSAMMJWJFYNUFEH7EGH2T4HJKOVMIZNJ23BZSMCM::withdraw_position(GAEGW4O6ZSHPSVPJPT3WW4IBY2KKSCNDMORU7N5PK54WMRACVX7JD4BM, 59720, 60140, 854358050, [403326, 177772126])  ✗
+    · VM call trapped with HostError
