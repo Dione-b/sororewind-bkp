@@ -20,6 +20,15 @@ pub enum RewindError {
     #[error("invalid transaction hash `{hash}`: expected 64 hexadecimal characters (32 bytes)")]
     InvalidHash { hash: String },
 
+    #[error("no transaction hash was given, and there is no --fixture to take one from")]
+    MissingHash,
+
+    #[error("invalid RPC URL: {reason}")]
+    InvalidRpcUrl { reason: String },
+
+    #[error("could not write the report: {0}")]
+    Output(String),
+
     #[error(
         "transaction {hash} not found on {network}.\n\
          \n\
@@ -132,14 +141,22 @@ pub enum RewindError {
     )]
     MissingTtl { entry: String },
 
-    #[error(
-        "the fixture file {path} could not be read ({source}); it was recorded for a different \
-         transaction or the directory is incomplete"
-    )]
+    #[error("could not read {path}: {source}")]
     FixtureIo {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+
+    #[error(
+        "the fixture at {dir} was recorded for transaction {recorded}, not {requested}.\n\
+         \n\
+         Drop the hash to replay the transaction the fixture holds."
+    )]
+    FixtureHashMismatch {
+        dir: PathBuf,
+        recorded: TxHash,
+        requested: TxHash,
     },
 
     #[error("{path} is not a usable fixture: {reason}")]
@@ -223,6 +240,10 @@ impl RewindError {
     pub fn kind(&self) -> &'static str {
         match self {
             RewindError::InvalidHash { .. } => "invalid_hash",
+            RewindError::MissingHash => "missing_hash",
+            RewindError::InvalidRpcUrl { .. } => "invalid_rpc_url",
+            RewindError::Output(_) => "output",
+            RewindError::FixtureHashMismatch { .. } => "fixture_hash_mismatch",
             RewindError::NotFound { .. } => "not_found",
             RewindError::RpcUnreachable { .. } => "rpc_unreachable",
             RewindError::HttpClient(_) => "http_client",
@@ -276,9 +297,8 @@ impl fmt::Display for Retention {
                 write!(
                     f,
                     "The RPC only keeps transactions for its retention window ({window} ledgers, \
-                     about {} days).",
-                    // Ledgers close roughly every five seconds.
-                    u64::from(*window) * 5 / 86_400
+                     about {}).",
+                    approximate_duration(*window)
                 )?;
                 match oldest {
                     Some(oldest) => write!(f, "\nOldest ledger available: {oldest}."),
@@ -294,4 +314,66 @@ impl fmt::Display for Retention {
     }
 }
 
+/// How long `ledgers` ledgers take, to the nearest sensible unit: "7 days",
+/// "1 day", "5 hours", "less than an hour".
+fn approximate_duration(ledgers: u32) -> String {
+    // Ledgers close roughly every five seconds.
+    let seconds = u64::from(ledgers) * 5;
+    let unit = |n: u64, name: &str| format!("{n} {name}{}", if n == 1 { "" } else { "s" });
+    // Round to the nearest unit, not down: 23.9 hours is a day.
+    match seconds {
+        s if s >= 86_400 - 1_800 => unit((s + 43_200) / 86_400, "day"),
+        s if s >= 1_800 => unit((s + 1_800) / 3_600, "hour"),
+        _ => "less than an hour".to_string(),
+    }
+}
+
 pub type Result<T> = std::result::Result<T, RewindError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_windows_read_in_a_sensible_unit() {
+        assert_eq!(approximate_duration(120_960), "7 days");
+        assert_eq!(approximate_duration(17_280), "1 day");
+        // Just under a day rounds to a day, not to "0 days".
+        assert_eq!(approximate_duration(17_000), "1 day");
+        assert_eq!(approximate_duration(8_640), "12 hours");
+        assert_eq!(approximate_duration(720), "1 hour");
+        assert_eq!(approximate_duration(100), "less than an hour");
+
+        let text = Retention::Reported {
+            window: 2_880,
+            oldest: Some(5),
+        }
+        .to_string();
+        assert!(text.contains("(2880 ledgers, about 4 hours)"), "{text}");
+        assert!(text.ends_with("Oldest ledger available: 5."), "{text}");
+        let text = Retention::Reported {
+            window: 2_880,
+            oldest: None,
+        }
+        .to_string();
+        assert!(!text.contains("Oldest"), "{text}");
+    }
+
+    #[test]
+    fn rpc_errors_show_their_code() {
+        let error = |code| RewindError::Rpc {
+            origin: "https://rpc.example".to_string(),
+            method: "getLedgers".to_string(),
+            code,
+            detail: "start ledger (5) must be between the oldest ledger: 9 and the latest \
+                     ledger: 10 for this rpc instance"
+                .to_string(),
+        };
+        assert!(error(Some(-32600))
+            .to_string()
+            .ends_with("(JSON-RPC code -32600)"));
+        assert!(error(None).to_string().ends_with("for this rpc instance"));
+        assert!(error(None).is_ledger_out_of_range());
+        assert_eq!(error(None).kind(), "rpc_error");
+    }
+}

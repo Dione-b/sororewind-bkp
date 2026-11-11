@@ -66,17 +66,17 @@ async fn main() -> ExitCode {
     let result = run(&cli).await;
     let code = sororewind::exit_code(&result);
     let printed = result.and_then(|report| {
-        if cli.json {
-            let document = render::json(&report).map_err(|e| {
-                sororewind::RewindError::Replay(format!("could not serialise the report: {e}"))
-            })?;
-            println!("{document}");
+        let text = if cli.json {
+            let mut document = render::json(&report)
+                .map_err(|e| sororewind::RewindError::Output(e.to_string()))?;
+            document.push('\n');
+            document
         } else {
             let detail = Detail::from_verbosity(cli.verbose);
             let color = render::use_color(cli.color_choice(), &render::ColorEnv::current());
-            print!("{}", render::human(&report, color, detail));
-        }
-        Ok(())
+            render::human(&report, color, detail)
+        };
+        write_stdout(&text)
     });
 
     match printed {
@@ -84,10 +84,25 @@ async fn main() -> ExitCode {
         Err(err) => {
             // A script reading `--json` gets a document either way.
             if cli.json {
-                println!("{}", render::json_error(&err));
+                let _ = write_stdout(&format!("{}\n", render::json_error(&err)));
             }
             eprintln!("sororewind: {err}");
             ExitCode::from(sororewind::EXIT_ERROR)
         }
+    }
+}
+
+/// Write to stdout without panicking when the reader has gone away:
+/// `sororewind … | head -1` closes the pipe early, and that is not a failure.
+fn write_stdout(text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(sororewind::RewindError::Output(e.to_string())),
     }
 }

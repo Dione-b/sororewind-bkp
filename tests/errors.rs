@@ -299,7 +299,8 @@ async fn fixture_directory_that_does_not_exist() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, RewindError::FixtureIo { .. }));
+    assert!(matches!(err, RewindError::FixtureInvalid { .. }));
+    assert!(err.to_string().contains("no such directory"), "{err}");
     assert_eq!(sororewind::exit_code(&Err(err)), 1);
 }
 
@@ -331,10 +332,7 @@ async fn fixture_missing_a_response() {
             .unwrap(),
     );
     let err = fails_with(&rpc, &request, "getTransaction").await;
-    assert!(matches!(
-        err,
-        RewindError::FixtureIo { .. } | RewindError::FixtureMissing { .. }
-    ));
+    assert!(matches!(err, RewindError::FixtureMissing { .. }));
 }
 
 /// The binary itself: argument errors and the two output modes.
@@ -391,7 +389,7 @@ mod binary {
         assert_eq!(out.status.code(), Some(1));
         let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(json["schemaVersion"], 1);
-        assert_eq!(json["error"]["kind"], "fixture_io");
+        assert_eq!(json["error"]["kind"], "fixture_invalid");
         let message = json["error"]["message"].as_str().unwrap();
         // The same sentence a person gets on stderr.
         assert!(String::from_utf8_lossy(&out.stderr).contains(message));
@@ -408,5 +406,48 @@ mod binary {
         assert!(!plain.stdout.contains(&0x1b));
         let forced = sororewind(&["--fixture", &fixture(), "--color", "always"]);
         assert!(forced.stdout.contains(&0x1b));
+    }
+
+    #[test]
+    fn a_fixture_only_replays_its_own_transaction() {
+        let other = "ab".repeat(32);
+        let out = sororewind(&["--fixture", &fixture(), &other]);
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("was recorded for transaction") && stderr.contains(&other),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn a_mistyped_fixture_path_is_named_as_such() {
+        let out = sororewind(&["--fixture", "/no/such/fixture"]);
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("there is no such directory"), "{stderr}");
+        assert!(!stderr.contains("different transaction"), "{stderr}");
+    }
+
+    /// `sororewind … | head -1`: the reader going away is not a failure, and
+    /// certainly not a panic (exit code 101).
+    #[test]
+    fn a_closed_pipe_is_not_an_error() {
+        use std::process::Stdio;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sororewind"))
+            .args(["--fixture", &fixture(), "-vv"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Close our end before the child has anything to write.
+        drop(child.stdout.take());
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

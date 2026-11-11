@@ -11,7 +11,7 @@ use crate::network::Network;
 use crate::pipeline::Request;
 use crate::render::ColorChoice;
 use crate::rpc::RpcClient;
-use crate::transport::{FixtureManifest, FixtureTransport, HttpTransport, Recording};
+use crate::transport::{FixtureTransport, HttpTransport, Recording};
 
 /// Replay a failed Soroban transaction locally and narrate the call tree.
 #[derive(Debug, Parser)]
@@ -38,17 +38,15 @@ pub struct Cli {
     pub tx_hash: Option<TxHash>,
 
     /// Network the transaction lives on; selects the default RPC endpoint and
-    /// is checked against the RPC's passphrase
-    /// [default RPCs: testnet https://soroban-testnet.stellar.org,
-    /// mainnet https://mainnet.sorobanrpc.com (third-party),
-    /// futurenet https://rpc-futurenet.stellar.org, local http://localhost:8000/rpc]
+    /// is checked against the RPC's passphrase. (The help text is completed
+    /// with the default endpoints in `Cli::command`.)
     #[arg(long, short = 'n', value_enum)]
     pub network: Option<Network>,
 
     /// Use this RPC endpoint instead of the default for --network. Prefer the
     /// SOROREWIND_RPC_URL environment variable for a URL that holds an API
     /// key: arguments end up in shell history and process listings
-    #[arg(long, value_name = "URL", conflicts_with = "fixture")]
+    #[arg(long, value_name = "URL", conflicts_with = "fixture", value_parser = parse_rpc_url)]
     pub rpc_url: Option<String>,
 
     /// Emit machine-readable JSON instead of the human narrative
@@ -57,7 +55,7 @@ pub struct Cli {
 
     /// Read the contract's error names from this WASM file instead of the
     /// ledger (debugging aid)
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", value_parser = parse_wasm_path)]
     pub wasm_debug: Option<PathBuf>,
 
     /// When to colour the narrative: auto colours a terminal, and honours
@@ -102,9 +100,66 @@ fn rpc_url_from(value: Option<String>) -> Option<String> {
     value.filter(|url| !url.trim().is_empty())
 }
 
+/// An RPC endpoint has to be an absolute http(s) URL: `localhost:8000` parses
+/// as a URL with the scheme `localhost`, and would only fail once sent.
+fn parse_rpc_url(text: &str) -> std::result::Result<String, String> {
+    let text = text.trim();
+    let url =
+        reqwest::Url::parse(text).map_err(|e| format!("{e} (expected http://… or https://…)"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "the scheme is `{}`, expected http or https (did you mean http://{text}?)",
+            url.scheme()
+        ));
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("it has no host".to_string());
+    }
+    Ok(text.to_string())
+}
+
+/// `--wasm-debug` is only read when the failure turns out to be a contract
+/// error; a path that does not exist should not wait until then to be told.
+fn parse_wasm_path(text: &str) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(text);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => Ok(path),
+        Ok(_) => Err("it is not a file".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `testnet https://…, mainnet https://… (third-party), …`, from the
+/// endpoints the code actually uses.
+fn default_rpcs() -> String {
+    Network::ALL
+        .into_iter()
+        .map(|network| {
+            format!(
+                "{network} {}{}",
+                network.default_rpc_url(),
+                if network == Network::Mainnet {
+                    " (third-party)"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl Cli {
     pub fn command() -> clap::Command {
-        <Cli as CommandFactory>::command().version(VERSION.as_str())
+        <Cli as CommandFactory>::command()
+            .version(VERSION.as_str())
+            .mut_arg("network", |arg| {
+                arg.help(format!(
+                    "Network the transaction lives on; selects the default RPC endpoint and is \
+                     checked against the RPC's passphrase [default RPCs: {}]",
+                    default_rpcs()
+                ))
+            })
     }
 
     /// Parse arguments; clap's own error carries help, version and usage
@@ -132,22 +187,29 @@ impl Cli {
     pub async fn connect(&self) -> Result<(RpcClient, Request)> {
         let (rpc, hash) = match &self.fixture {
             Some(dir) => {
-                let hash = match &self.tx_hash {
-                    Some(hash) => hash.clone(),
-                    None => FixtureManifest::load(dir).await?.tx_hash()?,
-                };
-                (RpcClient::new(FixtureTransport::open(dir).await?), hash)
+                let fixture = FixtureTransport::open(dir).await?;
+                // A fixture holds one transaction; a different hash would
+                // only fail later, on a response file it does not have.
+                let hash = fixture.hash_for(self.tx_hash.as_ref())?;
+                (RpcClient::new(fixture), hash)
             }
             None => {
                 // clap requires a hash whenever there is no fixture; a `Cli`
                 // built by hand without one is the caller's invalid input.
-                let hash = self.tx_hash.clone().ok_or(RewindError::InvalidHash {
-                    hash: String::new(),
-                })?;
+                let hash = self.tx_hash.clone().ok_or(RewindError::MissingHash)?;
                 let url = self
                     .rpc_url
                     .clone()
-                    .or_else(|| rpc_url_from(std::env::var(RPC_URL_ENV).ok()))
+                    .map(Ok)
+                    .or_else(|| {
+                        // The flag was validated by clap; the variable was not.
+                        rpc_url_from(std::env::var(RPC_URL_ENV).ok()).map(|url| {
+                            parse_rpc_url(&url).map_err(|reason| RewindError::InvalidRpcUrl {
+                                reason: format!("{RPC_URL_ENV}: {reason}"),
+                            })
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or_else(|| {
                         self.network
                             .unwrap_or(Network::Testnet)
@@ -216,7 +278,7 @@ mod tests {
     #[test]
     fn fixture_conflicts_with_live_sources() {
         for flag in ["--rpc-url", "--record"] {
-            let err = parse(&[HASH, "--fixture", "dir", flag, "x"]).unwrap_err();
+            let err = parse(&[HASH, "--fixture", "dir", flag, "http://x"]).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{flag}");
         }
         // Recording a live run against a custom endpoint is fine.
@@ -235,6 +297,66 @@ mod tests {
         }
         assert!(parse(&[HASH, "--network", "moon"]).is_err());
         assert_eq!(parse(&[HASH, "-vv"]).unwrap().verbose, 2);
+    }
+
+    #[test]
+    fn rpc_urls_must_be_http() {
+        for url in [
+            "http://localhost:8000/rpc",
+            "https://rpc.example/v1/key?x=1",
+        ] {
+            assert_eq!(
+                parse(&[HASH, "--rpc-url", url]).unwrap().rpc_url.as_deref(),
+                Some(url)
+            );
+        }
+        let message = |url: &str| parse(&[HASH, "--rpc-url", url]).unwrap_err().to_string();
+        // Parses as a URL whose scheme is `localhost`.
+        assert!(
+            message("localhost:8000").contains("did you mean http://localhost:8000?"),
+            "{}",
+            message("localhost:8000")
+        );
+        assert!(message("ftp://rpc.example").contains("expected http or https"));
+        assert!(message("rpc.example").contains("expected http://"));
+    }
+
+    #[test]
+    fn a_wasm_debug_path_must_be_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("contract.wasm");
+        std::fs::write(&file, b"\0asm").unwrap();
+        let file = file.display().to_string();
+        assert!(parse(&[HASH, "--wasm-debug", &file]).is_ok());
+
+        let missing = dir.path().join("nope.wasm").display().to_string();
+        let err = parse(&[HASH, "--wasm-debug", &missing]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        let directory = dir.path().display().to_string();
+        let err = parse(&[HASH, "--wasm-debug", &directory]).unwrap_err();
+        assert!(err.to_string().contains("it is not a file"), "{err}");
+    }
+
+    #[test]
+    fn help_lists_the_default_rpcs_the_code_uses() {
+        let help = Cli::command().render_long_help().to_string();
+        for network in Network::ALL {
+            assert!(
+                help.contains(network.default_rpc_url()),
+                "{network}: {help}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_hash_is_named_as_such() {
+        let cli = Cli {
+            tx_hash: None,
+            ..parse(&[HASH]).unwrap()
+        };
+        let err = cli.connect().await.err().unwrap();
+        assert!(matches!(err, RewindError::MissingHash), "{err}");
+        assert!(!err.to_string().contains("``"));
     }
 
     #[test]

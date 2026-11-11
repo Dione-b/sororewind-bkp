@@ -285,9 +285,21 @@ pub struct FixtureManifest {
 impl FixtureManifest {
     pub async fn load(dir: &Path) -> Result<Self> {
         let path = dir.join(MANIFEST_FILE);
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(RewindError::fixture_path(&path))?;
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            // The directory, not a file in it, is what is wrong.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RewindError::FixtureInvalid {
+                    path: dir.to_path_buf(),
+                    reason: if dir.is_dir() {
+                        format!("it has no {MANIFEST_FILE}; it is not a recorded fixture")
+                    } else {
+                        "there is no such directory".to_string()
+                    },
+                })
+            }
+            Err(e) => return Err(RewindError::fixture_path(&path)(e)),
+        };
         let manifest: FixtureManifest =
             serde_json::from_str(&text).map_err(|e| RewindError::FixtureInvalid {
                 path: path.clone(),
@@ -325,13 +337,14 @@ struct EntryStore {
 
 pub struct FixtureTransport {
     dir: PathBuf,
+    manifest: FixtureManifest,
     entries: EntryStore,
 }
 
 impl FixtureTransport {
     pub async fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
-        FixtureManifest::load(&dir).await?;
+        let manifest = FixtureManifest::load(&dir).await?;
 
         let path = dir.join(ENTRIES_FILE);
         let entries = match tokio::fs::read_to_string(&path).await {
@@ -343,7 +356,30 @@ impl FixtureTransport {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => EntryStore::default(),
             Err(e) => return Err(RewindError::fixture_path(&path)(e)),
         };
-        Ok(Self { dir, entries })
+        Ok(Self {
+            dir,
+            manifest,
+            entries,
+        })
+    }
+
+    /// The transaction this fixture was recorded for.
+    pub fn tx_hash(&self) -> Result<TxHash> {
+        self.manifest.tx_hash()
+    }
+
+    /// The hash to replay from this fixture: the recorded one, which
+    /// `requested`, when given, has to be.
+    pub fn hash_for(&self, requested: Option<&TxHash>) -> Result<TxHash> {
+        let recorded = self.tx_hash()?;
+        match requested {
+            Some(requested) if *requested != recorded => Err(RewindError::FixtureHashMismatch {
+                dir: self.dir.clone(),
+                recorded,
+                requested: requested.clone(),
+            }),
+            _ => Ok(recorded),
+        }
     }
 
     fn ledger_entries(&self, params: &Value) -> Result<String> {
@@ -378,9 +414,18 @@ impl Transport for FixtureTransport {
             }
             let path = self.dir.join(response_file(method, params));
             log::trace!(target: "fixture", "← {method} {}", path.display());
-            tokio::fs::read_to_string(&path)
-                .await
-                .map_err(RewindError::fixture_path(&path))
+            match tokio::fs::read_to_string(&path).await {
+                Ok(text) => Ok(text),
+                // Responses are filed by their request: no file, no such call
+                // in the recording.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(RewindError::FixtureMissing {
+                        dir: self.dir.clone(),
+                        what: format!("{method} {params}"),
+                    })
+                }
+                Err(e) => Err(RewindError::fixture_path(&path)(e)),
+            }
         })
     }
 
@@ -870,7 +915,15 @@ mod tests {
     async fn fixture_reports_what_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let err = FixtureTransport::open(dir.path()).await.err().unwrap();
-        assert!(matches!(err, RewindError::FixtureIo { .. }), "{err}");
+        assert!(
+            err.to_string().contains("it is not a recorded fixture"),
+            "{err}"
+        );
+        let err = FixtureTransport::open(dir.path().join("typo"))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("no such directory"), "{err}");
 
         tokio::fs::write(
             dir.path().join(MANIFEST_FILE),
@@ -897,7 +950,18 @@ mod tests {
             "{err}"
         );
         let err = fixture.request("getHealth", &json!({})).await.unwrap_err();
-        assert!(matches!(err, RewindError::FixtureIo { .. }), "{err}");
+        assert!(matches!(err, RewindError::FixtureMissing { .. }), "{err}");
+        assert!(err.to_string().contains("no recorded answer for getHealth"));
+
+        // The fixture replays its own transaction, and no other.
+        assert_eq!(fixture.hash_for(None).unwrap(), hash());
+        assert_eq!(fixture.hash_for(Some(&hash())).unwrap(), hash());
+        let other: TxHash = "cd".repeat(32).parse().unwrap();
+        let err = fixture.hash_for(Some(&other)).unwrap_err();
+        assert!(
+            matches!(err, RewindError::FixtureHashMismatch { .. }),
+            "{err}"
+        );
     }
 
     #[tokio::test]

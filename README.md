@@ -134,13 +134,13 @@ the usual `2`, so a script can treat `2` strictly as "diverged".
 | Option | Description |
 |--------|-------------|
 | `-n, --network <NETWORK>` | `testnet` (default), `mainnet`, `futurenet`, or `local` (a quickstart or standalone node). Selects the default RPC. |
-| `--rpc-url <URL>` | Use this RPC instead of the network's default. |
+| `--rpc-url <URL>` | Use this RPC instead of the network's default. Must be an `http://` or `https://` URL; `SOROREWIND_RPC_URL` sets it from the environment. |
 | `--json` | Print a JSON document instead of the narrative. |
 | `--wasm-debug <PATH>` | For a contract error, read the contract's error names from a local WASM file instead of the ledger. |
 | `--color <auto\|always\|never>` | When to colour the narrative. `auto` (the default) colours a terminal, and honours a non-empty `NO_COLOR`, `CLICOLOR_FORCE` and `TERM=dumb`. `always` keeps colour in a pager: `sororewind … --color always \| less -R`. |
 | `--no-color` | Same as `--color never`. |
 | `-v, --verbose` | Repeat for more detail (`-v`, `-vv`). |
-| `--fixture <DIR>` | Replay from a recorded fixture directory, offline. The hash is optional, since the fixture records it. Cannot be combined with `--rpc-url`. |
+| `--fixture <DIR>` | Replay from a recorded fixture directory, offline. The hash is optional, since the fixture records it; a different hash is an error. Cannot be combined with `--rpc-url`. |
 
 The default RPCs are `https://soroban-testnet.stellar.org` (testnet),
 `https://mainnet.sorobanrpc.com` (mainnet, run by a third party),

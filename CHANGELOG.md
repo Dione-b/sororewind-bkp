@@ -77,6 +77,16 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 
 ### Fixed
 
+- `--fixture <dir> <hash>` with a hash the fixture was not recorded for says
+  so; a mistyped `--fixture` path is reported as a missing directory instead
+  of "recorded for a different transaction".
+- Writing to a closed pipe (`sororewind … | head -1`) no longer panics with
+  exit code 101.
+- `--rpc-url` must be an http(s) URL and `--wasm-debug` an existing file,
+  checked when the arguments are parsed; `--help` lists the default RPCs the
+  code uses.
+- A missing hash, an output failure and a short retention window ("about 0
+  days") have fitting messages.
 - A ledger outside the RPC's window is reported as such instead of as a raw
   RPC error.
 - A transaction status this build does not know no longer makes the whole
