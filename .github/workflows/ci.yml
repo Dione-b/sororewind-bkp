@@ -78,4 +78,5 @@ jobs:
       # Installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --test live -- --ignored --nocapture
+      # Optimised: the test times each replay, and the hosts interpret WASM.
+      - run: cargo test --release --locked --test live -- --ignored --nocapture

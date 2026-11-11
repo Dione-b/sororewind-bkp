@@ -1,7 +1,9 @@
 //! Live end-to-end test against the public testnet RPC.
 //!
 //! Ignored by default (`cargo test` stays offline and deterministic); CI runs
-//! it nightly with `cargo test --test live -- --ignored --nocapture`.
+//! it nightly with `cargo test --release --test live -- --ignored --nocapture`
+//! (`just live`). It runs optimised because it times each replay, and an
+//! unoptimised host interprets WASM several times slower.
 //!
 //! No hash is committed here: the RPC forgets transactions after about a
 //! week, so the test asks the network for its most recent failures instead.
@@ -22,8 +24,9 @@ use sororewind::{Network, Outcome, Request};
 /// How many recent failures of each category to replay.
 const PER_CATEGORY: usize = 3;
 
-/// The tool must answer in a few seconds; generous headroom for CI, but it
-/// still catches a pathological RPC round-trip.
+/// The tool must answer in a few seconds; generous headroom for CI and for a
+/// replay that fetches ledger metadata, but it still catches a pathological
+/// RPC round-trip. Meant for a release build.
 const TIME_BUDGET: Duration = Duration::from_secs(15);
 
 #[tokio::test]

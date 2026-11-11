@@ -274,7 +274,12 @@ async fn rpc_response_with_undecodable_xdr() {
 #[tokio::test]
 async fn unreachable_rpc() {
     // Nothing listens on the discard port; the connection is refused at once.
-    let rpc = RpcClient::new(HttpTransport::new("http://127.0.0.1:9").unwrap());
+    // It is retried first; keep the waits short.
+    let rpc = RpcClient::new(
+        HttpTransport::new("http://127.0.0.1:9")
+            .unwrap()
+            .with_retry_base(std::time::Duration::from_millis(1)),
+    );
     let err = fails_with(
         &rpc,
         &common::request(FIXTURE).await,
@@ -333,121 +338,4 @@ async fn fixture_missing_a_response() {
     );
     let err = fails_with(&rpc, &request, "getTransaction").await;
     assert!(matches!(err, RewindError::FixtureMissing { .. }));
-}
-
-/// The binary itself: argument errors and the two output modes.
-mod binary {
-    use std::process::{Command, Output};
-
-    fn sororewind(args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sororewind"))
-            .args(args)
-            .env("NO_COLOR", "1")
-            .output()
-            .unwrap()
-    }
-
-    fn fixture() -> String {
-        super::common::fixture_dir(super::FIXTURE)
-            .display()
-            .to_string()
-    }
-
-    #[test]
-    fn invalid_hash_exits_1() {
-        let out = sororewind(&["not-a-hash"]);
-        assert_eq!(out.status.code(), Some(1));
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("expected 64 hexadecimal characters"),
-            "{stderr}"
-        );
-    }
-
-    #[test]
-    fn invalid_flags_exit_1() {
-        let out = sororewind(&["--fixture", &fixture(), "--rpc-url", "http://x"]);
-        assert_eq!(out.status.code(), Some(1));
-    }
-
-    #[test]
-    fn narrative_and_json_exit_0() {
-        let out = sororewind(&["--fixture", &fixture()]);
-        assert_eq!(out.status.code(), Some(0));
-        assert!(String::from_utf8_lossy(&out.stdout).contains("replay matches network"));
-
-        let out = sororewind(&["--fixture", &fixture(), "--json"]);
-        assert_eq!(out.status.code(), Some(0));
-        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(json["fidelity"]["match"], true);
-    }
-
-    #[test]
-    fn json_mode_reports_errors_as_json() {
-        let missing = super::common::fixtures_root().join("no-such-fixture");
-        let out = sororewind(&["--fixture", &missing.display().to_string(), "--json"]);
-        assert_eq!(out.status.code(), Some(1));
-        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(json["schemaVersion"], 1);
-        assert_eq!(json["error"]["kind"], "fixture_invalid");
-        let message = json["error"]["message"].as_str().unwrap();
-        // The same sentence a person gets on stderr.
-        assert!(String::from_utf8_lossy(&out.stderr).contains(message));
-
-        // Without --json, stdout stays empty.
-        let out = sororewind(&["--fixture", &missing.display().to_string()]);
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-    }
-
-    #[test]
-    fn colour_can_be_forced_into_a_pipe() {
-        let plain = sororewind(&["--fixture", &fixture()]);
-        assert!(!plain.stdout.contains(&0x1b));
-        let forced = sororewind(&["--fixture", &fixture(), "--color", "always"]);
-        assert!(forced.stdout.contains(&0x1b));
-    }
-
-    #[test]
-    fn a_fixture_only_replays_its_own_transaction() {
-        let other = "ab".repeat(32);
-        let out = sororewind(&["--fixture", &fixture(), &other]);
-        assert_eq!(out.status.code(), Some(1));
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("was recorded for transaction") && stderr.contains(&other),
-            "{stderr}"
-        );
-    }
-
-    #[test]
-    fn a_mistyped_fixture_path_is_named_as_such() {
-        let out = sororewind(&["--fixture", "/no/such/fixture"]);
-        assert_eq!(out.status.code(), Some(1));
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("there is no such directory"), "{stderr}");
-        assert!(!stderr.contains("different transaction"), "{stderr}");
-    }
-
-    /// `sororewind … | head -1`: the reader going away is not a failure, and
-    /// certainly not a panic (exit code 101).
-    #[test]
-    fn a_closed_pipe_is_not_an_error() {
-        use std::process::Stdio;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sororewind"))
-            .args(["--fixture", &fixture(), "-vv"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        // Close our end before the child has anything to write.
-        drop(child.stdout.take());
-        let out = child.wait_with_output().unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 }

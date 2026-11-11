@@ -250,7 +250,7 @@ cargo test
 ```
 
 ```bash
-cargo test --test live -- --ignored --nocapture
+cargo test --release --test live -- --ignored --nocapture
 ```
 
 `cargo test` is fully offline: unit tests plus a snapshot of the narrative for
@@ -316,6 +316,7 @@ Each fixture comes from a `find_failed` category:
 |---------|-----------------|
 | `auth-error`, `budget-error`, `contract-error`, `storage-error` | A transaction of that category. For `budget-error`, pick one whose result is `resource limit exceeded`. |
 | `refundable-fee` | A `budget-error` whose result is `insufficient refundable fee`. |
+| `nested-contract-error` | A `contract-error` raised by a WASM contract (the report names it: `contract error #17 · Limit`) whose call tree spans several contracts and levels. |
 | `rebuilt-entry` | A failure of a contract that rewrites its entries every few ledgers (an oracle's `write_prices`, for example) whose replay reports `N rebuilt`. |
 | `auth-check-auth` | An `auth-error` whose call tree, from `sororewind <TX_HASH>`, shows a `__check_auth` call: a custom account contract rejected the signature. |
 | `mainnet-*` | A mainnet transaction, recorded with `--network mainnet`, that keeps the older embedded host covered while mainnet runs the previous protocol. |

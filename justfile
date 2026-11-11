@@ -35,7 +35,7 @@ snap:
 
 # The live test against testnet, as the nightly CI job runs it.
 live:
-    cargo test --locked --test live -- --ignored --nocapture
+    cargo test --release --locked --test live -- --ignored --nocapture
 
 # List recent failed testnet transactions, to pick fixture hashes from.
 find *args:
