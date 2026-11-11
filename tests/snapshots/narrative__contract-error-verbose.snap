@@ -1,0 +1,23 @@
+---
+source: tests/narrative.rs
+expression: "render::human(&report, false, Detail::Budget)"
+---
+sororewind  dd1f9b…53db  testnet
+ledger 5672381 · protocol 30 · 2026-11-11 08:25:48 UTC
+
+✓ replay matches network
+  on-chain  trapped
+  local     trapped
+
+where it broke
+  contract error #10
+  "resulting balance is not within the allowed range"
+  in CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer (depth 0)
+
+call tree
+CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer(GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000)  ✗
+
+budget 907,402 / 1,033,991 cpu instructions · 23.6 KB / 40.0 MB memory
+network used 907,402 cpu instructions · 23.6 KB memory
+footprint 4 entries · 1 drifted · 0 ttl-drifted · 1 missing · prng seed derived
+  drifted: account GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC

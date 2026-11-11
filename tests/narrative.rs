@@ -27,7 +27,7 @@ async fn check(name: &str, expected: Outcome) {
     assert_eq!(
         report.outcome(),
         expected,
-        "fixture {name}: wrong outcome; re-record it (see CONTRIBUTING.md)"
+        "fixture {name}: wrong outcome; re-record it (see the README, \"Fixtures\")"
     );
 
     // The JSON document agrees with the narrative.
@@ -133,4 +133,27 @@ fn fixtures_record_one_ledger() {
             assert!(ledgers[0].get("metadataXdr").is_none(), "{name}/{file}");
         }
     }
+}
+
+/// The other output modes, pinned for one fixture: `-v`, `-vv` and `--json`.
+#[tokio::test]
+async fn output_modes() {
+    let name = "contract-error";
+    let report = common::replay(name).await.unwrap();
+    insta::assert_snapshot!(
+        "contract-error-verbose",
+        render::human(&report, false, Detail::Budget)
+    );
+    insta::assert_snapshot!(
+        "contract-error-diagnostics",
+        render::human(&report, false, Detail::Diagnostics)
+    );
+    // `rpc` names the fixture directory, which depends on the checkout.
+    let mut json: serde_json::Value =
+        serde_json::from_str(&render::json(&report).unwrap()).unwrap();
+    json["rpc"] = "<fixture>".into();
+    insta::assert_snapshot!(
+        "contract-error-json",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
 }

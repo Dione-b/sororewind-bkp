@@ -267,6 +267,30 @@ A new fixture also needs a line in the `fixtures!` list in
 `tests/narrative.rs` and an accepted snapshot: run `cargo insta review`, after
 `cargo install cargo-insta`.
 
+Each fixture comes from a `find_failed` category:
+
+| Fixture | How to find one |
+|---------|-----------------|
+| `auth-error`, `budget-error`, `contract-error`, `storage-error` | A transaction of that category. For `budget-error`, pick one whose result is `resource limit exceeded`: `insufficient refundable fee` does not replay (see [Why a replay can diverge](#why-a-replay-can-diverge)). |
+| `auth-check-auth` | An `auth-error` whose call tree, from `sororewind <TX_HASH>`, shows a `__check_auth` call: a custom account contract rejected the signature. |
+
+Recorded fixtures keep working offline indefinitely. Re-record them when:
+
+- the Stellar protocol, and with it `soroban-env-host`, is bumped: a fixture
+  only replays on the protocol it was recorded on;
+- the fixture layout changes, which bumps `FIXTURE_VERSION` in
+  `src/transport.rs`, and old fixtures fail with "re-record it";
+- testnet is reset.
+
+In every case the old hashes are gone from the RPC, so record fresh
+transactions found with `find_failed` rather than running `record_fixture`
+without arguments.
+
+Error paths that no recording covers are tested by rewriting a fixture's RPC
+responses in memory (`common::Overlay`): see `tests/errors.rs` for every error
+a user can hit, and `tests/scenarios.rs` for fee-bumps, archived entries and
+network mismatches.
+
 ## License
 
 Apache-2.0

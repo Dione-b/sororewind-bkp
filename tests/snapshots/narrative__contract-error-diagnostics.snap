@@ -1,0 +1,51 @@
+---
+source: tests/narrative.rs
+expression: "render::human(&report, false, Detail::Diagnostics)"
+---
+sororewind  dd1f9b…53db  testnet
+ledger 5672381 · protocol 30 · 2026-11-11 08:25:48 UTC
+
+✓ replay matches network
+  on-chain  trapped
+  local     trapped
+
+where it broke
+  contract error #10
+  "resulting balance is not within the allowed range"
+  in CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer (depth 0)
+
+call tree
+CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer(GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000)  ✗
+
+budget 907,402 / 1,033,991 cpu instructions · 23.6 KB / 40.0 MB memory
+network used 907,402 cpu instructions · 23.6 KB memory
+footprint 4 entries · 1 drifted · 0 ttl-drifted · 1 missing · prng seed derived
+  drifted: account GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC
+
+on-chain diagnostics
+  fail [-] fn_call, 0xd7928b72c2703ccf…(32 bytes), transfer [GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000]
+  fail [CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC] error, contract error #10 ["resulting balance is not within the allowed range", 10000000, -15000000100, 9223372036854775807]
+  fail [-] host_fn_failed, contract error #10 void
+  fail [-] core_metrics, read_entry 4
+  fail [-] core_metrics, write_entry 0
+  fail [-] core_metrics, ledger_read_byte 236
+  fail [-] core_metrics, ledger_write_byte 0
+  fail [-] core_metrics, read_key_byte 80
+  fail [-] core_metrics, write_key_byte 0
+  fail [-] core_metrics, read_data_byte 236
+  fail [-] core_metrics, write_data_byte 0
+  fail [-] core_metrics, read_code_byte 0
+  fail [-] core_metrics, write_code_byte 0
+  fail [-] core_metrics, emit_event 0
+  fail [-] core_metrics, emit_event_byte 0
+  fail [-] core_metrics, cpu_insn 907402
+  fail [-] core_metrics, mem_byte 24184
+  fail [-] core_metrics, invoke_time_nsecs 358838
+  fail [-] core_metrics, max_rw_key_byte 40
+  fail [-] core_metrics, max_rw_data_byte 144
+  fail [-] core_metrics, max_rw_code_byte 0
+  fail [-] core_metrics, max_emit_event_byte 0
+
+local diagnostics
+  fail [-] fn_call, 0xd7928b72c2703ccf…(32 bytes), transfer [GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000]
+  fail [CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC] error, contract error #10 ["resulting balance is not within the allowed range", 10000000, -15000000100, 9223372036854775807]
