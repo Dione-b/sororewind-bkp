@@ -1,47 +1,57 @@
-//! fetch: pull the raw materials for a replay out of a Soroban RPC.
+//! fetch: the typed Soroban RPC client.
 //!
-//! Everything here is deliberately dumb: no decoding, no interpretation. The
-//! stage's only job is to turn JSON into typed records that `decode` can work
-//! on, and to turn RPC-level failures into messages a human can act on.
-//!
-//! Two extra jobs, both about reproducibility: every response can be written to
-//! a directory with `--record`, and later read back with `--fixture` so the
-//! exact same replay runs offline. Recorded fixtures expire with the RPC's own
-//! retention window, which is why the recording script exists.
+//! Everything here is deliberately dumb: no XDR decoding, no interpretation.
+//! The client turns method calls into JSON-RPC requests, unwraps the JSON-RPC
+//! envelope, and turns RPC-level failures into messages a human can act on.
+//! Where the bytes come from — a live endpoint or a recorded fixture — is the
+//! [`Transport`]'s business, not this module's.
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::collections::HashMap;
 
-use base64::Engine;
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use futures_util::future::try_join_all;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
-use crate::cli::Network;
 use crate::error::{Result, RewindError};
+use crate::hash::TxHash;
+use crate::transport::{truncate, Transport};
 
-const B64: base64::engine::general_purpose::GeneralPurpose =
-    base64::engine::general_purpose::STANDARD;
+/// The most ledger keys one `getLedgerEntries` call accepts.
+///
+/// <https://developers.stellar.org/docs/data/apis/rpc/api-reference/methods/getLedgerEntries>
+pub const MAX_KEYS_PER_CALL: usize = 200;
 
-/// The subset of `getTransaction` we care about.
+/// The most transactions one `getTransactions` page returns.
+pub const MAX_TRANSACTIONS_PER_PAGE: u32 = 200;
+
+/// `getTransaction`'s verdict on a hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TxStatus {
+    Success,
+    Failed,
+    NotFound,
+}
+
+/// The subset of a `getTransaction` / `getTransactions` record we care about.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawTransaction {
-    pub status: String,
+    pub status: TxStatus,
+    #[serde(default)]
+    pub tx_hash: Option<String>,
     #[serde(default)]
     pub ledger: Option<u32>,
+    /// One-based position of the transaction in the ledger's apply order.
+    #[serde(default)]
+    pub application_order: Option<u32>,
     #[serde(default)]
     pub envelope_xdr: Option<String>,
     #[serde(default)]
     pub result_xdr: Option<String>,
     #[serde(default)]
     pub result_meta_xdr: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetTransactionResponse {
-    #[serde(flatten)]
-    pub tx: RawTransaction,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,13 +67,14 @@ pub struct RawLedgerEntry {
     pub live_until_ledger_seq: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetLedgerEntriesResponse {
+#[derive(Debug, Deserialize)]
+struct GetLedgerEntriesResponse {
     #[serde(default)]
-    pub entries: Vec<RawLedgerEntry>,
+    entries: Vec<RawLedgerEntry>,
 }
 
+/// One ledger from `getLedgers`. Only the header is kept; the response's
+/// `metadataXdr` (the full `LedgerCloseMeta`) is skipped by the deserializer.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawLedger {
@@ -72,11 +83,19 @@ pub struct RawLedger {
     pub header_xdr: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GetLedgersResponse {
+    #[serde(default)]
+    ledgers: Vec<RawLedger>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GetLedgersResponse {
+pub struct TransactionsPage {
     #[serde(default)]
-    pub ledgers: Vec<RawLedger>,
+    pub transactions: Vec<RawTransaction>,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,9 +104,11 @@ pub struct NetworkInfo {
     pub passphrase: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Health {
+    #[serde(default)]
+    pub latest_ledger: u32,
     #[serde(default)]
     pub oldest_ledger: u32,
     #[serde(default)]
@@ -107,168 +128,44 @@ struct RpcErrorBody {
     #[serde(default)]
     message: Option<String>,
     #[serde(default)]
-    data: Option<serde_json::Value>,
-}
-
-/// Where responses come from: the live network, or a recorded directory.
-#[derive(Debug)]
-enum Source {
-    Http { url: String, http: reqwest::Client },
-    Fixture { dir: PathBuf },
+    data: Option<Value>,
 }
 
 pub struct RpcClient {
-    network: Network,
-    verbose: u8,
-    source: Source,
-    /// When set, every live response is also written here.
-    record: Option<PathBuf>,
+    transport: Box<dyn Transport>,
 }
 
 impl RpcClient {
-    pub fn new(
-        network: Network,
-        url: Option<String>,
-        verbose: u8,
-        fixture: Option<PathBuf>,
-        record: Option<PathBuf>,
-    ) -> Self {
-        let source = match fixture {
-            Some(dir) => Source::Fixture { dir },
-            None => Source::Http {
-                url: url.unwrap_or_else(|| network.default_rpc_url().to_string()),
-                http: reqwest::Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .user_agent(concat!("sororewind/", env!("CARGO_PKG_VERSION")))
-                    .build()
-                    .expect("reqwest client builder cannot fail with these settings"),
-            },
-        };
+    pub fn new(transport: impl Transport + 'static) -> Self {
         Self {
-            network,
-            verbose,
-            source,
-            record,
+            transport: Box::new(transport),
         }
     }
 
-    pub fn url(&self) -> String {
-        match &self.source {
-            Source::Http { url, .. } => url.clone(),
-            Source::Fixture { dir } => format!("fixture:{}", dir.display()),
-        }
+    /// Where responses come from: the endpoint URL, or `fixture:<dir>`.
+    pub fn origin(&self) -> String {
+        self.transport.origin()
     }
 
-    /// File name a response is stored under. Stable across runs so a recorded
-    /// directory can be replayed byte-for-byte.
-    fn cache_file(dir: &Path, method: &str, key: &str) -> PathBuf {
-        dir.join(format!("{method}-{key}.json"))
-    }
-
-    fn cache_key(method: &str, params: &serde_json::Value) -> String {
-        match method {
-            "getTransaction" => params["hash"].as_str().unwrap_or("unknown").to_string(),
-            "getLedgers" => params["startLedger"].to_string(),
-            "getNetwork" => "network".to_string(),
-            "getHealth" => "health".to_string(),
-            "getLedgerEntries" => {
-                let joined = params["keys"]
-                    .as_array()
-                    .map(|keys| {
-                        keys.iter()
-                            .filter_map(|k| k.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-                hex::encode(&Sha256::digest(joined.as_bytes())[..8])
-            }
-            other => hex::encode(&Sha256::digest(other.as_bytes())[..8]),
-        }
-    }
-
-    async fn call<T: for<'de> Deserialize<'de>>(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<T> {
-        let key = Self::cache_key(method, &params);
-
-        let text = match &self.source {
-            Source::Fixture { dir } => {
-                let path = Self::cache_file(dir, method, &key);
-                if self.verbose > 1 {
-                    eprintln!("[fixture] ← {method} {}", path.display());
-                }
-                std::fs::read_to_string(&path).map_err(|e| {
-                    RewindError::State(format!(
-                    "the fixture at {} could not be read ({e}); it was recorded for a different \
-                     transaction or the directory is incomplete",
-                    path.display()
-                ))
-                })?
-            }
-            Source::Http { url, http } => {
-                let body = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params,
-                });
-                if self.verbose > 1 {
-                    eprintln!("[rpc] → {method} {}", body["params"]);
-                }
-
-                let response = http.post(url).json(&body).send().await.map_err(|e| {
-                    RewindError::RpcUnreachable {
-                        network: self.network.name().to_string(),
-                        url: url.clone(),
-                        detail: describe_reqwest(&e),
-                    }
-                })?;
-
-                let status = response.status();
-                let text = response
-                    .text()
-                    .await
-                    .map_err(|e| RewindError::RpcUnreachable {
-                        network: self.network.name().to_string(),
-                        url: url.clone(),
-                        detail: format!("reading response body: {e}"),
-                    })?;
-
-                if !status.is_success() {
-                    return Err(RewindError::Rpc {
-                        network: self.network.name().to_string(),
-                        method: method.to_string(),
-                        detail: format!("HTTP {status}: {}", truncate(&text, 300)),
-                    });
-                }
-
-                if self.verbose > 1 {
-                    eprintln!("[rpc] ← {method} {}", truncate(&text, 400));
-                }
-
-                if let Some(dir) = &self.record {
-                    let path = Self::cache_file(dir, method, &key);
-                    if let Err(e) = write_response(&path, &text) {
-                        if self.verbose > 0 {
-                            eprintln!("[record] could not write {}: {e}", path.display());
-                        }
-                    }
-                }
-
-                text
-            }
-        };
-
-        let parsed: RpcEnvelope<T> = serde_json::from_str(&text).map_err(|e| RewindError::Rpc {
-            network: self.network.name().to_string(),
+    fn error(&self, method: &str, detail: String) -> RewindError {
+        RewindError::Rpc {
+            origin: self.origin(),
             method: method.to_string(),
-            detail: format!(
-                "unparseable response: {e}; body was {}",
-                truncate(&text, 300)
-            ),
+            detail,
+        }
+    }
+
+    async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        let text = self.transport.request(method, &params).await?;
+
+        let parsed: RpcEnvelope<T> = serde_json::from_str(&text).map_err(|e| {
+            self.error(
+                method,
+                format!(
+                    "unparseable response: {e}; body was {}",
+                    truncate(&text, 300)
+                ),
+            )
         })?;
 
         if let Some(err) = parsed.error {
@@ -276,140 +173,237 @@ impl RpcClient {
                 (Some(m), Some(d)) => format!("{m} ({d})"),
                 (Some(m), None) => m,
                 (None, Some(d)) => d.to_string(),
-                (None, None) => format!("error code {:?}", err.code),
+                (None, None) => match err.code {
+                    Some(code) => format!("error code {code}"),
+                    None => "an error with no code or message".to_string(),
+                },
             };
-            return Err(RewindError::Rpc {
-                network: self.network.name().to_string(),
-                method: method.to_string(),
-                detail,
-            });
+            return Err(self.error(method, detail));
         }
 
-        parsed.result.ok_or_else(|| RewindError::Rpc {
-            network: self.network.name().to_string(),
-            method: method.to_string(),
-            detail: "response had neither `result` nor `error`".to_string(),
+        parsed.result.ok_or_else(|| {
+            self.error(
+                method,
+                "response had neither `result` nor `error`".to_string(),
+            )
         })
     }
 
     pub async fn health(&self) -> Result<Health> {
-        self.call("getHealth", serde_json::json!({})).await
+        self.call("getHealth", json!({})).await
     }
 
-    pub async fn network_info(&self) -> Result<NetworkInfo> {
-        self.call("getNetwork", serde_json::json!({})).await
+    pub async fn network(&self) -> Result<NetworkInfo> {
+        self.call("getNetwork", json!({})).await
     }
 
-    pub async fn get_transaction(&self, hash: &str) -> Result<GetTransactionResponse> {
-        self.call("getTransaction", serde_json::json!({ "hash": hash }))
+    pub async fn get_transaction(&self, hash: &TxHash) -> Result<RawTransaction> {
+        self.call("getTransaction", json!({ "hash": hash.as_str() }))
             .await
     }
 
-    pub async fn get_ledgers(&self, start: u32, limit: u32) -> Result<GetLedgersResponse> {
-        self.call(
-            "getLedgers",
-            serde_json::json!({ "startLedger": start, "limit": limit }),
-        )
-        .await
+    /// Fetch exactly one ledger; `None` when the RPC no longer has it.
+    pub async fn get_ledger(&self, sequence: u32) -> Result<Option<RawLedger>> {
+        // The limit lives under `pagination`; at the top level it is ignored
+        // and the RPC falls back to 50 ledgers (~14 MB of metadata).
+        let response: GetLedgersResponse = self
+            .call(
+                "getLedgers",
+                json!({ "startLedger": sequence, "pagination": { "limit": 1 } }),
+            )
+            .await?;
+        Ok(response
+            .ledgers
+            .into_iter()
+            .find(|ledger| ledger.sequence == sequence))
+    }
+
+    /// One page of transactions, oldest first. Start with `start_ledger`, then
+    /// pass the previous page's cursor.
+    pub async fn get_transactions(
+        &self,
+        start_ledger: u32,
+        cursor: Option<&str>,
+    ) -> Result<TransactionsPage> {
+        let params = match cursor {
+            Some(cursor) => json!({
+                "pagination": { "cursor": cursor, "limit": MAX_TRANSACTIONS_PER_PAGE }
+            }),
+            None => json!({
+                "startLedger": start_ledger,
+                "pagination": { "limit": MAX_TRANSACTIONS_PER_PAGE }
+            }),
+        };
+        self.call("getTransactions", params).await
     }
 
     /// Fetch ledger entries by their base64-encoded `LedgerKey` XDR.
     ///
-    /// The RPC caps the number of keys per call, so this pages automatically and
-    /// preserves the caller's ordering (the replay needs footprint order).
-    pub async fn get_ledger_entries(&self, keys_b64: &[String]) -> Result<Vec<RawLedgerEntry>> {
-        const MAX_KEYS: usize = 50;
-
-        let mut out = Vec::with_capacity(keys_b64.len());
-        for chunk in keys_b64.chunks(MAX_KEYS) {
-            let resp: GetLedgerEntriesResponse = self
+    /// Returns one item per requested key, in request order, `None` where the
+    /// RPC has no entry. The RPC caps the keys per call and answers in an
+    /// unspecified order, so this chunks, fetches the chunks concurrently and
+    /// puts everything back where the caller asked for it.
+    pub async fn get_ledger_entries(&self, keys: &[String]) -> Result<Vec<Option<RawLedgerEntry>>> {
+        let chunks = keys.chunks(MAX_KEYS_PER_CALL).map(|chunk| async move {
+            let response: GetLedgerEntriesResponse = self
                 .call(
                     "getLedgerEntries",
-                    serde_json::json!({ "keys": chunk, "xdrFormat": "base64" }),
+                    json!({ "keys": chunk, "xdrFormat": "base64" }),
                 )
                 .await?;
-            out.extend(resp.entries);
-        }
-        Ok(out)
+            Ok::<_, RewindError>(response.entries)
+        });
+        let returned = try_join_all(chunks).await?.into_iter().flatten().collect();
+        Ok(order_entries(keys, returned))
     }
 }
 
-fn write_response(path: &Path, text: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, text)
-}
-
-/// `getLedgerEntries` returns entries in an unspecified order relative to the
-/// request, so re-order by looking each requested key up in the response.
-pub fn order_entries(
+/// Line the returned entries up with the keys that were asked for.
+fn order_entries(
     requested: &[String],
     returned: Vec<RawLedgerEntry>,
 ) -> Vec<Option<RawLedgerEntry>> {
-    use std::collections::HashMap;
-    let mut by_key: HashMap<String, RawLedgerEntry> = HashMap::new();
-    for e in returned {
-        by_key.insert(e.key.clone(), e);
-    }
-    requested.iter().map(|k| by_key.remove(k)).collect()
-}
+    let positions: HashMap<&str, usize> = requested
+        .iter()
+        .enumerate()
+        .rev() // so the first occurrence of a repeated key wins
+        .map(|(i, key)| (key.as_str(), i))
+        .collect();
 
-pub fn b64_decode(s: &str, what: &str) -> Result<Vec<u8>> {
-    B64.decode(s.trim())
-        .map_err(|e| RewindError::Decode(format!("invalid base64 in {what}: {e}")))
-}
-
-/// `getLedgerEntries` hands back an entry as separate pieces — the body in
-/// `xdr` (a `LedgerEntryData`), the extension in `extXdr`, and the bookkeeping
-/// fields alongside. Reassemble them into the `LedgerEntry` the host wants.
-pub fn assemble_entry(raw: &RawLedgerEntry) -> Result<stellar_xdr::LedgerEntry> {
-    use stellar_xdr::{LedgerEntry, LedgerEntryData, LedgerEntryExt, Limits, ReadXdr};
-
-    let body = b64_decode(&raw.xdr, "ledger entry body")?;
-    let data = LedgerEntryData::from_xdr(&body, Limits::none())
-        .map_err(|e| RewindError::State(format!("decoding ledger entry body: {e}")))?;
-
-    // Older recordings and simpler nodes may omit the field; `LedgerEntryExt`
-    // default is `V0`, which is what an absent extension means.
-    let ext = match raw.ext_xdr.as_deref() {
-        Some(text) if !text.is_empty() => {
-            let bytes = b64_decode(text, "ledger entry ext")?;
-            LedgerEntryExt::from_xdr(&bytes, Limits::none())
-                .map_err(|e| RewindError::State(format!("decoding ledger entry ext: {e}")))?
+    let mut ordered: Vec<Option<RawLedgerEntry>> = requested.iter().map(|_| None).collect();
+    for entry in returned {
+        if let Some(&i) = positions.get(entry.key.as_str()) {
+            ordered[i] = Some(entry);
         }
-        _ => LedgerEntryExt::V0,
-    };
-
-    Ok(LedgerEntry {
-        last_modified_ledger_seq: raw.last_modified_ledger_seq.unwrap_or(0),
-        data,
-        ext,
-    })
-}
-
-pub fn b64_encode(bytes: &[u8]) -> String {
-    B64.encode(bytes)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &s[..end])
     }
+    ordered
 }
 
-fn describe_reqwest(e: &reqwest::Error) -> String {
-    if e.is_timeout() {
-        "timed out after 30s".to_string()
-    } else if e.is_connect() {
-        format!("connection failed: {e}")
-    } else {
-        e.to_string()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::MemoryTransport;
+
+    fn entry(key: &str) -> RawLedgerEntry {
+        RawLedgerEntry {
+            key: key.to_string(),
+            xdr: format!("body-of-{key}"),
+            ext_xdr: None,
+            last_modified_ledger_seq: None,
+            live_until_ledger_seq: None,
+        }
+    }
+
+    fn keys(names: &[&str]) -> Vec<String> {
+        names.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn orders_entries_by_request() {
+        let ordered = order_entries(
+            &keys(&["a", "b", "c"]),
+            vec![entry("c"), entry("a"), entry("unrequested")],
+        );
+        let got: Vec<Option<&str>> = ordered
+            .iter()
+            .map(|e| e.as_ref().map(|e| e.key.as_str()))
+            .collect();
+        assert_eq!(got, [Some("a"), None, Some("c")]);
+        assert!(order_entries(&[], vec![entry("x")]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_calls_go_through_the_transport() {
+        let transport = MemoryTransport::new()
+            .on("getNetwork", &json!({"result": {"passphrase": "Test SDF Network ; September 2015"}}))
+            .on("getTransaction", &json!({"result": {"status": "NOT_FOUND"}}))
+            .on("getLedgers", &json!({"result": {"ledgers": [
+                {"sequence": 7, "ledgerCloseTime": "100", "headerXdr": "AAAA", "metadataXdr": "ignored"}
+            ]}}));
+        let calls = transport.calls();
+        let rpc = RpcClient::new(transport);
+
+        assert_eq!(
+            rpc.network().await.unwrap().passphrase,
+            "Test SDF Network ; September 2015"
+        );
+        let hash: TxHash = "cd".repeat(32).parse().unwrap();
+        assert_eq!(
+            rpc.get_transaction(&hash).await.unwrap().status,
+            TxStatus::NotFound
+        );
+        assert_eq!(
+            rpc.get_ledger(7).await.unwrap().unwrap().ledger_close_time,
+            "100"
+        );
+        assert!(rpc.get_ledger(8).await.unwrap().is_none());
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[1].1, json!({"hash": hash.as_str()}));
+        assert_eq!(
+            calls[2].1,
+            json!({"startLedger": 7, "pagination": {"limit": 1}}),
+            "exactly one ledger must be requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_entries_are_chunked_and_reassembled() {
+        let wanted: Vec<String> = (0..MAX_KEYS_PER_CALL + 5)
+            .map(|i| format!("k{i}"))
+            .collect();
+        let transport = MemoryTransport::new().on_fn("getLedgerEntries", |params| {
+            // Answer each chunk in reverse, dropping one key, like a real RPC might.
+            let entries: Vec<Value> = params["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter(|k| k.as_str() != Some("k3"))
+                .map(|k| json!({"key": k, "xdr": "AAAA"}))
+                .collect();
+            json!({"result": {"entries": entries}})
+        });
+        let calls = transport.calls();
+        let rpc = RpcClient::new(transport);
+
+        let entries = rpc.get_ledger_entries(&wanted).await.unwrap();
+        assert_eq!(entries.len(), wanted.len());
+        for (i, (key, entry)) in wanted.iter().zip(&entries).enumerate() {
+            match entry {
+                Some(entry) => assert_eq!(&entry.key, key),
+                None => assert_eq!(i, 3),
+            }
+        }
+        let sizes: Vec<usize> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, params)| params["keys"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(sizes, [MAX_KEYS_PER_CALL, 5]);
+    }
+
+    #[tokio::test]
+    async fn rpc_errors_are_worded_for_people() {
+        let rpc = RpcClient::new(
+            MemoryTransport::new()
+                .on("getHealth", &json!({"error": {"code": -32601, "message": "method not found", "data": "getHealth"}}))
+                .on("getNetwork", &json!({"jsonrpc": "2.0"}))
+                .on_text("getTransaction", "<html>502</html>"),
+        );
+        let err = rpc.health().await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "the RPC (memory) returned an error for getHealth: method not found (\"getHealth\")"
+        );
+        let err = rpc.network().await.unwrap_err().to_string();
+        assert!(err.contains("neither `result` nor `error`"), "{err}");
+        let hash: TxHash = "cd".repeat(32).parse().unwrap();
+        let err = rpc.get_transaction(&hash).await.unwrap_err().to_string();
+        assert!(
+            err.contains("unparseable response") && err.contains("<html>502</html>"),
+            "{err}"
+        );
     }
 }

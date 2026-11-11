@@ -1,117 +1,136 @@
 //! Snapshot tests over the recorded fixtures.
 //!
 //! Every directory under `fixtures/` is a complete offline RPC recording of
-//! one failed testnet transaction: `hash.txt` names the transaction, the rest
-//! of the files are raw JSON-RPC responses. These tests drive the real binary
-//! (`--fixture`, `--no-color`) so what is snapshotted is exactly what a user
-//! sees, and they never touch the network — the whole point of recording.
+//! one failed testnet transaction (see `src/transport.rs` for the layout).
+//! Each fixture gets its own test, replayed once, in-process, through the
+//! same pipeline the binary runs; the test pins the narrative, the exit code
+//! and the JSON document together. Nothing here touches the network.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
+mod common;
 
-const FIXTURE_TIME_BUDGET: Duration = Duration::from_secs(5);
+use sororewind::render::{self, Detail};
+use sororewind::Outcome;
 
-/// Every fixture directory, sorted so snapshot names are stable.
-fn fixtures() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", root.display()))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.join("hash.txt").exists())
-        .collect();
-    dirs.sort();
-    assert!(
-        !dirs.is_empty(),
-        "no fixtures found under {} — run scripts/record-fixtures.sh",
-        root.display()
+async fn check(name: &str, expected: Outcome) {
+    let result = common::replay(name).await;
+    let report = result
+        .as_ref()
+        .unwrap_or_else(|err| panic!("fixture {name} could not be replayed: {err}"));
+
+    // The narrative, exactly as a user sees it.
+    let human = render::human(report, false, Detail::Summary);
+    insta::assert_snapshot!(name, common::transcript(&result, &human));
+
+    // The tool's core trust criterion: a fixture recorded as a match must
+    // keep matching, and a fixture kept as a divergence must keep diverging.
+    assert_eq!(
+        report.outcome(),
+        expected,
+        "fixture {name}: wrong outcome; re-record it (see CONTRIBUTING.md)"
     );
-    dirs
+
+    // The JSON document agrees with the narrative.
+    let json: serde_json::Value = serde_json::from_str(&render::json(report).unwrap()).unwrap();
+    assert_eq!(json["schemaVersion"], 1, "{name}");
+    assert_eq!(
+        json["hash"],
+        common::fixture_hash(name).await.as_str(),
+        "{name}"
+    );
+    assert_eq!(
+        json["fidelity"]["match"],
+        expected == Outcome::Matched,
+        "{name}"
+    );
+    assert_eq!(json["network"], "testnet", "{name}");
+    assert_eq!(json["status"], "FAILED", "{name}");
+    assert_eq!(
+        json["result"]["onchain"]["code"] == json["result"]["local"]["code"],
+        json["fidelity"]["divergence"] != "result",
+        "{name}"
+    );
+    assert_eq!(
+        json["calls"].as_array().unwrap().len(),
+        report.story.calls.len(),
+        "{name}"
+    );
+
+    // CPU instructions are not compared: stellar-core's `core_metrics` count
+    // work outside the host invocation (module cache, VM setup), so a
+    // faithful replay can still report a different figure.
 }
 
-fn hash_of(fixture: &Path) -> String {
-    std::fs::read_to_string(fixture.join("hash.txt"))
-        .expect("hash.txt unreadable")
-        .trim()
-        .to_string()
+/// One test per fixture, so one stale snapshot does not hide the others.
+macro_rules! fixtures {
+    ($($test:ident: $name:literal => $outcome:ident,)*) => {
+        $(
+            #[tokio::test]
+            async fn $test() {
+                check($name, Outcome::$outcome).await;
+            }
+        )*
+
+        const FIXTURES: &[&str] = &[$($name),*];
+    };
 }
 
-/// Run the binary against a fixture and return `(exit_code, stdout, stderr)`.
-fn run(fixture: &Path, extra: &[&str]) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_sororewind"))
-        .arg(hash_of(fixture))
-        .args(["--fixture", fixture.to_str().unwrap(), "--no-color"])
-        .args(extra)
-        .output()
-        .expect("failed to spawn sororewind");
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
+fixtures! {
+    auth_check_auth: "auth-check-auth" => Matched,
+    auth_error: "auth-error" => Matched,
+    budget_error: "budget-error" => Matched,
+    contract_error: "contract-error" => Matched,
+    storage_error: "storage-error" => Matched,
 }
 
-/// Human narrative, with the fixture directory redacted so snapshots do not
-/// depend on where the repo lives.
-fn human_report(fixture: &Path) -> String {
-    let (code, stdout, stderr) = run(fixture, &[]);
-    let dir = fixture.to_str().unwrap().to_string();
-    let text = format!("--- exit code: {code}\n{stdout}{stderr}");
-    text.replace(&dir, "<fixture>")
-}
-
+/// A fixture directory without a test is a recording nobody checks.
 #[test]
-fn narratives() {
-    for fixture in fixtures() {
-        let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
-        insta::assert_snapshot!(name, human_report(&fixture));
+fn every_fixture_has_a_test() {
+    let mut on_disk: Vec<String> = std::fs::read_dir(common::fixtures_root())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort();
+    let mut listed: Vec<String> = FIXTURES.iter().map(|name| name.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        on_disk, listed,
+        "fixtures/ and the `fixtures!` list disagree"
+    );
+}
+
+/// Fixtures are committed; keep them small.
+#[test]
+fn fixtures_stay_small() {
+    let mut total = 0;
+    for name in FIXTURES {
+        total += std::fs::read_dir(common::fixture_dir(name))
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.metadata().ok())
+            .map(|meta| meta.len())
+            .sum::<u64>();
     }
+    assert!(total < 1_000_000, "fixtures/ is {total} bytes");
 }
 
-/// Every recorded fixture must still replay-match the network's recorded
-/// result. This is the tool's core trust criterion; a fixture that drifts is
-/// a fixture that must be re-recorded or dropped.
+/// sororewind reads one ledger header; a recording holding more ledgers, or
+/// their `metadataXdr`, means the `getLedgers` request lost its limit.
 #[test]
-fn every_fixture_replays_clean() {
-    for fixture in fixtures() {
-        let started = Instant::now();
-        let (code, _, _) = run(&fixture, &[]);
-        let elapsed = started.elapsed();
-        let name = fixture.file_name().unwrap().to_string_lossy();
-        assert_eq!(
-            code,
-            0,
-            "fixture {} diverged from its recorded on-chain result \
-             (exit {code}; re-record with scripts/record-fixtures.sh)",
-            fixture.display()
-        );
-        assert!(
-            elapsed < FIXTURE_TIME_BUDGET,
-            "fixture {name} took {elapsed:?}; expected under {FIXTURE_TIME_BUDGET:?}"
-        );
-    }
-}
-
-/// JSON output is stable machine-readable output: parse it, and check the
-/// fields a consumer would key on.
-#[test]
-fn json_output_parses_and_reports_fidelity() {
-    for fixture in fixtures() {
-        let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
-        let (code, stdout, stderr) = run(&fixture, &["--json"]);
-        assert_eq!(code, 0, "{name}: exit {code}: {stderr}");
-        let v: serde_json::Value =
-            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{name}: bad JSON: {e}"));
-        assert_eq!(v["fidelity"]["match"], true, "{name}: {stdout}");
-        assert!(v["hash"].as_str().is_some(), "{name}: no hash field");
-        assert!(
-            v["failure"]["name"].is_string() || v["failure"]["name"].is_null(),
-            "{name}: malformed failure.name"
-        );
-        assert!(
-            v["failure"]["nameOrigin"].is_string() || v["failure"]["nameOrigin"].is_null(),
-            "{name}: malformed failure.nameOrigin"
-        );
+fn fixtures_record_one_ledger() {
+    for name in FIXTURES {
+        for entry in std::fs::read_dir(common::fixture_dir(name)).unwrap() {
+            let path = entry.unwrap().path();
+            let file = path.file_name().unwrap().to_string_lossy();
+            if !file.starts_with("getLedgers") {
+                continue;
+            }
+            let body: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let ledgers = body["result"]["ledgers"].as_array().unwrap();
+            assert_eq!(ledgers.len(), 1, "{name}/{file}");
+            assert!(ledgers[0].get("metadataXdr").is_none(), "{name}/{file}");
+        }
     }
 }

@@ -1,111 +1,100 @@
-//! Compact, human-readable encodings of on-chain identifiers.
-//!
-//! The full 56-character strkey is unreadable inline, so the narrative shows
-//! `G…ABC` / `C…XYZ` and expands to the full value only where it matters.
+//! Strkey encodings of on-chain identifiers.
 //!
 //! `stellar-strkey` types expose an inherent `to_string` that returns a
 //! fixed-capacity `heapless::String`; going through `format!` instead picks up
 //! their `Display` impls and gives us an ordinary owned `String`.
 
 use stellar_strkey::{ed25519, ClaimableBalance, Contract, LiquidityPool};
-use stellar_xdr::ScAddress;
+use stellar_xdr::{AccountId, ClaimableBalanceId, ContractId, Hash, PublicKey, ScAddress};
 
 pub fn account(bytes: &[u8; 32]) -> String {
     format!("{}", ed25519::PublicKey(*bytes))
+}
+
+pub fn account_id(id: &AccountId) -> String {
+    match &id.0 {
+        PublicKey::PublicKeyTypeEd25519(key) => account(&key.0),
+    }
 }
 
 pub fn contract(bytes: &[u8; 32]) -> String {
     format!("{}", Contract(*bytes))
 }
 
-/// `G…XYZ` — enough to recognise an account without burning a line of width.
-pub fn short_account(bytes: &[u8; 32]) -> String {
-    shorten(&account(bytes), 4)
+pub fn claimable_balance(bytes: &[u8; 32]) -> String {
+    format!("{}", ClaimableBalance::V0(*bytes))
 }
 
-/// `C…XYZ`
-pub fn short_contract(bytes: &[u8; 32]) -> String {
-    shorten(&contract(bytes), 4)
+pub fn liquidity_pool(bytes: &[u8; 32]) -> String {
+    format!("{}", LiquidityPool(*bytes))
 }
 
-fn shorten(s: &str, tail: usize) -> String {
-    if s.len() <= tail + 2 {
-        return s.to_string();
+/// Parse a `C…` strkey back into a contract id.
+pub fn parse_contract(strkey: &str) -> Option<ContractId> {
+    let contract = Contract::from_string(strkey).ok()?;
+    Some(ContractId(Hash(contract.0)))
+}
+
+/// First character, an ellipsis, and the last `tail` characters: `C…XYZW`.
+/// Enough to recognise an identifier without burning a line of width.
+pub fn shorten(strkey: &str, tail: usize) -> String {
+    if strkey.len() <= tail + 2 {
+        return strkey.to_string();
     }
-    format!("{}…{}", &s[..1], &s[s.len() - tail..])
+    format!("{}…{}", &strkey[..1], &strkey[strkey.len() - tail..])
 }
 
 pub fn address(addr: &ScAddress) -> String {
     match addr {
-        ScAddress::Account(id) => account(&account_bytes(id)),
+        ScAddress::Account(id) => account_id(id),
         ScAddress::Contract(c) => contract(&c.0 .0),
         ScAddress::MuxedAccount(m) => account(&m.ed25519.0),
+        ScAddress::ClaimableBalance(ClaimableBalanceId::ClaimableBalanceIdTypeV0(h)) => {
+            claimable_balance(&h.0)
+        }
+        ScAddress::LiquidityPool(pool) => liquidity_pool(&pool.0 .0),
         ScAddress::MuxedContract(m) => contract(&m.contract_id.0 .0),
-        ScAddress::ClaimableBalance(id) => match id {
-            stellar_xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(h) => {
-                format!("{}", ClaimableBalance::V0(h.0))
-            }
-        },
-        ScAddress::LiquidityPool(pool) => format!("{}", LiquidityPool(pool.0 .0)),
     }
 }
 
 pub fn short_address(addr: &ScAddress) -> String {
-    match addr {
-        ScAddress::Account(id) => short_account(&account_bytes(id)),
-        ScAddress::Contract(c) => short_contract(&c.0 .0),
-        ScAddress::MuxedAccount(m) => short_account(&m.ed25519.0),
-        ScAddress::MuxedContract(m) => short_contract(&m.contract_id.0 .0),
-        other => address(other),
-    }
+    shorten(&address(addr), 4)
 }
 
-fn account_bytes(id: &stellar_xdr::AccountId) -> [u8; 32] {
-    match &id.0 {
-        stellar_xdr::PublicKey::PublicKeyTypeEd25519(k) => k.0,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// One-line label for a footprint key. Drifted entries are printed with these,
-/// so they have to be short enough to read in a list.
-pub fn ledger_key(key: &stellar_xdr::LedgerKey) -> String {
-    use stellar_xdr::LedgerKey;
-    match key {
-        LedgerKey::Account(k) => format!("account {}", account(&account_bytes(&k.account_id))),
-        LedgerKey::Trustline(k) => {
-            format!("trustline {}", account(&account_bytes(&k.account_id)))
-        }
-        LedgerKey::Offer(k) => format!(
-            "offer {} of {}",
-            k.offer_id,
-            account(&account_bytes(&k.seller_id))
-        ),
-        LedgerKey::Data(k) => format!(
-            "data {}/{}",
-            account(&account_bytes(&k.account_id)),
-            k.data_name.0
-        ),
-        LedgerKey::ClaimableBalance(k) => match &k.balance_id {
-            stellar_xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(h) => format!(
-                "claimable balance {}",
-                shorten(&format!("{}", ClaimableBalance::V0(h.0)), 8)
-            ),
-        },
-        LedgerKey::LiquidityPool(k) => format!(
-            "liquidity pool {}",
-            shorten(&format!("{}", LiquidityPool(k.liquidity_pool_id.0 .0)), 8)
-        ),
-        LedgerKey::ContractData(k) => format!(
-            "contract data {} ({})",
-            short_address(&k.contract),
-            k.durability
-        ),
-        LedgerKey::ContractCode(k) => format!("contract code {}", hex16(&k.hash.0)),
-        LedgerKey::ConfigSetting(k) => format!("config setting {}", k.config_setting_id),
-        LedgerKey::Ttl(k) => format!("ttl {}", hex16(&k.key_hash.0)),
+    #[test]
+    fn shortens_only_long_strings() {
+        assert_eq!(shorten("CABCDEFGHIJ", 4), "C…GHIJ");
+        assert_eq!(shorten("CABCDE", 4), "CABCDE");
+        assert_eq!(shorten("", 4), "");
     }
-}
 
-fn hex16(bytes: &[u8; 32]) -> String {
-    format!("{}…", hex::encode(&bytes[..8]))
+    #[test]
+    fn encodes_by_kind() {
+        assert!(account(&[0; 32]).starts_with('G'));
+        assert!(contract(&[0; 32]).starts_with('C'));
+        assert!(claimable_balance(&[0; 32]).starts_with('B'));
+        assert!(liquidity_pool(&[0; 32]).starts_with('L'));
+        assert_eq!(account(&[0; 32]).len(), 56);
+    }
+
+    #[test]
+    fn contract_strkeys_round_trip() {
+        let text = contract(&[9; 32]);
+        assert_eq!(parse_contract(&text), Some(ContractId(Hash([9; 32]))));
+        assert_eq!(parse_contract(&account(&[9; 32])), None);
+        assert_eq!(parse_contract("nonsense"), None);
+    }
+
+    #[test]
+    fn addresses_use_the_matching_strkey() {
+        let c = ScAddress::Contract(ContractId(Hash([4; 32])));
+        assert_eq!(address(&c), contract(&[4; 32]));
+        assert_eq!(short_address(&c), shorten(&contract(&[4; 32]), 4));
+        let a = ScAddress::Account(crate::test_support::account([5; 32]));
+        assert_eq!(address(&a), account(&[5; 32]));
+    }
 }

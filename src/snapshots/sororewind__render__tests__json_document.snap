@@ -1,0 +1,119 @@
+---
+source: src/render.rs
+expression: json(&sample_report()).unwrap()
+---
+{
+  "schemaVersion": 1,
+  "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "feeBump": true,
+  "network": "testnet",
+  "rpc": "https://rpc.example",
+  "ledger": 1000,
+  "protocol": 30,
+  "closeTime": 1700000000,
+  "status": "FAILED",
+  "fidelity": {
+    "match": true,
+    "divergence": null
+  },
+  "result": {
+    "onchain": {
+      "code": "trapped",
+      "resultHash": null
+    },
+    "local": {
+      "code": "trapped",
+      "resultHash": null
+    }
+  },
+  "failure": {
+    "errorType": "contract",
+    "errorCode": null,
+    "contractCode": 3,
+    "description": "contract error #3",
+    "name": "InsufficientBalance",
+    "nameOrigin": "spec enum Error",
+    "message": "balance too low",
+    "contract": "CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM",
+    "function": "inner",
+    "depth": 1,
+    "trail": [
+      "balance too low",
+      "escalating"
+    ]
+  },
+  "calls": [
+    {
+      "depth": 0,
+      "contract": "CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM",
+      "function": "outer",
+      "args": [
+        "1",
+        "\"two\""
+      ],
+      "returned": null,
+      "open": true,
+      "recovered": false,
+      "failure": false,
+      "logs": [
+        "starting"
+      ]
+    },
+    {
+      "depth": 1,
+      "contract": "CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM",
+      "function": "probe",
+      "args": [],
+      "returned": "void",
+      "open": false,
+      "recovered": true,
+      "failure": false,
+      "logs": []
+    },
+    {
+      "depth": 1,
+      "contract": "CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM",
+      "function": "inner",
+      "args": [],
+      "returned": null,
+      "open": true,
+      "recovered": false,
+      "failure": true,
+      "logs": [
+        "about to fail"
+      ]
+    }
+  ],
+  "budget": {
+    "cpuInsns": 1234567,
+    "cpuLimit": 2000000,
+    "memBytes": 1048576,
+    "memLimit": 41943040,
+    "networkCpuInsns": 1234567,
+    "networkMemBytes": 1048576
+  },
+  "footprint": {
+    "entries": 4,
+    "missing": 1,
+    "drifted": [
+      "account GAAA"
+    ],
+    "ttlDrifted": [
+      {
+        "entry": "contract data C…AAAA Balance (persistent)",
+        "reason": "extendedSince"
+      }
+    ],
+    "archived": [],
+    "configDrifted": []
+  },
+  "prngSeed": "derived",
+  "diagnostics": {
+    "onchain": [
+      "fail [-] error, contract error #3 \"balance too low\""
+    ],
+    "local": [
+      "fail [-] error, contract error #3 \"balance too low\""
+    ]
+  }
+}
