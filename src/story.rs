@@ -5,12 +5,15 @@
 //! on the failure path. `error` events carry the `ScError` itself, which is
 //! where the failure is actually named.
 
-use stellar_xdr::{DiagnosticEvent, ScError, ScErrorType, ScVal};
+use serde::Serialize;
+use stellar_xdr::{DiagnosticEvent, ScError, ScVal};
 
-use crate::tx::{scval_short, split_event};
+use crate::display::{self, event_parts, scval};
+use crate::strkey;
 
 /// One frame of the invocation, in the order it was entered.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Call {
     pub depth: usize,
     /// Full strkey of the contract that was called, when the host told us.
@@ -21,253 +24,571 @@ pub struct Call {
     pub returned: Option<String>,
     /// Still open when the replay ended: this frame is on the failure path.
     pub open: bool,
-    /// An inner frame failed and this one carried on — the signature of a
-    /// `try_call`.
+    /// An inner frame failed and its caller carried on — the signature of a
+    /// `try_call`. Set on the frame that failed.
     pub recovered: bool,
+    /// The frame the fatal error was raised in.
+    #[serde(rename = "failure")]
+    pub is_failure: bool,
     /// `log` diagnostics emitted inside this frame.
     pub logs: Vec<String>,
-    /// The frame the fatal error was raised in.
-    pub is_failure: bool,
 }
 
 /// Where and what the replay died on.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Failure {
-    pub sc_error: Option<ScError>,
+    #[serde(skip)]
+    pub error: ScError,
+    /// Error category: `contract`, `auth`, `storage`, …
+    pub error_type: &'static str,
+    /// Host-defined code such as `InvalidAction`; `null` for contract errors.
+    pub error_code: Option<&'static str>,
+    /// The contract's own error number; `null` for host errors.
+    pub contract_code: Option<u32>,
+    /// The error in one phrase, as the narrative prints it.
+    pub description: String,
+    /// Contract-declared name for `contract_code`, when its spec has one.
+    pub name: Option<String>,
+    /// Where `name` came from.
+    pub name_origin: Option<String>,
     /// The message the host attached to the error diagnostic.
     pub message: String,
-    /// Every `error` diagnostic, oldest first — the escalation trail, printed
-    /// under `-vv`.
-    pub trail: Vec<String>,
     pub contract: Option<String>,
     pub function: Option<String>,
     pub depth: usize,
+    /// Every `error` diagnostic, oldest first — the escalation trail.
+    pub trail: Vec<String>,
     /// Index into [`Story::calls`] of the frame that failed, if any.
+    #[serde(skip)]
     pub call_index: Option<usize>,
-}
-
-impl Failure {
-    pub fn contract_error_code(&self) -> Option<u32> {
-        match &self.sc_error {
-            Some(ScError::Contract(n)) => Some(*n),
-            _ => None,
-        }
-    }
-
-    pub fn error_type(&self) -> Option<ScErrorType> {
-        self.sc_error.as_ref().map(|e| match e {
-            ScError::Contract(_) => ScErrorType::Contract,
-            ScError::WasmVm(_) => ScErrorType::WasmVm,
-            ScError::Context(_) => ScErrorType::Context,
-            ScError::Storage(_) => ScErrorType::Storage,
-            ScError::Object(_) => ScErrorType::Object,
-            ScError::Crypto(_) => ScErrorType::Crypto,
-            ScError::Events(_) => ScErrorType::Events,
-            ScError::Budget(_) => ScErrorType::Budget,
-            ScError::Value(_) => ScErrorType::Value,
-            ScError::Auth(_) => ScErrorType::Auth,
-        })
-    }
 }
 
 /// An `error` diagnostic and the frame that was open when it fired.
 struct ErrorEvent {
-    sc_error: Option<ScError>,
+    error: Option<ScError>,
     message: String,
     open_frame: Option<usize>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Story {
-    pub calls: Vec<Call>,
     pub failure: Option<Failure>,
+    pub calls: Vec<Call>,
 }
 
 impl Story {
     /// Walk the diagnostics once, keeping a stack of open frames.
     ///
-    /// `host_error` is the `ScError` the replay itself ended with; it is what
+    /// `fatal` is the `ScError` the replay itself ended with; it is what
     /// identifies *which* `error` diagnostic is the fatal one, as opposed to an
     /// error a `try_call` caught and shrugged off.
-    pub fn build(events: &[DiagnosticEvent], host_error: Option<&ScError>) -> Story {
+    pub fn build(events: &[DiagnosticEvent], fatal: Option<&ScError>) -> Story {
         let mut calls: Vec<Call> = Vec::new();
         let mut stack: Vec<usize> = Vec::new();
         let mut errors: Vec<ErrorEvent> = Vec::new();
 
         for event in events {
-            let (topics, data) = split_event(&event.event);
+            let (topics, data) = event_parts(&event.event);
             let Some(kind) = topics.first().and_then(symbol) else {
                 continue;
             };
+            // The contract the event was emitted from: the caller for
+            // `fn_call`, the returning contract for `fn_return`.
+            let emitter = event
+                .event
+                .contract_id
+                .as_ref()
+                .map(|id| strkey::contract(&id.0 .0));
 
             match kind.as_str() {
                 "fn_call" => {
+                    abandon_frames_above_caller(&mut calls, &mut stack, emitter.as_deref());
                     let contract = topics
                         .get(1)
                         .and_then(bytes32)
-                        .map(|b| crate::strkey::contract(&b))
-                        .or_else(|| {
-                            event
-                                .event
-                                .contract_id
-                                .as_ref()
-                                .map(|c| crate::strkey::contract(&c.0 .0))
-                        });
-                    let function = topics.get(2).and_then(symbol).unwrap_or_default();
-                    let depth = stack.len();
+                        .map(|id| strkey::contract(&id))
+                        .or(emitter);
                     calls.push(Call {
-                        depth,
+                        depth: stack.len(),
                         contract,
-                        function,
-                        args: data_args(&data),
+                        function: topics.get(2).and_then(symbol).unwrap_or_default(),
+                        args: call_args(data),
                         returned: None,
                         open: true,
                         recovered: false,
-                        logs: Vec::new(),
                         is_failure: false,
+                        logs: Vec::new(),
                     });
                     stack.push(calls.len() - 1);
                 }
                 "fn_return" => {
-                    let value = scval_short(&data);
                     let function = topics.get(1).and_then(symbol);
-                    // Frames above the matching one never returned: an inner
-                    // call failed and this one recovered from it.
-                    let position = function
-                        .as_ref()
-                        .and_then(|f| stack.iter().rposition(|&i| calls[i].function == *f));
-                    match position {
-                        Some(pos) => {
-                            for &i in &stack[pos + 1..] {
-                                calls[i].open = false;
-                                calls[i].recovered = true;
-                            }
-                            if let Some(&top) = stack.last() {
-                                calls[top].returned = Some(value);
-                                calls[top].open = false;
-                            }
-                            stack.truncate(pos);
-                        }
-                        None => {
-                            if let Some(top) = stack.pop() {
-                                calls[top].returned = Some(value);
-                                calls[top].open = false;
-                            }
-                        }
-                    }
+                    close_frame(
+                        &mut calls,
+                        &mut stack,
+                        function.as_deref(),
+                        emitter.as_deref(),
+                        scval(data),
+                    );
                 }
                 "error" => errors.push(ErrorEvent {
-                    sc_error: topics.get(1).and_then(sc_error_of),
-                    message: error_message(&data),
-                    open_frame: stack.last().copied(),
+                    error: topics.get(1).and_then(sc_error),
+                    message: message(data),
+                    open_frame: emitting_frame(&calls, &stack, emitter.as_deref()),
                 }),
                 "log" => {
-                    let message = error_message(&data);
-                    if let Some(&i) = stack.last() {
-                        calls[i].logs.push(message);
+                    if let Some(frame) = emitting_frame(&calls, &stack, emitter.as_deref()) {
+                        calls[frame].logs.push(message(data));
                     }
                 }
                 _ => {}
             }
         }
 
-        let failure = build_failure(&errors, host_error, &calls, &stack);
-        if let Some(index) = failure.as_ref().and_then(|f| f.call_index) {
-            if let Some(call) = calls.get_mut(index) {
-                call.is_failure = true;
-            }
+        let failure = fatal.map(|fatal| build_failure(&errors, fatal, &calls, &stack));
+        if let Some(call) = failure
+            .as_ref()
+            .and_then(|f| f.call_index)
+            .and_then(|i| calls.get_mut(i))
+        {
+            call.is_failure = true;
         }
 
-        Story { calls, failure }
+        Story { failure, calls }
     }
+}
+
+/// The innermost open frame of the contract an event was emitted from,
+/// falling back to the innermost frame of any contract.
+///
+/// The two differ after a `try_call` recovery: the failed frame is still on
+/// the stack (nothing announces its death), but the event comes from its
+/// caller.
+fn emitting_frame(calls: &[Call], stack: &[usize], emitter: Option<&str>) -> Option<usize> {
+    emitter
+        .and_then(|contract| {
+            stack
+                .iter()
+                .rev()
+                .find(|&&i| calls[i].contract.as_deref() == Some(contract))
+        })
+        .or(stack.last())
+        .copied()
+}
+
+/// A `fn_call` is emitted by the calling contract. If that contract's frame
+/// is not the innermost one, every frame above it has failed without a
+/// `fn_return` and its caller has moved on: a recovered `try_call`.
+fn abandon_frames_above_caller(calls: &mut [Call], stack: &mut Vec<usize>, caller: Option<&str>) {
+    let Some(caller) = caller else {
+        return;
+    };
+    let Some(position) = stack
+        .iter()
+        .rposition(|&i| calls[i].contract.as_deref() == Some(caller))
+    else {
+        return;
+    };
+    for &abandoned in &stack[position + 1..] {
+        calls[abandoned].open = false;
+        calls[abandoned].recovered = true;
+    }
+    stack.truncate(position + 1);
+}
+
+/// Close the frame a `fn_return` belongs to.
+fn close_frame(
+    calls: &mut [Call],
+    stack: &mut Vec<usize>,
+    function: Option<&str>,
+    contract: Option<&str>,
+    value: String,
+) {
+    let returning = |call: &Call| {
+        function.is_some_and(|f| call.function == f)
+            // A frame or an event without a contract id cannot be told apart
+            // by contract; the function name has to do.
+            && match (call.contract.as_deref(), contract) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+    };
+    // A return that matches no open frame still closes something: the host
+    // emits them strictly nested, so it can only be the innermost frame.
+    let position = stack
+        .iter()
+        .rposition(|&i| returning(&calls[i]))
+        .or(stack.len().checked_sub(1));
+    let Some(position) = position else {
+        return;
+    };
+
+    for &abandoned in &stack[position + 1..] {
+        calls[abandoned].open = false;
+        calls[abandoned].recovered = true;
+    }
+    let frame = stack[position];
+    calls[frame].returned = Some(value);
+    calls[frame].open = false;
+    stack.truncate(position);
 }
 
 fn build_failure(
     errors: &[ErrorEvent],
-    host_error: Option<&ScError>,
+    fatal: &ScError,
     calls: &[Call],
     stack: &[usize],
-) -> Option<Failure> {
-    let host_error = host_error?;
-
+) -> Failure {
     // The first diagnostic carrying the final error is where it originated;
     // later ones are the same error being escalated up the frame stack.
-    let chosen = errors
+    let origin = errors
         .iter()
-        .position(|e| e.sc_error.as_ref() == Some(host_error))
-        .or_else(|| errors.last().map(|_| errors.len() - 1));
+        .find(|e| e.error.as_ref() == Some(fatal))
+        .or(errors.last());
 
-    let trail: Vec<String> = errors.iter().map(|e| e.message.clone()).collect();
-
-    let (message, call_index) = match chosen.and_then(|i| errors.get(i)) {
-        Some(e) => (e.message.clone(), e.open_frame),
+    let (message, call_index) = match origin {
+        Some(event) => (event.message.clone(), event.open_frame),
         None => (String::new(), stack.last().copied()),
     };
 
     // When nothing was open (auth failures, budget blow-ups before the first
     // call) there is no frame to hang the failure on.
-    let (contract, function, depth) = match call_index.and_then(|i| calls.get(i)) {
-        Some(call) => (
-            call.contract.clone(),
-            Some(call.function.clone()),
-            call.depth,
-        ),
-        None => (None, None, 0),
-    };
+    let frame = call_index.and_then(|i| calls.get(i));
 
-    Some(Failure {
-        sc_error: Some(host_error.clone()),
+    Failure {
+        error: fatal.clone(),
+        error_type: display::error_type_name(fatal.discriminant()),
+        error_code: display::error_code(fatal).map(|code| code.name()),
+        contract_code: match fatal {
+            ScError::Contract(code) => Some(*code),
+            _ => None,
+        },
+        description: display::describe_error(fatal),
+        name: None,
+        name_origin: None,
         message,
-        trail,
-        contract,
-        function,
-        depth,
+        contract: frame.and_then(|call| call.contract.clone()),
+        function: frame.map(|call| call.function.clone()),
+        depth: frame.map_or(0, |call| call.depth),
+        trail: errors.iter().map(|e| e.message.clone()).collect(),
         call_index,
-    })
+    }
 }
 
-fn data_args(data: &ScVal) -> Vec<String> {
+fn call_args(data: &ScVal) -> Vec<String> {
     match data {
         ScVal::Void => Vec::new(),
-        ScVal::Vec(Some(v)) => v.0.iter().map(scval_short).collect(),
-        other => vec![scval_short(other)],
+        ScVal::Vec(Some(items)) => items.0.iter().map(scval).collect(),
+        other => vec![scval(other)],
     }
 }
 
-/// The `error` diagnostic carries the message as its first data argument.
-fn error_message(data: &ScVal) -> String {
-    match data {
+/// The `error` and `log` diagnostics carry their message as the first data
+/// argument.
+fn message(data: &ScVal) -> String {
+    let text = |value: &ScVal| match value {
         ScVal::String(s) => String::from_utf8_lossy(&s.0).into_owned(),
-        ScVal::Vec(Some(v)) => {
-            v.0.first()
-                .map(|first| match first {
-                    ScVal::String(s) => String::from_utf8_lossy(&s.0).into_owned(),
-                    other => scval_short(other),
-                })
-                .unwrap_or_default()
-        }
+        other => scval(other),
+    };
+    match data {
         ScVal::Void => String::new(),
-        other => scval_short(other),
+        ScVal::Vec(Some(items)) => items.0.first().map(text).unwrap_or_default(),
+        other => text(other),
     }
 }
 
-fn symbol(v: &ScVal) -> Option<String> {
-    match v {
+fn symbol(value: &ScVal) -> Option<String> {
+    match value {
         ScVal::Symbol(s) => Some(String::from_utf8_lossy(&s.0).into_owned()),
         _ => None,
     }
 }
 
-fn bytes32(v: &ScVal) -> Option<[u8; 32]> {
-    match v {
-        ScVal::Bytes(b) => b.0.as_slice().try_into().ok(),
+fn bytes32(value: &ScVal) -> Option<[u8; 32]> {
+    match value {
+        ScVal::Bytes(bytes) => bytes.0.as_slice().try_into().ok(),
         _ => None,
     }
 }
 
-fn sc_error_of(v: &ScVal) -> Option<ScError> {
-    match v {
-        ScVal::Error(e) => Some(e.clone()),
+fn sc_error(value: &ScVal) -> Option<ScError> {
+    match value {
+        ScVal::Error(error) => Some(error.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{error_event, fn_call, fn_return, log_event};
+    use stellar_xdr::ScErrorCode;
+
+    const A: [u8; 32] = [0xa; 32];
+    const B: [u8; 32] = [0xb; 32];
+
+    fn id(bytes: [u8; 32]) -> String {
+        strkey::contract(&bytes)
+    }
+
+    #[test]
+    fn nested_calls_that_return() {
+        let story = Story::build(
+            &[
+                fn_call(None, A, "outer", vec![ScVal::U32(1)]),
+                fn_call(Some(A), B, "inner", vec![]),
+                log_event(Some(B), "inside inner"),
+                fn_return(B, "inner", ScVal::U32(2)),
+                fn_return(A, "outer", ScVal::U32(3)),
+            ],
+            None,
+        );
+        assert!(story.failure.is_none());
+        let [outer, inner] = story.calls.as_slice() else {
+            panic!("expected two frames, got {:?}", story.calls);
+        };
+        assert_eq!(
+            (
+                outer.depth,
+                outer.contract.as_deref(),
+                outer.function.as_str()
+            ),
+            (0, Some(id(A).as_str()), "outer")
+        );
+        assert_eq!(outer.args, ["1"]);
+        assert_eq!(outer.returned.as_deref(), Some("3"));
+        assert_eq!((inner.depth, inner.returned.as_deref()), (1, Some("2")));
+        assert_eq!(inner.logs, ["inside inner"]);
+        assert!(story
+            .calls
+            .iter()
+            .all(|c| !c.open && !c.recovered && !c.is_failure));
+    }
+
+    #[test]
+    fn failure_leaves_the_path_open() {
+        let fatal = ScError::Contract(3);
+        let story = Story::build(
+            &[
+                fn_call(None, A, "outer", vec![]),
+                fn_call(Some(A), B, "inner", vec![]),
+                error_event(Some(B), fatal.clone(), "boom"),
+                error_event(Some(A), fatal.clone(), "escalating"),
+            ],
+            Some(&fatal),
+        );
+        let failure = story.failure.as_ref().unwrap();
+        assert_eq!(failure.description, "contract error #3");
+        assert_eq!(
+            (
+                failure.error_type,
+                failure.error_code,
+                failure.contract_code
+            ),
+            ("contract", None, Some(3))
+        );
+        // The first diagnostic carrying the fatal error names the origin.
+        assert_eq!(failure.message, "boom");
+        assert_eq!(failure.trail, ["boom", "escalating"]);
+        assert_eq!(failure.contract.as_deref(), Some(id(B).as_str()));
+        assert_eq!(
+            (failure.function.as_deref(), failure.depth),
+            (Some("inner"), 1)
+        );
+
+        assert!(story.calls[0].open && !story.calls[0].is_failure);
+        assert!(story.calls[1].open && story.calls[1].is_failure);
+    }
+
+    /// Regression test for the `try_call` recovery bug: the return value used
+    /// to land on the failed inner frame and the outer frame stayed open.
+    #[test]
+    fn recovered_inner_failure() {
+        let story = Story::build(
+            &[
+                fn_call(None, A, "outer", vec![]),
+                fn_call(Some(A), B, "inner", vec![]),
+                error_event(Some(B), ScError::Contract(9), "inner failed"),
+                error_event(Some(A), ScError::Contract(9), "contract try_call failed"),
+                fn_return(A, "outer", ScVal::U32(7)),
+            ],
+            None,
+        );
+        let [outer, inner] = story.calls.as_slice() else {
+            panic!("expected two frames");
+        };
+        // The outer frame is closed with its own return value...
+        assert_eq!(outer.returned.as_deref(), Some("7"));
+        assert!(!outer.open && !outer.recovered);
+        // ...and the inner one is marked recovered, without a return value.
+        assert_eq!(inner.returned, None);
+        assert!(!inner.open && inner.recovered);
+        assert!(story.failure.is_none());
+    }
+
+    #[test]
+    fn calls_after_a_recovered_failure_are_siblings_not_children() {
+        const C: [u8; 32] = [0xc; 32];
+        let story = Story::build(
+            &[
+                fn_call(None, A, "batch", vec![]),
+                fn_call(Some(A), B, "first", vec![]),
+                error_event(Some(B), ScError::Contract(9), "first failed"),
+                error_event(Some(A), ScError::Contract(9), "contract try_call failed"),
+                // `batch` moves on: the next call comes from A, not from B.
+                fn_call(Some(A), C, "second", vec![]),
+                log_event(Some(C), "in second"),
+                fn_return(C, "second", ScVal::Void),
+                log_event(Some(A), "back in batch"),
+                fn_return(A, "batch", ScVal::Void),
+            ],
+            None,
+        );
+        let depths: Vec<usize> = story.calls.iter().map(|c| c.depth).collect();
+        assert_eq!(depths, [0, 1, 1]);
+        assert!(story.calls[1].recovered && !story.calls[1].open);
+        assert_eq!(story.calls[1].returned, None);
+        assert_eq!(story.calls[2].logs, ["in second"]);
+        assert_eq!(story.calls[0].logs, ["back in batch"]);
+        assert!(story.calls.iter().all(|c| !c.open));
+    }
+
+    #[test]
+    fn errors_are_attributed_to_the_contract_that_raised_them() {
+        // B failed and A recovered; the fatal error is then raised by A while
+        // B's dead frame is still the innermost one on the stack.
+        let fatal = ScError::Contract(5);
+        let story = Story::build(
+            &[
+                fn_call(None, A, "outer", vec![]),
+                fn_call(Some(A), B, "inner", vec![]),
+                error_event(Some(B), ScError::Contract(9), "inner failed"),
+                error_event(Some(A), fatal.clone(), "outer gives up"),
+            ],
+            Some(&fatal),
+        );
+        let failure = story.failure.unwrap();
+        assert_eq!(failure.function.as_deref(), Some("outer"));
+        assert_eq!(failure.depth, 0);
+        assert!(story.calls[0].is_failure && !story.calls[1].is_failure);
+    }
+
+    #[test]
+    fn recovered_failure_then_fatal_error_picks_the_fatal_one() {
+        let fatal = ScError::Auth(ScErrorCode::InvalidAction);
+        let story = Story::build(
+            &[
+                fn_call(None, A, "outer", vec![]),
+                fn_call(Some(A), B, "inner", vec![]),
+                error_event(Some(B), ScError::Contract(9), "recovered"),
+                fn_call(Some(A), B, "second", vec![]),
+                error_event(Some(B), fatal.clone(), "fatal"),
+            ],
+            Some(&fatal),
+        );
+        let failure = story.failure.unwrap();
+        assert_eq!(failure.message, "fatal");
+        assert_eq!(failure.function.as_deref(), Some("second"));
+        assert_eq!(failure.description, "auth error InvalidAction");
+        assert_eq!(
+            (failure.error_type, failure.error_code),
+            ("auth", Some("InvalidAction"))
+        );
+        assert_eq!(failure.call_index, Some(2));
+    }
+
+    #[test]
+    fn recursion_closes_the_innermost_frame() {
+        let story = Story::build(
+            &[
+                fn_call(None, A, "walk", vec![ScVal::U32(2)]),
+                fn_call(Some(A), A, "walk", vec![ScVal::U32(1)]),
+                fn_return(A, "walk", ScVal::U32(10)),
+                fn_return(A, "walk", ScVal::U32(20)),
+            ],
+            None,
+        );
+        assert_eq!(story.calls[0].returned.as_deref(), Some("20"));
+        assert_eq!(story.calls[1].returned.as_deref(), Some("10"));
+        assert!(story.calls.iter().all(|c| !c.recovered));
+    }
+
+    #[test]
+    fn same_function_name_on_two_contracts() {
+        // B::run fails; the `run` that returns is A's. Matching on the name
+        // alone would close B's frame with A's value.
+        let story = Story::build(
+            &[
+                fn_call(None, A, "run", vec![]),
+                fn_call(Some(A), B, "run", vec![]),
+                error_event(Some(B), ScError::Contract(1), "inner failed"),
+                fn_return(A, "run", ScVal::Bool(true)),
+            ],
+            None,
+        );
+        assert_eq!(story.calls[0].returned.as_deref(), Some("true"));
+        assert_eq!(story.calls[1].returned, None);
+        assert!(story.calls[1].recovered);
+    }
+
+    #[test]
+    fn error_with_no_open_frame() {
+        let fatal = ScError::Auth(ScErrorCode::InvalidAction);
+        let story = Story::build(
+            &[error_event(None, fatal.clone(), "bad signature")],
+            Some(&fatal),
+        );
+        assert!(story.calls.is_empty());
+        let failure = story.failure.unwrap();
+        assert_eq!(failure.message, "bad signature");
+        assert_eq!(
+            (failure.contract, failure.function, failure.depth),
+            (None, None, 0)
+        );
+        assert_eq!(failure.call_index, None);
+    }
+
+    #[test]
+    fn fatal_error_without_any_diagnostic_blames_the_open_frame() {
+        let fatal = ScError::Budget(ScErrorCode::ExceededLimit);
+        let story = Story::build(&[fn_call(None, A, "spin", vec![])], Some(&fatal));
+        let failure = story.failure.unwrap();
+        assert_eq!(failure.message, "");
+        assert_eq!(failure.function.as_deref(), Some("spin"));
+        assert!(story.calls[0].is_failure);
+    }
+
+    #[test]
+    fn unmatched_error_falls_back_to_the_last_diagnostic() {
+        let story = Story::build(
+            &[
+                fn_call(None, A, "f", vec![]),
+                error_event(Some(A), ScError::Contract(1), "first"),
+                error_event(Some(A), ScError::Contract(2), "last"),
+            ],
+            Some(&ScError::Contract(99)),
+        );
+        assert_eq!(story.failure.unwrap().message, "last");
+    }
+
+    #[test]
+    fn logs_outside_any_frame_are_dropped() {
+        let story = Story::build(&[log_event(None, "orphan")], None);
+        assert_eq!(story, Story::default());
+    }
+
+    #[test]
+    fn a_stray_return_closes_the_innermost_frame() {
+        let story = Story::build(
+            &[
+                fn_call(None, A, "outer", vec![]),
+                fn_return(B, "unrelated", ScVal::Void),
+                fn_return(A, "nothing-open", ScVal::Void),
+            ],
+            None,
+        );
+        assert_eq!(story.calls[0].returned.as_deref(), Some("void"));
+        assert!(!story.calls[0].open);
     }
 }

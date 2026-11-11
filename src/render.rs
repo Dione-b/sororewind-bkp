@@ -1,72 +1,42 @@
 //! render: turn a completed replay into something a person can read.
 //!
-//! Two renderers over the same report: a human narrative and a JSON document.
-//! Colour is applied here and nowhere else, so the same bytes come out whether
-//! or not a terminal is attached.
+//! Two renderers over the same [`Report`]: a human narrative and a JSON
+//! document. Colour is applied here and nowhere else — and only to the
+//! narrative on stdout; anything on stderr is plain.
 
+use std::fmt::{self, Write};
 use std::io::IsTerminal;
 
 use owo_colors::OwoColorize;
-use serde_json::json;
 
-use crate::replay::Fidelity;
-use crate::story::Story;
+use crate::replay::{Divergence, PrngSeed};
+use crate::report::Report;
+use crate::story::{Call, Failure};
 
-/// Budget actually consumed by the local replay, next to the limits it ran
-/// under.
-#[derive(Debug, Clone, Copy)]
-pub struct BudgetReport {
-    pub cpu_insns: u64,
-    pub cpu_limit: u64,
-    pub mem_bytes: u64,
-    pub mem_limit: u64,
+/// How much of the report the narrative shows. Derived from `-v`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Detail {
+    /// Fidelity, the failure and the call tree.
+    Summary,
+    /// Adds return values, budget and footprint detail (`-v`).
+    Budget,
+    /// Adds the raw diagnostic events (`-vv`).
+    Diagnostics,
 }
 
-/// How far the ledger has moved since the transaction ran.
-#[derive(Debug, Clone, Default)]
-pub struct DriftReport {
-    /// Footprint slots whose entry was written at or after the transaction's
-    /// own ledger — the value we replayed may not be the value the host saw.
-    pub drifted: Vec<String>,
-    /// Footprint slots with no live entry at all.
-    pub missing: usize,
-    pub total: usize,
-    /// Whether every cost parameter came from a real `ConfigSetting` entry.
-    pub config_from_ledger: bool,
+impl Detail {
+    pub fn from_verbosity(verbose: u8) -> Detail {
+        match verbose {
+            0 => Detail::Summary,
+            1 => Detail::Budget,
+            _ => Detail::Diagnostics,
+        }
+    }
 }
 
-/// Everything both renderers need.
-#[derive(Debug, Clone)]
-pub struct Report {
-    pub hash: String,
-    pub network: String,
-    pub rpc_url: String,
-    pub ledger: u32,
-    pub protocol: u32,
-    pub close_time: u64,
-    pub status: String,
-
-    pub fidelity: Fidelity,
-    pub onchain_label: String,
-    pub local_label: String,
-
-    pub story: Story,
-    /// Contract-declared name for the failing error code, when we could read
-    /// the contract's spec.
-    pub error_name: Option<String>,
-    /// Where that name came from, shown under `-v`.
-    pub error_origin: Option<String>,
-
-    pub budget: BudgetReport,
-    pub drift: DriftReport,
-    /// Raw diagnostic summaries, `-vv` only.
-    pub onchain_diagnostics: Vec<String>,
-    pub local_diagnostics: Vec<String>,
-}
-
-/// Should ANSI colour be emitted?
+/// Should ANSI colour be emitted on stdout?
 ///
-/// `--no-color` wins, then `NO_COLOR`, then "is this a terminal".
+/// `--no-color` wins, then `NO_COLOR`, then "is stdout a terminal".
 pub fn use_color(no_color: bool) -> bool {
     if no_color || std::env::var_os("NO_COLOR").is_some() {
         return false;
@@ -74,15 +44,17 @@ pub fn use_color(no_color: bool) -> bool {
     std::io::stdout().is_terminal()
 }
 
+/// Colour that can be switched off.
+///
+/// Decision (hand-rolled, kept): `owo-colors` has its own conditional colour
+/// (`if_supports_color`, `set_override`), but it works through process-global
+/// state and an extra dependency, whereas the renderer needs an explicit flag
+/// so tests can render both ways side by side. Six one-line methods do that.
 struct Palette {
     on: bool,
 }
 
 impl Palette {
-    fn new(on: bool) -> Self {
-        Self { on }
-    }
-
     fn paint(&self, text: &str, color: fn(&str) -> String) -> String {
         if self.on {
             color(text)
@@ -111,103 +83,169 @@ impl Palette {
     }
 }
 
-pub fn human(report: &Report, color: bool, verbose: u8) -> String {
-    let p = Palette::new(color);
-    let mut out = String::new();
+/// The JSON document: the report itself, pretty-printed because this output
+/// is meant to be read and diffed as well as parsed.
+pub fn json(report: &Report) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(report)
+}
 
-    out.push_str(&format!(
-        "{}  {}  {}\n",
+/// The human narrative.
+pub fn human(report: &Report, color: bool, detail: Detail) -> String {
+    let mut out = String::new();
+    // Writing into a `String` cannot fail.
+    let _ = write_human(&mut out, report, &Palette { on: color }, detail);
+    out
+}
+
+fn write_human(out: &mut impl Write, report: &Report, p: &Palette, detail: Detail) -> fmt::Result {
+    header(out, report, p)?;
+    fidelity(out, report, p)?;
+    if let Some(failure) = &report.story.failure {
+        where_it_broke(out, failure, p, detail)?;
+    }
+    call_tree(out, &report.story.calls, p, detail)?;
+    if detail >= Detail::Budget {
+        budget(out, report, p)?;
+    }
+    if detail >= Detail::Budget || !report.fidelity.matches {
+        drift(out, report, p, detail)?;
+    }
+    if detail >= Detail::Diagnostics {
+        diagnostics(out, report, p)?;
+    }
+    Ok(())
+}
+
+fn header(out: &mut impl Write, report: &Report, p: &Palette) -> fmt::Result {
+    writeln!(
+        out,
+        "{}  {}  {}",
         p.bold("sororewind"),
-        p.cyan(&short_hash(&report.hash)),
+        p.cyan(&report.hash.short()),
         p.bold(&report.network),
-    ));
-    out.push_str(&format!(
-        "{}\n",
+    )?;
+    let fee_bump = if report.fee_bump { " · fee-bump" } else { "" };
+    writeln!(
+        out,
+        "{}",
         p.dim(&format!(
-            "ledger {} · protocol {} · {}",
+            "ledger {} · protocol {} · {}{fee_bump}",
             report.ledger,
             report.protocol,
             utc(report.close_time)
         ))
-    ));
-    out.push('\n');
+    )?;
+    writeln!(out)
+}
 
-    // Fidelity is the whole point of the tool: say it first, say it plainly.
-    match &report.fidelity {
-        Fidelity::Match => {
-            out.push_str(&format!("{}\n", p.green("✓ replay matches network")));
-        }
-        Fidelity::Diverged { onchain, local } => {
-            out.push_str(&format!(
-                "{}\n",
+/// Fidelity is the whole point of the tool: say it first, say it plainly.
+fn fidelity(out: &mut impl Write, report: &Report, p: &Palette) -> fmt::Result {
+    let (onchain, local) = (report.result.onchain.label(), report.result.local.label());
+    match report.fidelity.divergence {
+        None => writeln!(out, "{}", p.green("✓ replay matches network"))?,
+        Some(Divergence::Result) => {
+            writeln!(
+                out,
+                "{}",
                 p.yellow(&format!(
                     "⚠ replay diverged from the network ({onchain} vs {local})"
                 ))
-            ));
-            out.push_str(&format!(
-                "{}\n",
+            )?;
+            writeln!(
+                out,
+                "{}",
                 p.dim("  the ledger has almost certainly moved since this transaction ran")
-            ));
+            )?;
+        }
+        Some(Divergence::Error) => {
+            writeln!(
+                out,
+                "{}",
+                p.yellow("⚠ replay diverged from the network (same result, different error)")
+            )?;
+            writeln!(
+                out,
+                "{}",
+                p.dim("  the replay failed, but not the way the transaction did on-chain")
+            )?;
         }
     }
-    out.push_str(&format!(
-        "{}\n",
-        p.dim(&format!(
-            "  on-chain  {}\n  local     {}",
-            report.onchain_label, report.local_label
-        ))
-    ));
-    out.push('\n');
-
-    if let Some(failure) = &report.story.failure {
-        out.push_str(&format!("{}\n", p.bold("where it broke")));
-        out.push_str(&format!("  {}\n", describe_error(report, &p)));
-        if !failure.message.is_empty() {
-            out.push_str(&format!("  {}\n", p.dim(&format!("{:?}", failure.message))));
-        }
-        match (&failure.contract, &failure.function) {
-            (Some(contract), function) => {
-                let at = match function {
-                    Some(f) => format!("{contract}::{f}"),
-                    None => contract.clone(),
-                };
-                out.push_str(&format!(
-                    "  {}\n",
-                    p.dim(&format!("in {at} (depth {})", failure.depth))
-                ));
-            }
-            _ => {}
-        }
-        if verbose > 0 {
-            if let Some(origin) = &report.error_origin {
-                out.push_str(&format!("  {}\n", p.dim(&format!("name from {origin}"))));
-            }
-        }
-        if verbose > 1 && failure.trail.len() > 1 {
-            out.push_str(&format!(
-                "  {}\n",
-                p.dim(&format!(
-                    "{} error diagnostics: {}",
-                    failure.trail.len(),
-                    failure.trail.join(" → ")
-                ))
-            ));
-        }
-        out.push('\n');
+    writeln!(
+        out,
+        "{}",
+        p.dim(&format!("  on-chain  {onchain}\n  local     {local}"))
+    )?;
+    if !report.footprint.config_drifted.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            p.yellow(&format!(
+                "⚠ network settings changed since this transaction ran: {}",
+                report.footprint.config_drifted.join(", ")
+            ))
+        )?;
     }
+    writeln!(out)
+}
 
-    out.push_str(&format!("{}\n", p.bold("call tree")));
-    if report.story.calls.is_empty() {
-        out.push_str(&format!(
-            "  {}\n",
+fn where_it_broke(
+    out: &mut impl Write,
+    failure: &Failure,
+    p: &Palette,
+    detail: Detail,
+) -> fmt::Result {
+    writeln!(out, "{}", p.bold("where it broke"))?;
+    let headline = match &failure.name {
+        Some(name) => format!("{} · {name}", failure.description),
+        None => failure.description.clone(),
+    };
+    writeln!(out, "  {}", p.red(&headline))?;
+    if !failure.message.is_empty() {
+        writeln!(out, "  {}", p.dim(&quoted(&failure.message)))?;
+    }
+    if let Some(contract) = &failure.contract {
+        let location = match &failure.function {
+            Some(function) => format!("{contract}::{function}"),
+            None => contract.clone(),
+        };
+        writeln!(
+            out,
+            "  {}",
+            p.dim(&format!("in {location} (depth {})", failure.depth))
+        )?;
+    }
+    if detail >= Detail::Budget {
+        if let Some(origin) = &failure.name_origin {
+            writeln!(out, "  {}", p.dim(&format!("name from {origin}")))?;
+        }
+    }
+    if detail >= Detail::Diagnostics && failure.trail.len() > 1 {
+        writeln!(
+            out,
+            "  {}",
+            p.dim(&format!(
+                "{} error diagnostics: {}",
+                failure.trail.len(),
+                failure.trail.join(" → ")
+            ))
+        )?;
+    }
+    writeln!(out)
+}
+
+fn call_tree(out: &mut impl Write, calls: &[Call], p: &Palette, detail: Detail) -> fmt::Result {
+    writeln!(out, "{}", p.bold("call tree"))?;
+    if calls.is_empty() {
+        writeln!(
+            out,
+            "  {}",
             p.dim("no contract was entered before the failure")
-        ));
+        )?;
     }
-    for call in &report.story.calls {
-        let indent = if call.depth == 0 {
-            String::new()
-        } else {
-            format!("{}└─ ", "   ".repeat(call.depth - 1))
+    for call in calls {
+        let indent = match call.depth {
+            0 => String::new(),
+            depth => format!("{}└─ ", "   ".repeat(depth - 1)),
         };
         let head = match &call.contract {
             Some(contract) => format!("{contract}::{}", call.function),
@@ -215,208 +253,150 @@ pub fn human(report: &Report, color: bool, verbose: u8) -> String {
         };
         let mut line = format!("{indent}{head}({})", call.args.join(", "));
 
-        if let Some(returned) = &call.returned {
-            if verbose > 0 {
-                line.push_str(&format!(" → {returned}"));
+        if detail >= Detail::Budget {
+            if let Some(returned) = &call.returned {
+                write!(line, " → {returned}")?;
             }
-        }
-        if call.recovered && verbose > 0 {
-            line.push_str(&format!(" {}", p.dim("(recovered by try_call)")));
+            if call.recovered {
+                write!(line, " {}", p.dim("(recovered by try_call)"))?;
+            }
         }
         if call.is_failure {
-            out.push_str(&format!("{}\n", p.red(&format!("{line}  ✗"))));
+            writeln!(out, "{}", p.red(&format!("{line}  ✗")))?;
         } else if call.open {
-            out.push_str(&format!("{}\n", p.yellow(&line)));
+            writeln!(out, "{}", p.yellow(&line))?;
         } else {
-            out.push_str(&format!("{line}\n"));
+            writeln!(out, "{line}")?;
         }
 
+        let log_indent = if call.depth == 0 {
+            "    · "
+        } else {
+            "       · "
+        };
         for log in &call.logs {
-            let log_indent = format!("{}  · ", if call.depth == 0 { "  " } else { "     " });
-            out.push_str(&format!("{}{}\n", p.dim(&log_indent), p.dim(log)));
+            writeln!(out, "{}{}", p.dim(log_indent), p.dim(log))?;
         }
     }
-    out.push('\n');
+    writeln!(out)
+}
 
-    if verbose > 0 {
-        let b = &report.budget;
-        out.push_str(&format!(
-            "{}\n",
+fn budget(out: &mut impl Write, report: &Report, p: &Palette) -> fmt::Result {
+    let b = &report.budget;
+    writeln!(
+        out,
+        "{}",
+        p.dim(&format!(
+            "budget {} / {} cpu instructions · {} / {} memory",
+            grouped(b.cpu_insns),
+            grouped(b.cpu_limit),
+            human_bytes(b.mem_bytes),
+            human_bytes(b.mem_limit),
+        ))
+    )?;
+    if let (Some(cpu), Some(mem)) = (b.network_cpu_insns, b.network_mem_bytes) {
+        writeln!(
+            out,
+            "{}",
             p.dim(&format!(
-                "budget {} / {} cpu instructions · {} / {} memory",
-                grouped(b.cpu_insns),
-                grouped(b.cpu_limit),
-                human_bytes(b.mem_bytes),
-                human_bytes(b.mem_limit),
+                "network used {} cpu instructions · {} memory",
+                grouped(cpu),
+                human_bytes(mem)
             ))
-        ));
-        out.push_str(&format!(
-            "{}\n",
-            p.dim(&format!(
-                "footprint {} entries · {} drifted · {} missing · cost params {}",
-                report.drift.total,
-                report.drift.drifted.len(),
-                report.drift.missing,
-                if report.drift.config_from_ledger {
-                    "from the ledger"
-                } else {
-                    "protocol defaults (the RPC would not serve them)"
-                }
-            ))
-        ));
-        for key in &report.drift.drifted {
-            out.push_str(&format!("  {} {key}\n", p.yellow("drifted:")));
-        }
-        out.push('\n');
+        )?;
     }
+    Ok(())
+}
 
-    if verbose > 1 {
-        for (title, diagnostics) in [
-            ("on-chain diagnostics", &report.onchain_diagnostics),
-            ("local diagnostics", &report.local_diagnostics),
-        ] {
-            if diagnostics.is_empty() {
-                continue;
+/// How many drifted entries of each kind the summary lists before it points
+/// at `-v`. An actively maintained contract can have dozens.
+const DRIFT_LINES: usize = 5;
+
+/// What is known to differ between the ledger now and the ledger then.
+fn drift(out: &mut impl Write, report: &Report, p: &Palette, detail: Detail) -> fmt::Result {
+    let f = &report.footprint;
+    writeln!(
+        out,
+        "{}",
+        p.dim(&format!(
+            "footprint {} entries · {} drifted · {} ttl-drifted · {} missing · prng seed {}",
+            f.entries,
+            f.drifted.len(),
+            f.ttl_drifted.len(),
+            f.missing,
+            match report.prng_seed {
+                PrngSeed::Derived => "derived",
+                PrngSeed::Fixed => "fixed (apply order unknown)",
             }
-            out.push_str(&format!("{}\n", p.bold(title)));
-            for line in diagnostics {
-                out.push_str(&format!("  {line}\n"));
-            }
-            out.push('\n');
-        }
-    }
-
-    out
-}
-
-fn describe_error(report: &Report, p: &Palette) -> String {
-    let Some(failure) = &report.story.failure else {
-        return p.red("the replay failed");
-    };
-    match failure.contract_error_code() {
-        Some(code) => match &report.error_name {
-            Some(name) => p.red(&format!("contract error #{code} · {name}")),
-            None => p.red(&format!("contract error #{code}")),
-        },
-        None => {
-            let type_name = failure
-                .error_type()
-                .map(|t| format!("{t:?}").to_lowercase())
-                .unwrap_or_else(|| "host".to_string());
-            let code = failure
-                .sc_error
-                .as_ref()
-                .and_then(sc_error_code)
-                .map(|c| format!(" {c:?}"))
-                .unwrap_or_default();
-            p.red(&format!("{type_name} error{code}"))
-        }
-    }
-}
-
-fn sc_error_code(e: &stellar_xdr::ScError) -> Option<stellar_xdr::ScErrorCode> {
-    use stellar_xdr::ScError::*;
-    match e {
-        Contract(_) => None,
-        WasmVm(c) | Context(c) | Storage(c) | Object(c) | Crypto(c) | Events(c) | Budget(c)
-        | Value(c) | Auth(c) => Some(*c),
-    }
-}
-
-pub fn json(report: &Report) -> String {
-    let failure = report.story.failure.as_ref().map(|f| {
-        json!({
-            "type": f.error_type().map(|t| format!("{t:?}")),
-            "code": f.contract_error_code(),
-            "name": report.error_name,
-            "nameOrigin": report.error_origin,
-            "message": f.message,
-            "contract": f.contract,
-            "function": f.function,
-            "depth": f.depth,
-            "trail": f.trail,
-        })
-    });
-
-    let calls: Vec<_> = report
-        .story
-        .calls
+        ))
+    )?;
+    let ttl_drifted: Vec<String> = f
+        .ttl_drifted
         .iter()
-        .map(|c| {
-            json!({
-                "depth": c.depth,
-                "contract": c.contract,
-                "function": c.function,
-                "args": c.args,
-                "returned": c.returned,
-                "open": c.open,
-                "recovered": c.recovered,
-                "failure": c.is_failure,
-                "logs": c.logs,
-            })
-        })
+        .map(|drifted| format!("{} ({})", drifted.entry, drifted.reason.describe()))
         .collect();
-
-    let fidelity = match &report.fidelity {
-        Fidelity::Match => json!({ "match": true }),
-        Fidelity::Diverged { onchain, local } => {
-            json!({ "match": false, "onchain": onchain, "local": local })
-        }
+    let limit = if detail >= Detail::Budget {
+        usize::MAX
+    } else {
+        DRIFT_LINES
     };
-
-    let document = json!({
-        "hash": report.hash,
-        "network": report.network,
-        "rpc": report.rpc_url,
-        "ledger": report.ledger,
-        "protocol": report.protocol,
-        "closeTime": report.close_time,
-        "status": report.status,
-        "fidelity": fidelity,
-        "result": {
-            "onchain": report.onchain_label,
-            "local": report.local_label,
-        },
-        "failure": failure,
-        "calls": calls,
-        "budget": {
-            "cpuInsns": report.budget.cpu_insns,
-            "cpuLimit": report.budget.cpu_limit,
-            "memBytes": report.budget.mem_bytes,
-            "memLimit": report.budget.mem_limit,
-        },
-        "footprint": {
-            "entries": report.drift.total,
-            "drifted": report.drift.drifted,
-            "missing": report.drift.missing,
-            "configFromLedger": report.drift.config_from_ledger,
-        },
-        "diagnostics": {
-            "onchain": report.onchain_diagnostics,
-            "local": report.local_diagnostics,
-        },
-    });
-
-    // Pretty-printed: this output is meant to be read and diffed.
-    serde_json::to_string_pretty(&document).expect("report serializes cleanly")
+    for (label, entries) in [
+        ("archived:", &f.archived),
+        ("drifted:", &f.drifted),
+        ("ttl drifted:", &ttl_drifted),
+    ] {
+        for entry in entries.iter().take(limit) {
+            writeln!(out, "  {} {entry}", p.yellow(label))?;
+        }
+        if entries.len() > limit {
+            writeln!(
+                out,
+                "  {}",
+                p.dim(&format!(
+                    "… and {} more (-v lists them all)",
+                    entries.len() - limit
+                ))
+            )?;
+        }
+    }
+    writeln!(out)
 }
 
-fn short_hash(hash: &str) -> String {
-    if hash.len() > 12 {
-        format!("{}…{}", &hash[..6], &hash[hash.len() - 4..])
-    } else {
-        hash.to_string()
+fn diagnostics(out: &mut impl Write, report: &Report, p: &Palette) -> fmt::Result {
+    for (title, lines) in [
+        ("on-chain diagnostics", &report.diagnostics.onchain),
+        ("local diagnostics", &report.diagnostics.local),
+    ] {
+        if lines.is_empty() {
+            continue;
+        }
+        writeln!(out, "{}", p.bold(title))?;
+        for line in lines {
+            writeln!(out, "  {line}")?;
+        }
+        writeln!(out)?;
     }
+    Ok(())
+}
+
+/// A message as a quoted literal, with control characters escaped.
+fn quoted(text: &str) -> String {
+    format!("\"{}\"", text.escape_debug())
 }
 
 /// Seconds since the Unix epoch into a fixed, sortable UTC stamp.
+///
+/// Decision (hand-rolled, kept): this is Howard Hinnant's `civil_from_days`,
+/// fifteen lines of integer arithmetic that are exact for the whole `u64`
+/// range a ledger close time can take. A date crate for one line of output
+/// is not worth its weight next to the Soroban host; the edge cases are
+/// pinned by the tests below instead.
 fn utc(timestamp: u64) -> String {
-    // Civil-from-days, Howard Hinnant's algorithm — no date crate for one line.
     let days = (timestamp / 86_400) as i64;
     let secs = timestamp % 86_400;
     let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
@@ -432,11 +412,12 @@ fn utc(timestamp: u64) -> String {
     )
 }
 
+/// `1234567` → `1,234,567`.
 fn grouped(n: u64) -> String {
     let digits = n.to_string();
-    let mut out = String::new();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -462,6 +443,9 @@ fn human_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::Fidelity;
+    use crate::report::{TtlDriftEntry, TtlDriftReason};
+    use crate::test_support::sample_report;
 
     #[test]
     fn formats_timestamps() {
@@ -470,8 +454,135 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_cross_leap_days_and_year_boundaries() {
+        // 2024 is a leap year: Feb 28 → Feb 29 → Mar 1.
+        assert_eq!(utc(1_709_164_799), "2024-02-28 23:59:59 UTC");
+        assert_eq!(utc(1_709_164_800), "2024-02-29 00:00:00 UTC");
+        assert_eq!(utc(1_709_251_200), "2024-03-01 00:00:00 UTC");
+        // 2023 is not: Feb 28 → Mar 1.
+        assert_eq!(utc(1_677_628_799), "2023-02-28 23:59:59 UTC");
+        assert_eq!(utc(1_677_628_800), "2023-03-01 00:00:00 UTC");
+        // Year boundary.
+        assert_eq!(utc(1_735_689_599), "2024-12-31 23:59:59 UTC");
+        assert_eq!(utc(1_735_689_600), "2025-01-01 00:00:00 UTC");
+        // Century rules: 2000 was a leap year, 2100 will not be.
+        assert_eq!(utc(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(utc(4_107_456_000), "2100-02-28 00:00:00 UTC");
+        assert_eq!(utc(4_107_542_400), "2100-03-01 00:00:00 UTC");
+        // Month ends.
+        assert_eq!(utc(1_706_745_599), "2024-01-31 23:59:59 UTC");
+        assert_eq!(utc(1_719_791_999), "2024-06-30 23:59:59 UTC");
+    }
+
+    #[test]
+    fn far_future_timestamps_do_not_panic() {
+        assert_eq!(utc(253_402_300_799), "9999-12-31 23:59:59 UTC");
+        assert!(utc(u64::MAX).ends_with(" UTC"));
+    }
+
+    #[test]
     fn groups_digits() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
         assert_eq!(grouped(4_120), "4,120");
         assert_eq!(grouped(100_000_000), "100,000,000");
+        assert_eq!(grouped(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn scales_bytes() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(41_943_040), "40.0 MB");
+        assert_eq!(human_bytes(u64::MAX), "16777216.0 TB");
+    }
+
+    #[test]
+    fn quotes_messages() {
+        assert_eq!(quoted("plain"), "\"plain\"");
+        assert_eq!(quoted("a \"b\"\n"), r#""a \"b\"\n""#);
+    }
+
+    #[test]
+    fn detail_follows_verbosity() {
+        assert_eq!(Detail::from_verbosity(0), Detail::Summary);
+        assert_eq!(Detail::from_verbosity(1), Detail::Budget);
+        assert_eq!(Detail::from_verbosity(2), Detail::Diagnostics);
+        assert_eq!(Detail::from_verbosity(9), Detail::Diagnostics);
+    }
+
+    #[test]
+    fn colour_is_only_emitted_when_asked_for() {
+        let report = sample_report();
+        let plain = human(&report, false, Detail::Diagnostics);
+        assert!(
+            !plain.contains('\u{1b}'),
+            "plain output must carry no escapes"
+        );
+
+        let coloured = human(&report, true, Detail::Diagnostics);
+        assert!(coloured.contains("\u{1b}[32m✓ replay matches network\u{1b}[39m"));
+        assert!(coloured.contains("\u{1b}[1mcall tree\u{1b}[0m"));
+        // Same text once the escapes are stripped.
+        let mut stripped = String::new();
+        let mut chars = coloured.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                stripped.push(c);
+            }
+        }
+        assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn summary_narrative() {
+        insta::assert_snapshot!(
+            "human_summary",
+            human(&sample_report(), false, Detail::Summary)
+        );
+    }
+
+    #[test]
+    fn verbose_narrative_adds_budget_and_diagnostics() {
+        insta::assert_snapshot!(
+            "human_diagnostics",
+            human(&sample_report(), false, Detail::Diagnostics)
+        );
+    }
+
+    #[test]
+    fn divergence_explains_itself_without_flags() {
+        let mut report = sample_report();
+        report.fidelity = Fidelity::diverged(Divergence::Result);
+        report.result.local = crate::report::ResultSummary {
+            code: "entry_archived",
+            result_hash: None,
+        };
+        report.footprint.archived = vec!["contract code abcd…".to_string()];
+        report.footprint.config_drifted = vec!["StateArchival".to_string()];
+        report.footprint.ttl_drifted = vec![TtlDriftEntry {
+            entry: "contract code ffff…".to_string(),
+            reason: TtlDriftReason::ArchivedSince,
+        }];
+        report.prng_seed = PrngSeed::Fixed;
+        report.story = crate::story::Story::default();
+
+        insta::assert_snapshot!("human_diverged", human(&report, false, Detail::Summary));
+
+        report.fidelity = Fidelity::diverged(Divergence::Error);
+        let text = human(&report, false, Detail::Summary);
+        assert!(text.contains("⚠ replay diverged from the network (same result, different error)"));
+    }
+
+    #[test]
+    fn json_document() {
+        insta::assert_snapshot!("json_document", json(&sample_report()).unwrap());
     }
 }

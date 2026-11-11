@@ -1,0 +1,197 @@
+//! The outcome of a run, as data.
+//!
+//! [`Report`] holds structured values — result codes, error categories,
+//! counts — and leaves wording to the renderers. Serialising it *is* the
+//! `--json` document, so the struct is the schema: a field added here shows up
+//! in the output, and [`SCHEMA_VERSION`] says when the shape changed
+//! incompatibly.
+
+use serde::Serialize;
+use stellar_xdr::InvokeHostFunctionResult;
+
+use crate::display;
+use crate::hash::TxHash;
+use crate::replay::{BudgetUse, Fidelity, PrngSeed};
+use crate::rpc::TxStatus;
+use crate::state::TtlDrift;
+use crate::story::Story;
+
+/// Version of the JSON document. Bumped when a field is removed, renamed or
+/// changes meaning; adding fields does not bump it.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Everything both renderers need.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Report {
+    pub schema_version: u32,
+    pub hash: TxHash,
+    /// The transaction was wrapped in a fee-bump; `hash` may be the outer or
+    /// the inner hash, whichever the RPC was asked for.
+    pub fee_bump: bool,
+    /// Network name derived from the RPC's passphrase.
+    pub network: String,
+    /// The endpoint, or `fixture:<dir>`.
+    pub rpc: String,
+    pub ledger: u32,
+    pub protocol: u32,
+    /// Close time of the transaction's ledger, seconds since the Unix epoch.
+    pub close_time: u64,
+    pub status: TxStatus,
+
+    pub fidelity: Fidelity,
+    pub result: ResultPair,
+    /// `failure` and `calls`.
+    #[serde(flatten)]
+    pub story: Story,
+
+    pub budget: BudgetUse,
+    pub footprint: FootprintReport,
+    pub prng_seed: PrngSeed,
+    pub diagnostics: Diagnostics,
+}
+
+impl Report {
+    pub fn outcome(&self) -> Outcome {
+        if self.fidelity.matches {
+            Outcome::Matched
+        } else {
+            Outcome::Diverged
+        }
+    }
+}
+
+/// What a completed run concluded. Maps onto the process exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The local replay reproduced the network's recorded result.
+    Matched,
+    /// The replay ran but disagreed with the network.
+    Diverged,
+}
+
+/// The network's result next to the local one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResultPair {
+    pub onchain: ResultSummary,
+    pub local: ResultSummary,
+}
+
+/// An `InvokeHostFunctionResult`, structured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultSummary {
+    /// `success`, `trapped`, `resource_limit_exceeded`, `entry_archived`,
+    /// `insufficient_refundable_fee` or `malformed`.
+    pub code: &'static str,
+    /// Hash of the return value and events; only for `success`.
+    pub result_hash: Option<String>,
+}
+
+impl ResultSummary {
+    /// The result in the words a person would use.
+    pub fn label(&self) -> String {
+        match &self.result_hash {
+            Some(hash) => format!("success (result hash {hash})"),
+            None => self.code.replace('_', " "),
+        }
+    }
+}
+
+impl From<&InvokeHostFunctionResult> for ResultSummary {
+    fn from(result: &InvokeHostFunctionResult) -> Self {
+        ResultSummary {
+            code: display::result_code(result),
+            result_hash: match result {
+                InvokeHostFunctionResult::Success(hash) => Some(hex::encode(hash.0)),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// How far the ledger has moved since the transaction ran.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FootprintReport {
+    /// Number of keys in the transaction's footprint.
+    pub entries: usize,
+    /// Footprint slots the host was handed no entry for.
+    pub missing: usize,
+    /// Entries written at or after the transaction's own ledger — the value
+    /// replayed may not be the value the host saw.
+    pub drifted: Vec<String>,
+    /// Entries whose TTL provably changed after the transaction ran.
+    pub ttl_drifted: Vec<TtlDriftEntry>,
+    /// Entries that were archived when the transaction ran and not restored
+    /// by it.
+    pub archived: Vec<String>,
+    /// Network settings modified at or after the transaction's ledger.
+    pub config_drifted: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TtlDriftEntry {
+    pub entry: String,
+    pub reason: TtlDriftReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TtlDriftReason {
+    /// The TTL was extended after the transaction ran.
+    ExtendedSince,
+    /// The entry was live for the transaction and has been archived since.
+    ArchivedSince,
+}
+
+impl TtlDriftReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            TtlDriftReason::ExtendedSince => "TTL extended since",
+            TtlDriftReason::ArchivedSince => "archived since",
+        }
+    }
+}
+
+impl From<TtlDrift> for TtlDriftReason {
+    fn from(drift: TtlDrift) -> Self {
+        match drift {
+            TtlDrift::ExtendedSince => TtlDriftReason::ExtendedSince,
+            TtlDrift::ArchivedSince => TtlDriftReason::ArchivedSince,
+        }
+    }
+}
+
+/// Diagnostic events, one rendered line each, for side-by-side comparison.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Diagnostics {
+    pub onchain: Vec<String>,
+    pub local: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::Hash;
+
+    #[test]
+    fn summarises_results() {
+        let trapped = ResultSummary::from(&InvokeHostFunctionResult::Trapped);
+        assert_eq!(
+            (trapped.code, trapped.result_hash.as_deref()),
+            ("trapped", None)
+        );
+        assert_eq!(trapped.label(), "trapped");
+
+        let limit = ResultSummary::from(&InvokeHostFunctionResult::ResourceLimitExceeded);
+        assert_eq!(limit.label(), "resource limit exceeded");
+
+        let success = ResultSummary::from(&InvokeHostFunctionResult::Success(Hash([1; 32])));
+        assert_eq!(success.code, "success");
+        assert_eq!(
+            success.label(),
+            format!("success (result hash {})", "01".repeat(32))
+        );
+    }
+}

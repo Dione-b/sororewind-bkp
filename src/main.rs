@@ -1,32 +1,91 @@
-//! sororewind — replay a failed Soroban transaction and narrate the failure.
-//!
-//! The binary is a thin shell: parse arguments, run the pipeline, map the
-//! outcome onto an exit code. Everything else lives in the pipeline so the
-//! offline fixtures exercise exactly the same path as a live run.
+//! The `sororewind` binary: parse arguments, run the pipeline, print the
+//! report, exit with the outcome. Everything else lives in the library.
 
-mod cli;
-mod error;
-mod pipeline;
-mod render;
-mod replay;
-mod rpc;
-mod spec;
-mod state;
-mod story;
-mod strkey;
-mod tx;
+use std::process::ExitCode;
 
-use clap::Parser;
+use clap::error::ErrorKind;
+use sororewind::cli::Cli;
+use sororewind::render::{self, Detail};
+use sororewind::{Report, Result};
+
+/// Diagnostics go to stderr, tagged with where they came from: `[rpc] → …`.
+/// This is the only place in the program that writes to stderr.
+struct StderrLogger;
+
+/// The tags sororewind logs under. Dependencies log too; they are not ours to
+/// print.
+const TARGETS: [&str; 5] = ["rpc", "fixture", "record", "spec", "replay"];
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        TARGETS.contains(&metadata.target())
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logging(verbose: u8) {
+    static LOGGER: StderrLogger = StderrLogger;
+    // Installing a logger only fails if one is already set; there is not.
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(match verbose {
+        0 => log::LevelFilter::Warn,
+        1 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    });
+}
+
+async fn run(cli: &Cli) -> Result<Report> {
+    let (rpc, request) = cli.connect().await?;
+    sororewind::run(&rpc, &request).await
+}
 
 #[tokio::main]
-async fn main() {
-    let cli = cli::Cli::parse();
+async fn main() -> ExitCode {
+    let cli = match Cli::try_parse_args(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err(err) => {
+            // `--help` and `--version` are not failures. Everything else is a
+            // tool error: clap's default exit code for usage errors is 2,
+            // which here means "the replay diverged".
+            let _ = err.print();
+            return match err.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,
+                _ => ExitCode::from(sororewind::EXIT_ERROR),
+            };
+        }
+    };
+    init_logging(cli.verbose);
 
-    match pipeline::run(&cli).await {
-        Ok(code) => std::process::exit(code),
+    let result = run(&cli).await;
+    let code = sororewind::exit_code(&result);
+    let printed = result.and_then(|report| {
+        if cli.json {
+            let document = render::json(&report).map_err(|e| {
+                sororewind::RewindError::Replay(format!("could not serialise the report: {e}"))
+            })?;
+            println!("{document}");
+        } else {
+            let detail = Detail::from_verbosity(cli.verbose);
+            print!(
+                "{}",
+                render::human(&report, render::use_color(cli.no_color), detail)
+            );
+        }
+        Ok(())
+    });
+
+    match printed {
+        Ok(()) => ExitCode::from(code),
         Err(err) => {
             eprintln!("sororewind: {err}");
-            std::process::exit(pipeline::EXIT_ERROR);
+            ExitCode::from(sororewind::EXIT_ERROR)
         }
     }
 }

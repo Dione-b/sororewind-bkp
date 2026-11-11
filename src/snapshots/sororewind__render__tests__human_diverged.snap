@@ -1,0 +1,20 @@
+---
+source: src/render.rs
+expression: "human(&report, false, Detail::Summary)"
+---
+sororewind  aaaaaa…aaaa  testnet
+ledger 1000 · protocol 30 · 2023-11-14 22:13:20 UTC · fee-bump
+
+⚠ replay diverged from the network (trapped vs entry archived)
+  the ledger has almost certainly moved since this transaction ran
+  on-chain  trapped
+  local     entry archived
+⚠ network settings changed since this transaction ran: StateArchival
+
+call tree
+  no contract was entered before the failure
+
+footprint 4 entries · 1 drifted · 1 ttl-drifted · 1 missing · prng seed fixed (apply order unknown)
+  archived: contract code abcd…
+  drifted: account GAAA
+  ttl drifted: contract code ffff… (archived since)

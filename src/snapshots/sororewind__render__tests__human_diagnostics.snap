@@ -1,0 +1,36 @@
+---
+source: src/render.rs
+expression: "human(&sample_report(), false, Detail::Diagnostics)"
+---
+sororewind  aaaaaa…aaaa  testnet
+ledger 1000 · protocol 30 · 2023-11-14 22:13:20 UTC · fee-bump
+
+✓ replay matches network
+  on-chain  trapped
+  local     trapped
+
+where it broke
+  contract error #3 · InsufficientBalance
+  "balance too low"
+  in CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::inner (depth 1)
+  name from spec enum Error
+  2 error diagnostics: balance too low → escalating
+
+call tree
+CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::outer(1, "two")
+    · starting
+└─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::probe() → void (recovered by try_call)
+└─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::inner()  ✗
+       · about to fail
+
+budget 1,234,567 / 2,000,000 cpu instructions · 1.0 MB / 40.0 MB memory
+network used 1,234,567 cpu instructions · 1.0 MB memory
+footprint 4 entries · 1 drifted · 1 ttl-drifted · 1 missing · prng seed derived
+  drifted: account GAAA
+  ttl drifted: contract data C…AAAA Balance (persistent) (TTL extended since)
+
+on-chain diagnostics
+  fail [-] error, contract error #3 "balance too low"
+
+local diagnostics
+  fail [-] error, contract error #3 "balance too low"
