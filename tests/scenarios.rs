@@ -215,3 +215,14 @@ async fn a_network_the_rpc_does_not_serve_is_an_error() {
         .unwrap();
     assert_eq!(report.network, "testnet");
 }
+
+#[tokio::test]
+async fn each_embedded_host_replays_its_own_protocol() {
+    // One recording per embedded host; both must match the network.
+    for (fixture, protocol) in [("mainnet-auth-error", 29), ("contract-error", 30)] {
+        let report = common::replay(fixture).await.unwrap();
+        assert_eq!(report.protocol, protocol, "{fixture}");
+        assert!(sororewind::host::for_protocol(protocol).is_some());
+        assert_eq!(report.outcome(), Outcome::Matched, "{fixture}");
+    }
+}

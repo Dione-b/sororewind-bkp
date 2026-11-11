@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
+use sororewind::network::NetworkId;
 use sororewind::rpc::RpcClient;
 use sororewind::transport::{FixtureManifest, FixtureTransport, HttpTransport, Recording};
 use sororewind::{Network, Outcome, Request, Result, TxHash};
@@ -62,7 +63,7 @@ async fn replay(rpc: &RpcClient, hash: &TxHash, network: Network) -> Result<Outc
     Ok(sororewind::run(rpc, &request).await?.outcome())
 }
 
-async fn record(args: &Args, name: &str, hash: &TxHash) -> Result<Recorded> {
+async fn record(args: &Args, name: &str, hash: &TxHash, network: Network) -> Result<Recorded> {
     let target = args.dir.join(name);
     let staging = args.dir.join(format!(".{name}.staging"));
     let _ = std::fs::remove_dir_all(&staging);
@@ -70,9 +71,9 @@ async fn record(args: &Args, name: &str, hash: &TxHash) -> Result<Recorded> {
     let url = args
         .rpc_url
         .clone()
-        .unwrap_or_else(|| args.network.default_rpc_url().to_string());
+        .unwrap_or_else(|| network.default_rpc_url().to_string());
     let recording = Recording::create(HttpTransport::new(url)?, &staging, hash).await?;
-    let outcome = replay(&RpcClient::new(recording), hash, args.network).await;
+    let outcome = replay(&RpcClient::new(recording), hash, network).await;
 
     let keep = match &outcome {
         Ok(Outcome::Matched) => true,
@@ -131,15 +132,17 @@ async fn existing(dir: &Path) -> Result<Vec<(String, TxHash)>> {
 async fn rerecord(args: &Args, name: &str, hash: &TxHash) -> Result<Recorded> {
     // A fixture that already diverges offline captured drift on purpose.
     let offline = RpcClient::new(FixtureTransport::open(args.dir.join(name)).await?);
-    if matches!(
-        replay(&offline, hash, args.network).await,
-        Ok(Outcome::Diverged)
-    ) {
+    // Re-record from the network the fixture was recorded on.
+    let network = match NetworkId::from_passphrase(&offline.network().await?.passphrase) {
+        NetworkId::Known(network) => network,
+        NetworkId::Custom(_) => args.network,
+    };
+    if matches!(replay(&offline, hash, network).await, Ok(Outcome::Diverged)) {
         return Ok(Recorded::Skipped(
             "it captures a divergence, which cannot be re-recorded",
         ));
     }
-    record(args, name, hash).await
+    record(args, name, hash, network).await
 }
 
 #[tokio::main]
@@ -166,7 +169,7 @@ async fn main() -> ExitCode {
     let mut failed = false;
     for (name, hash) in &jobs {
         let result = if single.is_some() {
-            record(&args, name, hash).await
+            record(&args, name, hash, args.network).await
         } else {
             rerecord(&args, name, hash).await
         };

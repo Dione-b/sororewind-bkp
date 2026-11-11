@@ -42,8 +42,10 @@ with Rust 1.89 or newer:
 cargo install --git https://github.com/Dione-b/sororewind
 ```
 
-`sororewind --version` prints the Stellar protocol and host version the build
-replays.
+Each build replays the Stellar protocols of the Soroban hosts it embeds:
+currently 29 and 30, so it covers testnet and mainnet across an upgrade, when
+testnet runs the new protocol weeks before mainnet. `sororewind --version`
+lists them.
 
 ## Quick start
 
@@ -186,10 +188,11 @@ Some transactions cannot be replayed at all. sororewind exits `1` and explains
 why:
 
 - **Too old.** The RPC no longer has the transaction or the ledger it ran in.
-- **Another protocol version.** The host refuses to execute a ledger from a
-  different protocol. Each build replays one protocol, shown by
-  `sororewind --version`; the error names the host version you would need. Testnet upgrades before mainnet, so between the two upgrades a build
-  replays only one of them.
+- **Another protocol version.** Each Soroban host refuses to execute a ledger
+  from any protocol but its own, and a build embeds the hosts for the
+  previous and the current protocol (`sororewind --version`). A transaction
+  from any other protocol is refused; the error names the host version you
+  would need.
 - **Failed before the host.** A transaction that stellar-core rejected during
   validation or fee processing ran no contract code, so there is nothing to
   replay.
@@ -265,7 +268,7 @@ cargo run --example record_fixture -- contract-error <TX_HASH>
 By default `record_fixture` keeps a recording only if it replays as a match
 (`--allow-diverged` keeps a divergence on purpose), and it never replaces a
 working fixture with a failed one. Without arguments it re-records every
-fixture from the hash it was made for, which only works while the RPC still
+fixture from the hash and network it was made for, which only works while the RPC still
 has those transactions.
 
 A new fixture also needs a line in the `fixtures!` list in
@@ -278,11 +281,13 @@ Each fixture comes from a `find_failed` category:
 |---------|-----------------|
 | `auth-error`, `budget-error`, `contract-error`, `storage-error` | A transaction of that category. For `budget-error`, pick one whose result is `resource limit exceeded`: `insufficient refundable fee` does not replay (see [Why a replay can diverge](#why-a-replay-can-diverge)). |
 | `auth-check-auth` | An `auth-error` whose call tree, from `sororewind <TX_HASH>`, shows a `__check_auth` call: a custom account contract rejected the signature. |
+| `mainnet-*` | A mainnet transaction, recorded with `--network mainnet`, that keeps the older embedded host covered while mainnet runs the previous protocol. |
 
 Recorded fixtures keep working offline indefinitely. Re-record them when:
 
-- the Stellar protocol, and with it `soroban-env-host`, is bumped: a fixture
-  only replays on the protocol it was recorded on;
+- a protocol is dropped from the embedded hosts: its fixtures no longer
+  replay. When a host is added, record fixtures for the new protocol and keep
+  the others until their host goes;
 - the fixture layout changes, which bumps `FIXTURE_VERSION` in
   `src/transport.rs`, and old fixtures fail with "re-record it";
 - testnet is reset.

@@ -19,7 +19,7 @@ use crate::rpc::{RawTransaction, RpcClient, TxStatus};
 use crate::state::{self, LedgerContext, Reconstructed};
 use crate::story::{Failure, Story};
 use crate::tx::{self, DecodedTx};
-use crate::{spec, strkey, HOST_VERSION};
+use crate::{host, spec, strkey};
 
 /// What to replay.
 #[derive(Debug, Clone)]
@@ -101,18 +101,16 @@ async fn fetch(rpc: &RpcClient, request: &Request) -> Result<Fetched> {
     }
 }
 
-/// The host hard-rejects any ledger whose protocol differs from its own, so
+/// Each host hard-rejects any ledger whose protocol differs from its own, so
 /// checking here turns a cryptic host error into an actionable sentence.
 fn guard_protocol(tx: &DecodedTx, ledger: &LedgerContext, network: &NetworkId) -> Result<()> {
-    let host_protocol = crate::host_protocol();
-    if ledger.protocol == host_protocol {
+    if host::for_protocol(ledger.protocol).is_some() {
         return Ok(());
     }
     Err(RewindError::ProtocolMismatch {
         hash: tx.hash.clone(),
         tx_protocol: ledger.protocol,
-        host_protocol,
-        host_version: HOST_VERSION,
+        supported: host::describe(),
         network: network.clone(),
     })
 }

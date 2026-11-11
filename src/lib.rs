@@ -22,6 +22,7 @@ pub mod discover;
 pub mod display;
 pub mod error;
 pub mod hash;
+pub mod host;
 pub mod network;
 pub mod pipeline;
 pub mod render;
@@ -50,15 +51,6 @@ pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
 /// The replay ran but disagreed with the network.
 pub const EXIT_DIVERGED: u8 = 2;
-
-/// Version of the embedded `soroban-env-host`.
-pub const HOST_VERSION: &str = soroban_env_host::VERSION.pkg;
-
-/// The one Stellar protocol version this build can replay: the embedded host
-/// refuses to execute a ledger of any other.
-pub fn host_protocol() -> u32 {
-    soroban_env_host::meta::INTERFACE_VERSION.protocol
-}
 
 /// The process exit code for a finished run.
 pub fn exit_code(result: &Result<Report>) -> u8 {

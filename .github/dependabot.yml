@@ -4,13 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # stellar-xdr and soroban-env-host move in lockstep with the protocol
-    # (see Cargo.toml); bump their major versions by hand.
+    # The embedded hosts and their stellar-xdr are pinned exactly, one host
+    # per protocol; they change only with a protocol upgrade (CONTRIBUTING.md,
+    # "Protocol upgrades").
     ignore:
       - dependency-name: stellar-xdr
-        update-types: [version-update:semver-major]
       - dependency-name: soroban-env-host
-        update-types: [version-update:semver-major]
   - package-ecosystem: github-actions
     directory: /
     schedule:

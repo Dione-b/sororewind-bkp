@@ -17,10 +17,15 @@ clap = { version = "4.6", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
-# Protocol lockstep: these two move together, and their major version is the
-# Stellar protocol version this build can replay. See CONTRIBUTING.md.
-stellar-xdr = { version = "30.0.0" }
-soroban-env-host = { version = "30.0.0" }
+# One Soroban host per protocol this build replays, at most two at a time
+# (the previous and the current one). Each host's major version is the
+# protocol it executes; pin them exactly, as stellar-core does. `stellar-xdr`
+# follows the newest host: the code outside `src/host/` uses only its types,
+# and talks to older hosts in XDR bytes. See CONTRIBUTING.md, "Protocol
+# upgrades".
+stellar-xdr = { version = "=30.0.0" }
+soroban-env-host-p29 = { package = "soroban-env-host", version = "=29.0.2" }
+soroban-env-host-p30 = { package = "soroban-env-host", version = "=30.0.0" }
 owo-colors = "4"
 thiserror = "2"
 log = "0.4"
