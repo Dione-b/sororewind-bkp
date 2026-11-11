@@ -1,0 +1,2 @@
+# Snapshots and fixtures are compared byte for byte; keep LF on every OS.
+* text=auto eol=lf
