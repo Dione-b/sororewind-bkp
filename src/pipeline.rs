@@ -17,7 +17,7 @@ use crate::report::{
 };
 use crate::rpc::{RawTransaction, RpcClient, TxStatus};
 use crate::state::{self, LedgerContext, Reconstructed};
-use crate::story::{Failure, Story};
+use crate::story::Story;
 use crate::tx::{self, DecodedTx};
 use crate::{host, spec, strkey};
 use stellar_xdr::{ConfigSettingId, InvokeHostFunctionResult};
@@ -116,7 +116,8 @@ fn guard_protocol(tx: &DecodedTx, ledger: &LedgerContext, network: &NetworkId) -
     })
 }
 
-/// Build the call tree and, for a contract error, give the number its name.
+/// Build the call tree and give the contract error behind the failure, the
+/// fatal one or the one a host error wraps, its name.
 async fn narrate(
     rpc: &RpcClient,
     request: &Request,
@@ -124,11 +125,49 @@ async fn narrate(
     outcome: &ReplayOutcome,
 ) -> Result<Story> {
     let mut story = Story::build(&outcome.diagnostics, outcome.error.as_ref());
-    let Some(code) = story.failure.as_ref().and_then(|f| f.contract_code) else {
+    let Some(failure) = &story.failure else {
         return Ok(story);
     };
+    // The contract the error was raised in, falling back to the outermost
+    // call when the failure happened before any frame opened.
+    let (code, contract) = match (&failure.cause, failure.contract_code) {
+        (Some(cause), _) => (cause.contract_code, cause.contract.clone()),
+        (None, Some(code)) => (code, failure.contract.clone()),
+        (None, None) => return Ok(story),
+    };
+    let contract = contract.or_else(|| story.calls.first().and_then(|call| call.contract.clone()));
 
-    let (wasm, changed_since) = match &request.wasm_debug {
+    let Some(found) = error_name(rpc, request, state, contract.as_deref(), code).await? else {
+        return Ok(story);
+    };
+    if let Some(failure) = &mut story.failure {
+        match &mut failure.cause {
+            Some(cause) => {
+                cause.name = Some(found.name);
+                cause.name_origin = Some(found.origin);
+            }
+            None => {
+                failure.name = Some(found.name);
+                failure.name_origin = Some(found.origin);
+            }
+        }
+    }
+    Ok(story)
+}
+
+/// The name `contract` declares for error `code`, and where it was read from.
+///
+/// The contract's code is usually already in the footprint; when it is not, it
+/// costs two extra `getLedgerEntries` calls, which is still cheap next to the
+/// value of printing `InsufficientBalance` instead of `#3`.
+async fn error_name(
+    rpc: &RpcClient,
+    request: &Request,
+    state: &Reconstructed,
+    contract: Option<&str>,
+    code: u32,
+) -> Result<Option<spec::ErrorName>> {
+    let (names, source) = match &request.wasm_debug {
         Some(path) => {
             let wasm = tokio::fs::read(path)
                 .await
@@ -136,61 +175,46 @@ async fn narrate(
                     path: path.clone(),
                     source,
                 })?;
-            (wasm, false)
+            (
+                spec::from_wasm(&wasm),
+                format!(", from --wasm-debug {}", path.display()),
+            )
         }
-        None => match failing_contract_wasm(rpc, state, &story).await {
-            Some(contract) => (contract.wasm, contract.changed_since),
-            None => return Ok(story),
-        },
-    };
-
-    // A contract without a readable spec still has a number; not an error.
-    match spec::from_wasm(&wasm) {
-        Ok(names) => {
-            if let Some(failure) = &mut story.failure {
-                failure.name = names.name(code).map(str::to_string);
+        None => {
+            let Some(contract_id) = contract.and_then(strkey::parse_contract) else {
+                return Ok(None);
+            };
+            match spec::contract_wasm(rpc, state, &contract_id).await {
+                Ok(spec::ContractCode::StellarAsset) => {
+                    (Ok(spec::stellar_asset_contract()), String::new())
+                }
                 // The name is read from the code the contract has now.
-                failure.name_origin = match (names.origin, changed_since) {
-                    (Some(origin), true) => Some(format!(
-                        "{origin}, read from code that changed after the transaction: the \
-                         name may not be the one this error had"
-                    )),
-                    (origin, _) => origin,
-                };
+                Ok(spec::ContractCode::Wasm(contract)) if contract.changed_since => (
+                    spec::from_wasm(&contract.wasm),
+                    ", read from code that changed after the transaction: the name may not be \
+                     the one this error had"
+                        .to_string(),
+                ),
+                Ok(spec::ContractCode::Wasm(contract)) => (
+                    spec::from_wasm(&contract.wasm),
+                    ", from the contract's code on the ledger".to_string(),
+                ),
+                Err(err) => {
+                    log::debug!(target: "spec", "{err}");
+                    return Ok(None);
+                }
             }
         }
-        Err(err) => log::debug!(target: "spec", "{err}"),
-    }
-    Ok(story)
-}
-
-/// The WASM of the contract the error was raised in, falling back to the
-/// outermost call when the failure happened before any frame opened.
-///
-/// The contract's code is usually already in the footprint; when it is not, it
-/// costs two extra `getLedgerEntries` calls, which is still cheap next to the
-/// value of printing `InsufficientBalance` instead of `#3`.
-async fn failing_contract_wasm(
-    rpc: &RpcClient,
-    state: &Reconstructed,
-    story: &Story,
-) -> Option<spec::ContractWasm> {
-    let contract = story
-        .failure
-        .as_ref()
-        .and_then(|failure: &Failure| failure.contract.as_deref())
-        .or_else(|| {
-            story
-                .calls
-                .first()
-                .and_then(|call| call.contract.as_deref())
-        })?;
-    let contract_id = strkey::parse_contract(contract)?;
-    match spec::contract_wasm(rpc, state, &contract_id).await {
-        Ok(wasm) => Some(wasm),
+    };
+    // A contract without a readable spec still has a number; not an error.
+    match names {
+        Ok(names) => Ok(names.lookup(code).map(|found| spec::ErrorName {
+            origin: format!("{}{source}", found.origin),
+            ..found
+        })),
         Err(err) => {
             log::debug!(target: "spec", "{err}");
-            None
+            Ok(None)
         }
     }
 }

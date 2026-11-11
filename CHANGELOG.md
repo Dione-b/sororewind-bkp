@@ -32,7 +32,17 @@ an incompatible change to the JSON bumps its `schemaVersion`.
   `restoredSince`.
 - `sororewind --version` shows the protocols and host versions it replays.
 
+- A host error raised in answer to a contract error (a custom account's
+  `__check_auth` rejecting a signature, for one) reports that contract error
+  as its cause, named from the contract's spec (`failure.cause` in JSON).
+- Stellar Asset Contract errors are named (`#10` is `BalanceError`).
+- `error` and `log` diagnostics keep their arguments: `message [arg, arg]`.
+
 ### Changed
+
+- `failure.nameOrigin` is only set when a name was found, and says where the
+  spec was read from (the ledger or `--wasm-debug`). A code declared by
+  several error enums lists every candidate.
 
 - The minimum supported Rust is 1.89.
 - `getLedgers` fetches one ledger instead of 50 (about 14 MB less per run).
@@ -43,6 +53,10 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 
 ### Fixed
 
+- The failure is attributed to the last escalation, not to an earlier error
+  with the same code that a `try_call` recovered from.
+- The call tree no longer nests later calls under a dead frame after a
+  recovered self-call.
 - A transaction in the ledger that upgraded the protocol or the base reserve
   is replayed under the previous values, as the network ran it.
 - A host failure while decoding its inputs is replayed as `trapped` or

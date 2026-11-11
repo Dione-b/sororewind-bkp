@@ -40,7 +40,8 @@ expression: json(&sample_report()).unwrap()
     "trail": [
       "balance too low",
       "escalating"
-    ]
+    ],
+    "cause": null
   },
   "calls": [
     {

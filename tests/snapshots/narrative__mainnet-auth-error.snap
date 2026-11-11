@@ -12,9 +12,9 @@ ledger 65424472 · protocol 29 · 2026-11-11 14:46:42 UTC
 
 where it broke
   auth error ExistingValue
-  "nonce already exists for address"
+  "nonce already exists for address [GBOT34TBVIIOXU3YIWU4ZA7H44EIXTUCHMNB6J5QMRKSU3M4R3HCDPLR]"
   in CBBMQBNHB2FYVZYV7VNHOJHUMTFJLR4PUMRVQYNW6RHIKZO2NQMIBUCV::swap (depth 0)
 
 call tree
 CBBMQBNHB2FYVZYV7VNHOJHUMTFJLR4PUMRVQYNW6RHIKZO2NQMIBUCV::swap(GBOT34TBVIIOXU3YIWU4ZA7H44EIXTUCHMNB6J5QMRKSU3M4R3HCDPLR, 0, 1, 64218578144, 9573121722)  ✗
-    · VM call trapped with HostError
+    · VM call trapped with HostError [swap, auth error ExistingValue]

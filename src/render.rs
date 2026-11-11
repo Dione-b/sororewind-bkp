@@ -234,8 +234,33 @@ fn where_it_broke(
             p.dim(&format!("in {location} (depth {})", failure.depth))
         )?;
     }
+    if let Some(cause) = &failure.cause {
+        let headline = match &cause.name {
+            Some(name) => format!("caused by {} · {name}", cause.description),
+            None => format!("caused by {}", cause.description),
+        };
+        writeln!(out, "  {}", p.red(&headline))?;
+        if !cause.message.is_empty() {
+            writeln!(out, "  {}", p.dim(&quoted(&cause.message)))?;
+        }
+        if let Some(contract) = &cause.contract {
+            let location = match &cause.function {
+                Some(function) => format!("{contract}::{function}"),
+                None => contract.clone(),
+            };
+            writeln!(
+                out,
+                "  {}",
+                p.dim(&format!("in {location} (depth {})", cause.depth))
+            )?;
+        }
+    }
     if detail >= Detail::Budget {
-        if let Some(origin) = &failure.name_origin {
+        let origin = failure
+            .name_origin
+            .as_ref()
+            .or(failure.cause.as_ref().and_then(|c| c.name_origin.as_ref()));
+        if let Some(origin) = origin {
             writeln!(out, "  {}", p.dim(&format!("name from {origin}")))?;
         }
     }

@@ -60,6 +60,7 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
     ]
   },
   "failure": {
+    "cause": null,
     "contract": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
     "contractCode": 10,
     "depth": 0,
@@ -67,11 +68,11 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
     "errorCode": null,
     "errorType": "contract",
     "function": "transfer",
-    "message": "resulting balance is not within the allowed range",
-    "name": null,
-    "nameOrigin": null,
+    "message": "resulting balance is not within the allowed range [10000000, -15000000100, 9223372036854775807]",
+    "name": "BalanceError",
+    "nameOrigin": "the Stellar Asset Contract's built-in errors",
     "trail": [
-      "resulting balance is not within the allowed range"
+      "resulting balance is not within the allowed range [10000000, -15000000100, 9223372036854775807]"
     ]
   },
   "feeBump": false,

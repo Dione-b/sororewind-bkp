@@ -525,17 +525,22 @@ pub fn decoded_tx() -> DecodedTx {
 
 // --- WASM -------------------------------------------------------------------
 
-/// A WASM binary made of the given `(section id, payload)` pairs. Payloads
-/// must be shorter than 128 bytes so their length fits one LEB128 byte.
+/// A WASM binary made of the given `(section id, payload)` pairs.
 pub fn wasm_with_sections(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
     let mut wasm = b"\0asm\x01\0\0\0".to_vec();
     for (id, payload) in sections {
-        assert!(
-            payload.len() < 128,
-            "test helper only writes one-byte lengths"
-        );
         wasm.push(*id);
-        wasm.push(payload.len() as u8);
+        // The length, as unsigned LEB128.
+        let mut length = payload.len();
+        loop {
+            let byte = (length & 0x7f) as u8;
+            length >>= 7;
+            if length == 0 {
+                wasm.push(byte);
+                break;
+            }
+            wasm.push(byte | 0x80);
+        }
         wasm.extend(payload);
     }
     wasm

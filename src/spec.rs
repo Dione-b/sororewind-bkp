@@ -20,21 +20,89 @@ use crate::state::Reconstructed;
 
 /// Contract-declared error names, keyed by the numeric code an
 /// `ScError::Contract(n)` carries.
+///
+/// A contract can declare several error enums (its own, and those of
+/// contracts it imports), and they may reuse numbers; every declaration is
+/// kept so an ambiguous code is reported as such rather than guessed.
 #[derive(Debug, Default, Clone)]
 pub struct ErrorNames {
-    names: HashMap<u32, String>,
-    /// Where the names came from, so a reader can tell a real lookup from an
-    /// absent spec.
-    pub origin: Option<String>,
+    /// Per code, each `(enum, case)` that declares it, in spec order.
+    names: HashMap<u32, Vec<(String, String)>>,
+    /// The names are the Stellar Asset Contract's, not read from a spec.
+    builtin: bool,
+}
+
+/// The name of one error code, and where it was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorName {
+    pub name: String,
+    pub origin: String,
 }
 
 impl ErrorNames {
-    pub fn name(&self, code: u32) -> Option<&str> {
-        self.names.get(&code).map(String::as_str)
+    /// The name declared for `code`. When several enums declare the code
+    /// under different names, all of them, qualified.
+    pub fn lookup(&self, code: u32) -> Option<ErrorName> {
+        match self.names.get(&code)?.as_slice() {
+            [] => None,
+            [(_, case)] if self.builtin => Some(ErrorName {
+                name: case.clone(),
+                origin: "the Stellar Asset Contract's built-in errors".to_string(),
+            }),
+            [(error_enum, case)] => Some(ErrorName {
+                name: case.clone(),
+                origin: format!("spec enum {error_enum}"),
+            }),
+            candidates => Some(ErrorName {
+                name: candidates
+                    .iter()
+                    .map(|(error_enum, case)| format!("{error_enum}::{case}"))
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                origin: format!(
+                    "{} spec enums that declare this code; which one raised it is not recorded",
+                    candidates.len()
+                ),
+            }),
+        }
+    }
+
+    pub fn name(&self, code: u32) -> Option<String> {
+        self.lookup(code).map(|found| found.name)
     }
 }
 
-/// Read the error enum out of a WASM's `contractspecv0` custom section.
+/// The errors of the built-in Stellar Asset Contract, which has no WASM and
+/// so no spec: `ContractError` in soroban-env-host's
+/// `builtin_contracts/contract_error.rs`, identical in hosts 29.0.2 and
+/// 30.0.0 (checked 2026-11-11). Review it with each protocol upgrade.
+pub fn stellar_asset_contract() -> ErrorNames {
+    const ERRORS: [(u32, &str); 14] = [
+        (2, "OperationNotSupportedError"),
+        (3, "AlreadyInitializedError"),
+        (4, "UnauthorizedError"),
+        (5, "AuthenticationError"),
+        (6, "AccountMissingError"),
+        (7, "AccountIsNotClassic"),
+        (8, "NegativeAmountError"),
+        (9, "AllowanceError"),
+        (10, "BalanceError"),
+        (11, "BalanceDeauthorizedError"),
+        (12, "OverflowError"),
+        (13, "TrustlineMissingError"),
+        (14, "InsufficientAccountReserve"),
+        (15, "TooManyAccountSubentries"),
+    ];
+    ErrorNames {
+        names: ERRORS
+            .iter()
+            .map(|(code, name)| (*code, vec![("ContractError".to_string(), name.to_string())]))
+            .collect(),
+        builtin: true,
+    }
+}
+
+/// Read the error enums out of a WASM's `contractspecv0` custom section.
 ///
 /// The section is a bare stream of `ScSpecEntry` XDR values with no framing,
 /// so it is decoded entry by entry until the bytes run out.
@@ -51,15 +119,22 @@ pub fn from_wasm(wasm: &[u8]) -> Result<ErrorNames> {
         },
     );
 
-    let mut names = HashMap::new();
-    let mut enum_name = None;
+    let mut names: HashMap<u32, Vec<(String, String)>> = HashMap::new();
     for entry in ScSpecEntry::read_xdr_iter(&mut reader) {
         let entry = entry
             .map_err(|e| missing(format!("the `contractspecv0` section is malformed: {e}")))?;
         if let ScSpecEntry::UdtErrorEnumV0(error_enum) = entry {
-            enum_name = Some(String::from_utf8_lossy(&error_enum.name).into_owned());
+            let enum_name = String::from_utf8_lossy(&error_enum.name).into_owned();
             for case in error_enum.cases.iter() {
-                names.insert(case.value, String::from_utf8_lossy(&case.name).into_owned());
+                let declared = (
+                    enum_name.clone(),
+                    String::from_utf8_lossy(&case.name).into_owned(),
+                );
+                let known = names.entry(case.value).or_default();
+                // The same enum imported twice is one declaration.
+                if !known.contains(&declared) {
+                    known.push(declared);
+                }
             }
         }
     }
@@ -72,7 +147,7 @@ pub fn from_wasm(wasm: &[u8]) -> Result<ErrorNames> {
 
     Ok(ErrorNames {
         names,
-        origin: enum_name.map(|name| format!("spec enum {name}")),
+        builtin: false,
     })
 }
 
@@ -132,6 +207,14 @@ fn leb128_u32(bytes: &[u8]) -> Option<(u32, usize)> {
     None
 }
 
+/// What executes a contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractCode {
+    Wasm(ContractWasm),
+    /// The built-in Stellar Asset Contract: no WASM, no spec.
+    StellarAsset,
+}
+
 /// A contract's WASM as the ledger has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractWasm {
@@ -149,7 +232,7 @@ pub async fn contract_wasm(
     rpc: &RpcClient,
     state: &Reconstructed,
     contract_id: &ContractId,
-) -> Result<ContractWasm> {
+) -> Result<ContractCode> {
     let instance_key = LedgerKey::ContractData(LedgerKeyContractData {
         contract: ScAddress::Contract(contract_id.clone()),
         key: ScVal::LedgerKeyContractInstance,
@@ -168,10 +251,7 @@ pub async fn contract_wasm(
         });
     };
     let ContractExecutable::Wasm(hash) = instance.executable else {
-        return Err(RewindError::SpecMissing {
-            reason: "this contract has no WASM of its own (it is a built-in asset contract)"
-                .to_string(),
-        });
+        return Ok(ContractCode::StellarAsset);
     };
 
     let code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash });
@@ -181,10 +261,10 @@ pub async fn contract_wasm(
             reason: "the contract's code entry does not hold contract code",
         });
     };
-    Ok(ContractWasm {
+    Ok(ContractCode::Wasm(ContractWasm {
         wasm: code.code.to_vec(),
         changed_since: instance_changed || code_changed,
-    })
+    }))
 }
 
 /// Look a ledger entry up in the reconstructed footprint first, and only go to
@@ -345,10 +425,49 @@ mod tests {
         let section = spec_section("Error", &[("NotFound", 1), ("AlreadyProcessed", 13)]);
         let wasm = wasm_with_sections(&[(0, [&[14u8][..], b"contractspecv0", &section].concat())]);
         let names = from_wasm(&wasm).unwrap();
-        assert_eq!(names.name(13), Some("AlreadyProcessed"));
-        assert_eq!(names.name(1), Some("NotFound"));
+        assert_eq!(names.name(13).as_deref(), Some("AlreadyProcessed"));
         assert_eq!(names.name(2), None);
-        assert_eq!(names.origin.as_deref(), Some("spec enum Error"));
+        assert_eq!(
+            names.lookup(1),
+            Some(ErrorName {
+                name: "NotFound".to_string(),
+                origin: "spec enum Error".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn several_error_enums_are_kept_apart() {
+        let section = [
+            spec_section("Error", &[("NotFound", 1), ("Paused", 2)]),
+            spec_section("Pool", &[("Empty", 1)]),
+            // The same enum imported a second time declares nothing new.
+            spec_section("Error", &[("NotFound", 1)]),
+        ]
+        .concat();
+        let wasm = wasm_with_sections(&[(0, [&[14u8][..], b"contractspecv0", &section].concat())]);
+        let names = from_wasm(&wasm).unwrap();
+
+        // Each unambiguous code names the enum it came from, not the last one.
+        assert_eq!(names.lookup(2).unwrap().origin, "spec enum Error");
+        // A shared code lists every candidate instead of picking one.
+        let shared = names.lookup(1).unwrap();
+        assert_eq!(shared.name, "Error::NotFound or Pool::Empty");
+        assert!(
+            shared.origin.starts_with("2 spec enums"),
+            "{}",
+            shared.origin
+        );
+    }
+
+    #[test]
+    fn the_stellar_asset_contract_has_builtin_names() {
+        let names = stellar_asset_contract();
+        let balance = names.lookup(10).unwrap();
+        assert_eq!(balance.name, "BalanceError");
+        assert!(balance.origin.contains("Stellar Asset Contract"));
+        assert_eq!(names.name(1), None, "reserved");
+        assert_eq!(names.name(16), None);
     }
 
     #[test]

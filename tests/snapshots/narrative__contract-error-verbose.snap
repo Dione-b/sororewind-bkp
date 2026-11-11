@@ -10,9 +10,10 @@ ledger 5672381 · protocol 30 · 2026-11-11 08:25:48 UTC
   local     trapped
 
 where it broke
-  contract error #10
-  "resulting balance is not within the allowed range"
+  contract error #10 · BalanceError
+  "resulting balance is not within the allowed range [10000000, -15000000100, 9223372036854775807]"
   in CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer (depth 0)
+  name from the Stellar Asset Contract's built-in errors
 
 call tree
 CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer(GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000)  ✗

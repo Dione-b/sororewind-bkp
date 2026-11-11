@@ -154,7 +154,7 @@ main fields:
 | `hash`, `network`, `ledger`, `protocol`, `closeTime` | Which transaction ran, and where. |
 | `fidelity.match`, `fidelity.divergence` | Whether the replay matched, and if not, how it diverged. |
 | `result.onchain`, `result.local` | Each side's result, as `{ code, resultHash }`. |
-| `failure` | The error that ended the transaction, with the contract, function and depth it came from; `null` when there is none. |
+| `failure` | The error that ended the transaction, with the contract, function and depth it came from; `null` when there is none. `failure.cause` is the contract error a host error was raised in answer to, when there is one. |
 | `calls` | The call tree, one entry per call, with arguments, return value and logs. |
 | `budget`, `footprint`, `prngSeed` | Resource use, the footprint and its drift, and how the random-number seed was obtained. |
 | `diagnostics` | The raw on-chain and local diagnostic events. |
