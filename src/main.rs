@@ -42,8 +42,25 @@ fn init_logging(verbose: u8) {
 }
 
 async fn run(cli: &Cli) -> Result<Report> {
-    let (rpc, request) = cli.connect().await?;
-    sororewind::run(&rpc, &request).await
+    let connection = cli.connect().await?;
+    let result = sororewind::run(&connection.rpc, &connection.request).await;
+    if let Some(recording) = &connection.recording {
+        // Only a run that got as far as a report is a fixture worth having:
+        // anything else would replay as a different error, or as another
+        // transaction's leftovers.
+        match &result {
+            Ok(_) => recording.commit().await?,
+            Err(_) => {
+                recording.discard().await;
+                log::warn!(
+                    target: "record",
+                    "the run failed, so nothing was recorded; {} is unchanged",
+                    recording.target().display()
+                );
+            }
+        }
+    }
+    result
 }
 
 #[tokio::main]

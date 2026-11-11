@@ -77,6 +77,14 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 
 ### Fixed
 
+- `--record` stages the recording and moves it into place in one step once
+  the replay has run: an existing fixture is replaced whole or left alone,
+  never mixed with another transaction's files, and files are written
+  atomically.
+- `record_fixture` no longer collides on, or leaves behind, a visible backup
+  directory; it keeps the real I/O error, skips stray directories, and can
+  re-record a fixture made on a custom network (with `--rpc-url`).
+- `find_failed` checks the RPC's passphrase against `--network`.
 - `--fixture <dir> <hash>` with a hash the fixture was not recorded for says
   so; a mistyped `--fixture` path is reported as a missing directory instead
   of "recorded for a different transaction".

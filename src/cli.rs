@@ -11,7 +11,7 @@ use crate::network::Network;
 use crate::pipeline::Request;
 use crate::render::ColorChoice;
 use crate::rpc::RpcClient;
-use crate::transport::{FixtureTransport, HttpTransport, Recording};
+use crate::transport::{FixtureTransport, HttpTransport, Recording, RecordingHandle};
 
 /// Replay a failed Soroban transaction locally and narrate the call tree.
 #[derive(Debug, Parser)]
@@ -76,7 +76,9 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub fixture: Option<PathBuf>,
 
-    /// Write every RPC response into this directory while running
+    /// Record the run's RPC responses as a fixture in this directory. It is
+    /// written in one step once the replay has run; a run that fails leaves
+    /// the directory as it was
     #[arg(long, value_name = "DIR", hide = true, conflicts_with = "fixture")]
     pub record: Option<PathBuf>,
 }
@@ -90,6 +92,15 @@ static VERSION: LazyLock<String> = LazyLock::new(|| {
         crate::host::describe()
     )
 });
+
+/// Where the responses come from, what to replay, and the recording being
+/// made of it, if any.
+pub struct Connection {
+    pub rpc: RpcClient,
+    pub request: Request,
+    /// With `--record`: the staged recording, to commit once the run is over.
+    pub recording: Option<RecordingHandle>,
+}
 
 /// The environment variable that names the RPC endpoint when `--rpc-url` is
 /// not given.
@@ -184,7 +195,8 @@ impl Cli {
 
     /// Open the source of RPC responses the arguments ask for, and work out
     /// which transaction to replay.
-    pub async fn connect(&self) -> Result<(RpcClient, Request)> {
+    pub async fn connect(&self) -> Result<Connection> {
+        let mut recording = None;
         let (rpc, hash) = match &self.fixture {
             Some(dir) => {
                 let fixture = FixtureTransport::open(dir).await?;
@@ -218,20 +230,25 @@ impl Cli {
                     });
                 let http = HttpTransport::new(url)?;
                 let rpc = match &self.record {
-                    Some(dir) => RpcClient::new(Recording::create(http, dir, &hash).await?),
+                    Some(dir) => {
+                        let recorder = Recording::create(http, dir, &hash).await?;
+                        recording = Some(recorder.handle());
+                        RpcClient::new(recorder)
+                    }
                     None => RpcClient::new(http),
                 };
                 (rpc, hash)
             }
         };
-        Ok((
+        Ok(Connection {
             rpc,
-            Request {
+            request: Request {
                 hash,
                 network: self.network,
                 wasm_debug: self.wasm_debug.clone(),
             },
-        ))
+            recording,
+        })
     }
 }
 

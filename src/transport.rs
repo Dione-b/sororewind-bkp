@@ -438,39 +438,84 @@ impl Transport for FixtureTransport {
 
 /// Writes every response of the wrapped transport into a fixture directory.
 ///
+/// A recording is staged in a hidden sibling of its target (`.name.recording`
+/// next to `name`) and only becomes `name` when [`RecordingHandle::commit`] is
+/// called, in one rename. Until then an existing fixture at the target is
+/// untouched, so a run that fails halfway, or is interrupted, can neither
+/// destroy a working fixture nor leave one that mixes two transactions.
+///
 /// A recording that cannot be written is a failed run: a silently incomplete
 /// fixture is worse than no fixture.
 pub struct Recording<T> {
     inner: T,
-    dir: PathBuf,
+    state: std::sync::Arc<RecordingState>,
+}
+
+struct RecordingState {
+    target: PathBuf,
+    staging: PathBuf,
+    backup: PathBuf,
     entries: tokio::sync::Mutex<EntryStore>,
 }
 
+/// Decides what becomes of a [`Recording`] once the run it recorded is over.
+#[derive(Clone)]
+pub struct RecordingHandle(std::sync::Arc<RecordingState>);
+
 impl<T: Transport> Recording<T> {
     pub async fn create(inner: T, dir: impl Into<PathBuf>, hash: &TxHash) -> Result<Self> {
-        let dir = dir.into();
-        tokio::fs::create_dir_all(&dir)
+        let target: PathBuf = dir.into();
+        let name = target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                RewindError::record_path(&target)(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the directory has no name to record under",
+                ))
+            })?;
+        let parent = match target.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        // Hidden, and named after the whole target name, so `a.v1` and `a.v2`
+        // do not share a staging area and nothing mistakes it for a fixture.
+        let staging = parent.join(format!(".{name}.recording"));
+        let backup = parent.join(format!(".{name}.backup"));
+
+        // Whatever an interrupted run left behind is not worth keeping.
+        remove_dir_if_present(&staging).await?;
+        tokio::fs::create_dir_all(&staging)
             .await
-            .map_err(RewindError::record_path(&dir))?;
+            .map_err(RewindError::record_path(&staging))?;
         let manifest = FixtureManifest {
             version: FIXTURE_VERSION,
             hash: hash.to_string(),
         };
-        write_json(&dir.join(MANIFEST_FILE), &manifest).await?;
+        write_json(&staging.join(MANIFEST_FILE), &manifest).await?;
         Ok(Self {
             inner,
-            dir,
-            entries: tokio::sync::Mutex::new(EntryStore::default()),
+            state: std::sync::Arc::new(RecordingState {
+                target,
+                staging,
+                backup,
+                entries: tokio::sync::Mutex::new(EntryStore::default()),
+            }),
         })
     }
 
-    async fn record_entries(&self, params: &Value, text: &str) -> Result<()> {
+    /// The handle that commits or discards this recording.
+    pub fn handle(&self) -> RecordingHandle {
+        RecordingHandle(self.state.clone())
+    }
+
+    async fn record_entries(&self, params: &Value, text: &str) {
         let Ok(response) = serde_json::from_str::<Value>(text) else {
-            return Ok(());
+            return;
         };
-        // An error response is reported by the client; there is nothing to keep.
+        // An error response fails the run, and a failed run is not committed.
         let Some(result) = response.get("result") else {
-            return Ok(());
+            return;
         };
         let returned: BTreeMap<&str, &Value> = result["entries"]
             .as_array()
@@ -479,9 +524,8 @@ impl<T: Transport> Recording<T> {
             .filter_map(|e| Some((e.get("key")?.as_str()?, e)))
             .collect();
 
-        // Concurrent chunks merge into one store; the lock also serialises
-        // the writes so the file always holds a complete document.
-        let mut store = self.entries.lock().await;
+        // Concurrent chunks merge into one store, written once on commit.
+        let mut store = self.state.entries.lock().await;
         for key in requested_keys(params) {
             store
                 .entries
@@ -490,15 +534,12 @@ impl<T: Transport> Recording<T> {
         if let Some(latest) = result["latestLedger"].as_u64() {
             store.latest_ledger = store.latest_ledger.max(latest);
         }
-        write_json(&self.dir.join(ENTRIES_FILE), &*store).await
     }
-}
 
-impl<T> Recording<T> {
     /// The ledger keys recorded so far and the keys of their TTL entries,
     /// XDR-encoded: the entries whose history is worth keeping.
     async fn recorded_keys(&self) -> HashSet<Vec<u8>> {
-        let store = self.entries.lock().await;
+        let store = self.state.entries.lock().await;
         let mut keys = HashSet::new();
         for key in store.entries.keys() {
             let Ok(key) = crate::codec::b64_decode(key, "a ledger key") else {
@@ -511,19 +552,74 @@ impl<T> Recording<T> {
     }
 }
 
+impl RecordingHandle {
+    /// Where the recording ends up once committed.
+    pub fn target(&self) -> &Path {
+        &self.0.target
+    }
+
+    /// Make the recording the fixture at its target, replacing the one that
+    /// was there. The old fixture is only removed once the new one is in
+    /// place, and is put back if that fails.
+    pub async fn commit(&self) -> Result<()> {
+        let RecordingState {
+            target,
+            staging,
+            backup,
+            entries,
+        } = &*self.0;
+        {
+            let store = entries.lock().await;
+            // A recording that never reached `getLedgerEntries` has no store.
+            if !store.entries.is_empty() {
+                write_json(&staging.join(ENTRIES_FILE), &*store).await?;
+            }
+        }
+
+        remove_dir_if_present(backup).await?;
+        let had_old = match tokio::fs::rename(target, backup).await {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(RewindError::record_path(target)(e)),
+        };
+        if let Err(e) = tokio::fs::rename(staging, target).await {
+            if had_old {
+                let _ = tokio::fs::rename(backup, target).await;
+            }
+            let _ = tokio::fs::remove_dir_all(staging).await;
+            return Err(RewindError::record_path(target)(e));
+        }
+        if had_old {
+            remove_dir_if_present(backup).await?;
+        }
+        Ok(())
+    }
+
+    /// Throw the recording away; the fixture at the target stays as it was.
+    pub async fn discard(&self) {
+        let _ = tokio::fs::remove_dir_all(&self.0.staging).await;
+    }
+}
+
+async fn remove_dir_if_present(dir: &Path) -> Result<()> {
+    match tokio::fs::remove_dir_all(dir).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(RewindError::record_path(dir)(e)),
+    }
+}
+
 impl<T: Transport> Transport for Recording<T> {
     fn request<'a>(&'a self, method: &'a str, params: &'a Value) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let text = self.inner.request(method, params).await?;
             if method == "getLedgerEntries" {
-                self.record_entries(params, &text).await?;
+                self.record_entries(params, &text).await;
             } else {
-                let path = self.dir.join(response_file(method, params));
+                let path = self.state.staging.join(response_file(method, params));
                 log::debug!(target: "record", "{method} → {}", path.display());
                 let keep = self.recorded_keys().await;
-                tokio::fs::write(&path, slim(method, &text, &keep))
-                    .await
-                    .map_err(RewindError::record_path(&path))?;
+                write_atomically(&path, slim(method, &text, &keep).as_bytes()).await?;
             }
             Ok(text)
         })
@@ -539,7 +635,19 @@ async fn write_json<V: Serialize>(path: &Path, value: &V) -> Result<()> {
     let mut text = serde_json::to_string_pretty(value)
         .map_err(|e| RewindError::record_path(path)(std::io::Error::other(e)))?;
     text.push('\n');
-    tokio::fs::write(path, text)
+    write_atomically(path, text.as_bytes()).await
+}
+
+/// Write a file whole or not at all: to a temporary name, then renamed over
+/// the destination, so an interrupted run never leaves truncated JSON.
+async fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .map_err(RewindError::record_path(path))?;
+    tokio::fs::rename(&temporary, path)
         .await
         .map_err(RewindError::record_path(path))
 }
@@ -874,7 +982,8 @@ mod tests {
                     {"key": "k3", "xdr": "e3"},
                 ]}}),
             );
-        let recording = Recording::create(live, dir.path(), &hash()).await.unwrap();
+        let target = dir.path().join("rec");
+        let recording = Recording::create(live, &target, &hash()).await.unwrap();
 
         recording.request("getNetwork", &json!({})).await.unwrap();
         // Recorded as two chunks...
@@ -887,11 +996,20 @@ mod tests {
             .await
             .unwrap();
 
-        let manifest = FixtureManifest::load(dir.path()).await.unwrap();
+        // Nothing exists at the target until the recording is committed.
+        assert!(!target.exists());
+        recording.handle().commit().await.unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, ["rec"], "no staging or backup directory is left");
+
+        let manifest = FixtureManifest::load(&target).await.unwrap();
         assert_eq!(manifest.tx_hash().unwrap(), hash());
 
         // ...and replayed as one.
-        let fixture = FixtureTransport::open(dir.path()).await.unwrap();
+        let fixture = FixtureTransport::open(&target).await.unwrap();
         let text = fixture
             .request("getLedgerEntries", &json!({"keys": ["k3", "k2", "k1"]}))
             .await
@@ -937,10 +1055,13 @@ mod tests {
             "{err}"
         );
 
-        Recording::create(MemoryTransport::new(), dir.path(), &hash())
+        let recording = Recording::create(MemoryTransport::new(), dir.path().join("rec"), &hash())
             .await
             .unwrap();
-        let fixture = FixtureTransport::open(dir.path()).await.unwrap();
+        recording.handle().commit().await.unwrap();
+        let fixture = FixtureTransport::open(dir.path().join("rec"))
+            .await
+            .unwrap();
         let err = fixture
             .request("getLedgerEntries", &json!({"keys": ["never-recorded"]}))
             .await
@@ -971,8 +1092,8 @@ mod tests {
         let recording = Recording::create(live, dir.path().join("rec"), &hash())
             .await
             .unwrap();
-        // Pull the directory out from under the recorder.
-        tokio::fs::remove_dir_all(dir.path().join("rec"))
+        // Pull the staging directory out from under the recorder.
+        tokio::fs::remove_dir_all(dir.path().join(".rec.recording"))
             .await
             .unwrap();
         let err = recording
@@ -980,5 +1101,107 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RewindError::RecordIo { .. }), "{err}");
+        // The real cause is kept, not replaced by a generic sentence.
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    async fn record(target: &Path, hash: &TxHash, passphrase: &str) -> RecordingHandle {
+        let live = MemoryTransport::new()
+            .on("getNetwork", &json!({"result": {"passphrase": passphrase}}))
+            .on(
+                "getLedgerEntries",
+                &json!({"result": {"entries": [{"key": passphrase, "xdr": "e"}]}}),
+            );
+        let recording = Recording::create(live, target, hash).await.unwrap();
+        recording.request("getNetwork", &json!({})).await.unwrap();
+        recording
+            .request("getLedgerEntries", &json!({"keys": [passphrase]}))
+            .await
+            .unwrap();
+        recording.handle()
+    }
+
+    async fn recorded_passphrase(target: &Path) -> String {
+        let fixture = FixtureTransport::open(target).await.unwrap();
+        let text = fixture.request("getNetwork", &json!({})).await.unwrap();
+        let response: Value = serde_json::from_str(&text).unwrap();
+        response["result"]["passphrase"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_recording_replaces_a_fixture_whole_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fixture.v1");
+        let other: TxHash = "cd".repeat(32).parse().unwrap();
+
+        record(&target, &hash(), "old")
+            .await
+            .commit()
+            .await
+            .unwrap();
+        // A file only the old recording has.
+        std::fs::write(target.join("getHealth.json"), "{}").unwrap();
+
+        // A second recording that is abandoned leaves the old fixture alone.
+        let abandoned = record(&target, &other, "abandoned").await;
+        assert_eq!(recorded_passphrase(&target).await, "old");
+        abandoned.discard().await;
+        assert_eq!(recorded_passphrase(&target).await, "old");
+        assert!(!dir.path().join(".fixture.v1.recording").exists());
+
+        // A committed one replaces it entirely: nothing of the old one is left
+        // to be mixed with the new transaction's responses.
+        record(&target, &other, "new").await.commit().await.unwrap();
+        assert_eq!(recorded_passphrase(&target).await, "new");
+        let fixture = FixtureTransport::open(&target).await.unwrap();
+        assert_eq!(fixture.tx_hash().unwrap(), other);
+        assert!(!target.join("getHealth.json").exists());
+        assert!(fixture
+            .request("getLedgerEntries", &json!({"keys": ["old"]}))
+            .await
+            .is_err());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["fixture.v1"]);
+        // No temporary file survives inside the fixture either.
+        assert!(std::fs::read_dir(&target).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+    }
+
+    #[tokio::test]
+    async fn stale_staging_and_backup_directories_do_not_get_in_the_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.v2");
+        // What an interrupted run leaves behind, with a file from another
+        // transaction in it.
+        for stale in [".a.v2.recording", ".a.v2.backup"] {
+            std::fs::create_dir(dir.path().join(stale)).unwrap();
+            std::fs::write(dir.path().join(stale).join("getHealth.json"), "{}").unwrap();
+        }
+        // A fixture whose name differs only after the dot is not disturbed.
+        record(&dir.path().join("a.v1"), &hash(), "v1")
+            .await
+            .commit()
+            .await
+            .unwrap();
+
+        record(&target, &hash(), "v2").await.commit().await.unwrap();
+        assert_eq!(recorded_passphrase(&target).await, "v2");
+        assert!(!target.join("getHealth.json").exists());
+        assert_eq!(recorded_passphrase(&dir.path().join("a.v1")).await, "v1");
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.v1", "a.v2"]);
     }
 }
