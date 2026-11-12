@@ -57,7 +57,8 @@
 //!   rebuilt as well. The scan runs whenever current state cannot rule such
 //!   changes out (see [`rebuild`]), and stops early once every drifted entry
 //!   and every watched TTL or missing entry has its first later change, or at
-//!   the RPC's latest ledger.
+//!   the RPC's latest ledger. Its pages are requested together, so the window
+//!   costs about one round trip.
 //! - **Backward**, for entries not written again that soon: the entry's
 //!   current `lastModifiedLedgerSeq` names the ledger of its *last* change,
 //!   whose `state` record names the ledger of the one before, and so on. The
@@ -88,6 +89,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use stellar_xdr::{
@@ -559,10 +561,23 @@ pub async fn rebuild(
         return rebuild;
     };
 
-    // Forward: the ledgers right after the transaction, in order.
+    // Forward: the ledgers right after the transaction, in order. Every page
+    // is requested at once and read in order: the scan rarely stops early
+    // (a watched TTL seldom changes), so pages one after another would cost
+    // a round trip each for nothing. Those past an early stop are dropped.
     let mut tracker = Tracker::new(key_xdr);
     let mut next = target.ledger;
     let window_end = target.ledger.saturating_add(FORWARD_LEDGERS);
+    let starts: Vec<u32> = (target.ledger..window_end)
+        .step_by(FORWARD_PAGE as usize)
+        .collect();
+    let in_flight = starts.len();
+    let mut pages = stream::iter(starts)
+        .map(|start| async move {
+            let limit = FORWARD_PAGE.min(window_end - start);
+            (limit, rpc.get_ledgers(start, limit).await)
+        })
+        .buffered(in_flight);
     // Why the transaction's own ledger could not be read, when it could not.
     let mut own_ledger_failure = None;
     'forward: while next < window_end {
@@ -579,8 +594,11 @@ pub async fn rebuild(
         if !drift_pending && !watch_pending {
             break;
         }
-        let limit = FORWARD_PAGE.min(window_end - next);
-        let ledgers = match rpc.get_ledgers(next, limit).await {
+        // Pages are whole and in order, so this one starts at `next`.
+        let Some((limit, ledgers)) = pages.next().await else {
+            break;
+        };
+        let ledgers = match ledgers {
             Ok(ledgers) => ledgers,
             Err(err) => {
                 log::debug!(target: "replay", "ledger metadata from {next}: {err}");
@@ -616,6 +634,8 @@ pub async fn rebuild(
             next = expected + 1;
         }
     }
+    // Cancel the pages the scan stopped short of.
+    drop(pages);
     // `next` is the first ledger the forward scan did not cover.
     let covered_until = next;
 
@@ -792,7 +812,13 @@ mod tests {
     /// An RPC that serves the given ledgers' changes, in the form fixtures
     /// keep them, and nothing past `latest`.
     fn rpc(ledgers: Vec<(u32, Groups)>, latest: u32) -> (RpcClient, crate::test_support::Calls) {
-        let transport = MemoryTransport::new().on_fn("getLedgers", move |params| {
+        let transport = serving(ledgers, latest);
+        let calls = transport.calls();
+        (RpcClient::new(transport), calls)
+    }
+
+    fn serving(ledgers: Vec<(u32, Groups)>, latest: u32) -> MemoryTransport {
+        MemoryTransport::new().on_fn("getLedgers", move |params| {
             let start = params["startLedger"].as_u64().unwrap() as u32;
             let limit = params["pagination"]["limit"].as_u64().unwrap() as u32;
             let served: Vec<Value> = (start..start + limit)
@@ -816,9 +842,7 @@ mod tests {
                 })
                 .collect();
             json!({"result": {"ledgers": served}})
-        });
-        let calls = transport.calls();
-        (RpcClient::new(transport), calls)
+        })
     }
 
     async fn rebuild_one(
@@ -863,12 +887,10 @@ mod tests {
             ),
             (N + 2, vec![(Phase::Operations, 0, update(&v1, &v2))]),
         ];
-        let (rpc, calls) = rpc(ledgers, N + 100);
+        let (rpc, _) = rpc(ledgers, N + 100);
         let (past, note) = rebuild_one(&rpc, &now, None).await;
         assert_eq!(past.value, Some(PastValue::Entry(Box::new(v1))));
         assert_eq!(note, None);
-        // One page was enough.
-        assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -987,13 +1009,55 @@ mod tests {
                 update(&ttl_entry(&now, N + 40), &ttl_entry(&now, N + 9_000)),
             )],
         )];
-        let (rpc, calls) = rpc(ledgers, N + 100);
+        let (rpc, _) = rpc(ledgers, N + 100);
         let (past, note) = rebuild_one(&rpc, &now, Some(N + 9_000)).await;
         assert_eq!(past.value, None);
         assert_eq!(past.live_until, Some(N + 40));
         assert_eq!(note, None);
-        // Two pages: the scan stops once the TTL's first later change is in.
-        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    /// A transport whose `getLedgers` calls are only answered once `pages`
+    /// of them are waiting: a scan that awaited each page before asking for
+    /// the next would wait forever.
+    struct AllAtOnce {
+        inner: MemoryTransport,
+        gate: tokio::sync::Barrier,
+    }
+
+    impl crate::transport::Transport for AllAtOnce {
+        fn request<'a>(
+            &'a self,
+            method: &'a str,
+            params: &'a Value,
+        ) -> crate::transport::BoxFuture<'a, Result<String>> {
+            Box::pin(async move {
+                if method == "getLedgers" {
+                    self.gate.wait().await;
+                }
+                self.inner.request(method, params).await
+            })
+        }
+
+        fn origin(&self) -> String {
+            self.inner.origin()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_forward_pages_are_requested_at_once() {
+        // A watched TTL that does not move keeps the scan going to the end.
+        let entry = data_entry([2; 32], Persistent, N - 9);
+        let rpc = RpcClient::new(AllAtOnce {
+            inner: serving(Vec::new(), N + 100),
+            gate: tokio::sync::Barrier::new(FORWARD_LEDGERS.div_ceil(FORWARD_PAGE) as usize),
+        });
+        let rebuilt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rebuild_one(&rpc, &entry, Some(N + 50)),
+        )
+        .await
+        .expect("the forward pages were requested one after another");
+        assert_eq!(rebuilt, (Past::default(), None));
     }
 
     #[tokio::test]
@@ -1046,6 +1110,8 @@ mod tests {
                 .collect()
         };
         let n = u64::from(N);
+        // This RPC answers at once, so a page is only requested once the scan
+        // reads on: the requests show where it stopped reading.
 
         // A page that stops short.
         let (short, calls) = rpc(Vec::new(), N + 5);
