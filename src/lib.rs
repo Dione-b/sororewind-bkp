@@ -43,7 +43,7 @@ mod test_support;
 pub use error::{Result, RewindError};
 pub use hash::TxHash;
 pub use network::Network;
-pub use pipeline::{run, Request};
+pub use pipeline::{Request, run};
 pub use report::{Outcome, Report};
 
 /// The replay ran and reproduced the network's recorded result.

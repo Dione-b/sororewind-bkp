@@ -103,9 +103,15 @@ use crate::tx::DecodedTx;
 /// The ledger the transaction was applied in, as the host needs to see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerContext {
+    /// The ledger sequence number.
     pub sequence: u32,
+    /// The protocol the transaction ran under: the previous header's when
+    /// this ledger upgraded it.
     pub protocol: u32,
+    /// The base reserve the transaction ran under, in stroops: the previous
+    /// header's when this ledger upgraded it.
     pub base_reserve: u32,
+    /// `scpValue.closeTime`, in seconds since the Unix epoch.
     pub close_time: u64,
     /// SHA-256 of the network passphrase.
     pub network_id: [u8; 32],
@@ -196,16 +202,26 @@ impl Upgraded {
 /// comparable with the network's.
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
+    /// What each host operation costs in instructions.
     pub cpu_cost_params: ContractCostParams,
+    /// What each host operation costs in memory.
     pub mem_cost_params: ContractCostParams,
+    /// The memory budget of a transaction, in bytes.
     pub tx_memory_limit: u32,
+    /// The most contract event bytes one transaction may emit.
     pub tx_max_contract_events_size_bytes: u32,
+    /// The longest TTL an entry can be extended to, in ledgers.
     pub max_entry_ttl: u32,
+    /// The minimum TTL of a new temporary entry, in ledgers.
     pub min_temporary_ttl: u32,
+    /// The minimum TTL of a new persistent entry, in ledgers; also what a
+    /// restoration grants.
     pub min_persistent_ttl: u32,
     /// The largest contract code and contract data entries the network takes.
     pub max_contract_size_bytes: u32,
+    /// The largest contract data entry, in bytes.
     pub max_contract_data_entry_size_bytes: u32,
+    /// The fee settings, for recomputing the transaction's resource fee.
     pub fees: FeeSettings,
     /// Settings modified at or after the transaction's ledger: the network was
     /// reconfigured since, so the replay may be priced differently.
@@ -357,11 +373,14 @@ fn build_config(entries: &[Option<RawLedgerEntry>], tx_ledger: u32) -> Result<Ne
 pub enum Liveness {
     /// A classic entry; it has no TTL.
     Untracked,
+    /// Live when the transaction ran.
     Live {
+        /// The TTL handed to the host.
         live_until: u32,
     },
     /// Archived when the transaction ran and listed for automatic restoration.
     Restored {
+        /// The TTL core assigns on restoration: `ledger + minPersistentTTL - 1`.
         live_until: u32,
     },
     /// Persistent, past its TTL, and not listed for restoration.
@@ -392,15 +411,21 @@ pub enum TtlDrift {
 /// The facts liveness is decided against.
 #[derive(Debug, Clone, Copy)]
 pub struct LivenessRule {
+    /// The ledger the transaction ran in.
     pub tx_ledger: u32,
+    /// The network's `maxEntryTTL`, which bounds how far a TTL set by then
+    /// could reach.
     pub max_entry_ttl: u32,
+    /// The network's `minPersistentTTL`, which sets the TTL of a restoration.
     pub min_persistent_ttl: u32,
 }
 
 /// What is known about one durable entry's TTL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TtlFacts {
+    /// Temporary or persistent; contract code counts as persistent.
     pub durability: ContractDataDurability,
+    /// Its `liveUntilLedgerSeq`; `0` when it is archived now.
     pub live_until: u32,
     /// The transaction listed the entry for automatic restoration.
     pub restorable: bool,
@@ -552,14 +577,22 @@ fn durability(key: &LedgerKey) -> Option<ContractDataDurability> {
 /// One footprint slot, plus what we learned about the entry living in it.
 #[derive(Debug, Clone)]
 pub struct FootprintSlot {
+    /// The footprint key.
     pub key: LedgerKey,
+    /// `key`, XDR-encoded.
     pub key_xdr: Vec<u8>,
+    /// The entry under `key`; `None` when the RPC has none, or it did not
+    /// exist when the transaction ran.
     pub entry: Option<LedgerEntry>,
     /// `entry`, XDR-encoded once: the bytes the host is handed, and the size
     /// stellar-core's limits are checked against.
     pub entry_xdr: Option<Vec<u8>>,
+    /// The entry's `lastModifiedLedgerSeq`; `None` when there is no entry or
+    /// the RPC did not say.
     pub last_modified: Option<u32>,
+    /// Whether the entry existed for the host, and with which TTL.
     pub liveness: Liveness,
+    /// Why its TTL is known to have changed since, when it is.
     pub ttl_drift: Option<TtlDrift>,
     /// The entry (or its absence) is the one the transaction saw, rebuilt
     /// from ledger metadata, rather than the one on the ledger now.
@@ -672,6 +705,8 @@ impl FootprintSlot {
         matches!(self.liveness, Liveness::Absent | Liveness::Expired)
     }
 
+    /// Archived when the transaction ran and not listed for restoration:
+    /// stellar-core fails the operation with `ENTRY_ARCHIVED`.
     pub fn archived(&self) -> bool {
         matches!(self.liveness, Liveness::Archived { .. })
     }
@@ -696,9 +731,13 @@ impl FootprintSlot {
     }
 }
 
+/// The ledger the transaction saw, as far as it can be rebuilt: everything
+/// the host is handed besides the transaction itself.
 #[derive(Debug)]
 pub struct Reconstructed {
+    /// The ledger the host runs in.
     pub ledger_info: LedgerInfo,
+    /// The network's settings, from its `ConfigSetting` entries.
     pub config: NetworkConfig,
     /// In footprint order: read-only keys first, then read-write.
     pub slots: Vec<FootprintSlot>,
@@ -745,6 +784,8 @@ pub struct Fetched {
     config_entries: Vec<Option<RawLedgerEntry>>,
 }
 
+/// Fetch every footprint entry and the network's settings in one
+/// `getLedgerEntries` request.
 pub async fn fetch(rpc: &RpcClient, tx: &DecodedTx) -> Result<Fetched> {
     let footprint = tx.footprint_keys();
     let key_xdr: Vec<Vec<u8>> = footprint

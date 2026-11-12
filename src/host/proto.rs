@@ -4,14 +4,15 @@
 // host type may cross into the rest of the crate; see `host/mod.rs`.
 
 use super::soroban_env_host::{
+    Host, HostError, LedgerInfo, ModuleCache,
     budget::Budget,
     e2e_invoke::{
-        entry_size_for_rent, extract_rent_changes, invoke_host_function, TtlLedgerEntryMeta,
+        TtlLedgerEntryMeta, entry_size_for_rent, extract_rent_changes, invoke_host_function,
     },
     fees::{
-        compute_rent_fee, compute_rent_write_fee_per_1kb, compute_transaction_resource_fee,
         FeeConfiguration, LedgerEntryRentChange, RentFeeConfiguration, RentWriteFeeConfiguration,
-        TransactionResources,
+        TransactionResources, compute_rent_fee, compute_rent_write_fee_per_1kb,
+        compute_transaction_resource_fee,
     },
     storage::Storage,
     vm::VersionedContractCodeCostInputs,
@@ -19,7 +20,6 @@ use super::soroban_env_host::{
         ContractCodeCostInputs, ContractCostParams, Hash, LedgerEntry, Limits, ReadXdr, ScError,
         ScErrorCode, ScErrorType, WriteXdr,
     },
-    Host, HostError, LedgerInfo, ModuleCache,
 };
 use crate::host::{Change, Failure, FeeRequest, Fees, Invocation, Output, RentChange};
 

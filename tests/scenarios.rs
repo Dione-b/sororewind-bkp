@@ -258,11 +258,13 @@ async fn the_refundable_fee_check_is_mirrored() {
         "{failure:?}"
     );
     // Rent is priced from a window that keeps moving; the report says so.
-    assert!(report
-        .footprint
-        .config_drifted
-        .iter()
-        .any(|setting| setting == "LiveSorobanStateSizeWindow"));
+    assert!(
+        report
+            .footprint
+            .config_drifted
+            .iter()
+            .any(|setting| setting == "LiveSorobanStateSizeWindow")
+    );
 }
 
 #[tokio::test]

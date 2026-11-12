@@ -18,6 +18,14 @@ labels: bug
 
 **Output with `-vv`**
 
+<!-- The report goes to stdout and the diagnostics to stderr; capture both,
+     in order, with:
+
+         sororewind <hash> -vv 2>&1 | tee sororewind.log
+
+     (add `--network` / `--rpc-url` as in your original run). Remove any API
+     key from the RPC URL before pasting. -->
+
 <details>
 
 ```

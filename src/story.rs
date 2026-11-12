@@ -15,10 +15,14 @@ use crate::strkey;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Call {
+    /// How many frames were open when this one was entered; the outermost
+    /// call is 0.
     pub depth: usize,
     /// Full strkey of the contract that was called, when the host told us.
     pub contract: Option<String>,
+    /// The function name from the `fn_call` event; empty if it had none.
     pub function: String,
+    /// The arguments, each rendered for reading (see `display::scval`).
     pub args: Vec<String>,
     /// The arguments whole, each an `ScVal` in base64 XDR: `args` abbreviates
     /// long byte strings, large collections and deep nesting.
@@ -43,6 +47,7 @@ pub struct Call {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Failure {
+    /// The fatal error itself, as the host raised it.
     #[serde(skip)]
     pub error: ScError,
     /// Error category: `contract`, `auth`, `storage`, `wasm_vm`, …
@@ -59,7 +64,10 @@ pub struct Failure {
     pub name_origin: Option<String>,
     /// The message the host attached to the error diagnostic.
     pub message: String,
+    /// Full strkey of the contract whose frame raised the error, when known.
     pub contract: Option<String>,
+    /// The function whose frame raised the error; `null` when no frame was
+    /// open.
     pub function: Option<String>,
     /// Depth of the frame the error was raised in; `null` when no frame was
     /// open.
@@ -79,14 +87,22 @@ pub struct Failure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Cause {
+    /// The contract's own error number.
     pub contract_code: u32,
+    /// The error in one phrase, as the narrative prints it.
     pub description: String,
     /// Contract-declared name for `contract_code`, when its spec has one.
     pub name: Option<String>,
+    /// Where `name` came from.
     pub name_origin: Option<String>,
+    /// The message the host attached to the contract error diagnostic.
     pub message: String,
+    /// Full strkey of the contract that returned the error, when known.
     pub contract: Option<String>,
+    /// The function that returned the error; `null` when no frame was open.
     pub function: Option<String>,
+    /// Depth of the frame that returned the error; `null` when no frame was
+    /// open.
     pub depth: Option<usize>,
 }
 
@@ -100,9 +116,13 @@ struct ErrorEvent {
     stretch: usize,
 }
 
+/// What the replay did: the call tree, and the failure it ended in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Story {
+    /// The fatal error and where it was raised; `None` when the replay ended
+    /// without one.
     pub failure: Option<Failure>,
+    /// Every frame the host entered, in the order it entered them.
     pub calls: Vec<Call>,
 }
 
@@ -131,7 +151,7 @@ impl Story {
                 .event
                 .contract_id
                 .as_ref()
-                .map(|id| strkey::contract(&id.0 .0));
+                .map(|id| strkey::contract(&id.0.0));
 
             match kind.as_str() {
                 "fn_call" => {
@@ -483,10 +503,12 @@ mod tests {
         assert_eq!(outer.returned.as_deref(), Some("3"));
         assert_eq!((inner.depth, inner.returned.as_deref()), (1, Some("2")));
         assert_eq!(inner.logs, ["inside inner"]);
-        assert!(story
-            .calls
-            .iter()
-            .all(|c| !c.open && !c.recovered && !c.is_failure));
+        assert!(
+            story
+                .calls
+                .iter()
+                .all(|c| !c.open && !c.recovered && !c.is_failure)
+        );
     }
 
     #[test]

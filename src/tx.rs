@@ -20,7 +20,9 @@ use crate::rpc::RawTransaction;
 /// Everything replay needs, lifted out of the envelope.
 #[derive(Debug)]
 pub struct DecodedTx {
+    /// The hash the transaction was fetched by.
     pub hash: TxHash,
+    /// Sequence of the ledger the transaction was applied in.
     pub ledger: u32,
     /// The envelope was a fee-bump wrapping the Soroban transaction.
     pub fee_bump: bool,
@@ -30,7 +32,9 @@ pub struct DecodedTx {
 
     /// The account the host treats as the transaction invoker.
     pub source_account: AccountId,
+    /// What the `InvokeHostFunction` operation asked the host to run.
     pub host_function: HostFunction,
+    /// The declared footprint and resource limits (`sorobanData.resources`).
     pub resources: SorobanResources,
     /// The resource fee the transaction declared (`sorobanData.resourceFee`).
     pub resource_fee: i64,
@@ -38,6 +42,7 @@ pub struct DecodedTx {
     /// included: what core charges the transaction-size fee on. For a
     /// fee-bump that is the inner envelope.
     pub envelope_size: u32,
+    /// The authorization entries the operation carried, in envelope order.
     pub auth: Vec<SorobanAuthorizationEntry>,
     /// Indices into `resources.footprint.read_write` of entries the transaction
     /// asked the host to auto-restore. Empty for ordinary invocations.
@@ -45,6 +50,8 @@ pub struct DecodedTx {
 
     /// What the network actually recorded.
     pub onchain_result: InvokeHostFunctionResult,
+    /// The diagnostic events the network recorded; empty when the RPC sent
+    /// no `resultMetaXdr` or the meta holds none.
     pub onchain_diagnostic_events: Vec<DiagnosticEvent>,
 }
 
@@ -61,18 +68,22 @@ impl DecodedTx {
             .collect()
     }
 
+    /// The host function as raw XDR, for the host.
     pub fn encoded_host_function(&self) -> Result<Vec<u8>> {
         codec::encode(&self.host_function, "the host function")
     }
 
+    /// The declared resources as raw XDR, for the host.
     pub fn encoded_resources(&self) -> Result<Vec<u8>> {
         codec::encode(&self.resources, "the transaction resources")
     }
 
+    /// The source account as raw XDR, for the host.
     pub fn encoded_source_account(&self) -> Result<Vec<u8>> {
         codec::encode(&self.source_account, "the source account")
     }
 
+    /// Each authorization entry as raw XDR, in envelope order.
     pub fn encoded_auth(&self) -> Result<Vec<Vec<u8>>> {
         self.auth
             .iter()
@@ -81,6 +92,9 @@ impl DecodedTx {
     }
 }
 
+/// Decode a `getTransaction` record. Fails with `NotSoroban` unless the
+/// envelope holds exactly one `InvokeHostFunction` operation with Soroban
+/// resources, and with `MissingField` when the RPC left out a field it needs.
 pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
     let not_soroban = |reason: String| RewindError::NotSoroban {
         hash: hash.clone(),
@@ -246,7 +260,7 @@ mod tests {
     use super::*;
     use crate::rpc::TxStatus;
     use crate::test_support::{
-        account, fee_bump, invoke_envelope, muxed, raw_tx, result_xdr, tx_result, InvokeSpec,
+        InvokeSpec, account, fee_bump, invoke_envelope, muxed, raw_tx, result_xdr, tx_result,
     };
     use stellar_xdr::{
         InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
@@ -448,11 +462,13 @@ mod tests {
             .try_into()
             .unwrap(),
         ));
-        assert!(reason(raw_tx(
-            &invoke_envelope(&InvokeSpec::default()),
-            &wrong_result
-        ))
-        .contains("`Payment`, not a host function result"));
+        assert!(
+            reason(raw_tx(
+                &invoke_envelope(&InvokeSpec::default()),
+                &wrong_result
+            ))
+            .contains("`Payment`, not a host function result")
+        );
     }
 
     #[test]

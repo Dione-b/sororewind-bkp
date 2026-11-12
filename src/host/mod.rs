@@ -24,13 +24,21 @@ mod p30;
 /// The ledger the transaction ran in, as every host's `LedgerInfo` holds it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LedgerInfo {
+    /// The ledger's protocol, which picks the host that replays it.
     pub protocol_version: u32,
+    /// The ledger sequence number.
     pub sequence_number: u32,
+    /// The ledger's close time, in seconds since the Unix epoch.
     pub timestamp: u64,
+    /// SHA-256 of the network passphrase.
     pub network_id: [u8; 32],
+    /// The base reserve, in stroops.
     pub base_reserve: u32,
+    /// The minimum TTL of a new temporary entry, in ledgers.
     pub min_temp_entry_ttl: u32,
+    /// The minimum TTL of a new persistent entry, in ledgers.
     pub min_persistent_entry_ttl: u32,
+    /// The longest TTL an entry can be extended to, in ledgers.
     pub max_entry_ttl: u32,
 }
 
@@ -46,6 +54,7 @@ pub struct Entry<'a> {
 /// A contract to parse into the module cache before the invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractCode<'a> {
+    /// The SHA-256 of the Wasm, which keys the module cache.
     pub hash: [u8; 32],
     /// Borrowed from the footprint entry: a contract can be 128 KB.
     pub wasm: &'a [u8],
@@ -59,26 +68,38 @@ pub struct Invocation<'a> {
     /// `HostFunction`, `SorobanResources`, `AccountId` and each
     /// `SorobanAuthorizationEntry`, XDR-encoded.
     pub host_function: Vec<u8>,
+    /// The transaction's declared `SorobanResources`, footprint included.
     pub resources: Vec<u8>,
+    /// The `AccountId` of the operation's source account.
     pub source_account: Vec<u8>,
+    /// One `SorobanAuthorizationEntry` per item.
     pub auth: Vec<Vec<u8>>,
+    /// Indices into the read-write footprint of the archived entries core
+    /// restores before it invokes the host.
     pub restored_rw_indices: &'a [u32],
+    /// The ledger the transaction ran in.
     pub ledger: LedgerInfo,
     /// One item per footprint key, in footprint order; `None` where the host
     /// should see no entry.
     pub entries: Vec<Option<Entry<'a>>>,
+    /// The base PRNG seed core derives for this transaction.
     pub prng_seed: [u8; 32],
+    /// The budget's instruction limit: the transaction's declared instructions.
     pub cpu_limit: u64,
+    /// The budget's memory limit, in bytes: the network's `txMemoryLimit`.
     pub mem_limit: u64,
     /// The network's `ContractCostParams`, XDR-encoded.
     pub cpu_cost_params: Vec<u8>,
+    /// The memory counterpart of `cpu_cost_params`, XDR-encoded.
     pub mem_cost_params: Vec<u8>,
+    /// The contracts in the footprint, to parse into the module cache.
     pub contracts: Vec<ContractCode<'a>>,
 }
 
 /// What one footprint entry became.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Change {
+    /// Whether the entry is in the read-only footprint.
     pub read_only: bool,
     /// The new `LedgerEntry`, XDR-encoded; `None` when it was removed or is
     /// read-only.
@@ -90,49 +111,77 @@ pub struct Change {
 /// One entry's rent inputs, as the host's `LedgerEntryRentChange` holds them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RentChange {
+    /// Whether the entry is persistent rather than temporary.
     pub is_persistent: bool,
+    /// Whether the entry is contract code.
     pub is_code_entry: bool,
+    /// Its rent size before the invocation; 0 for a new entry.
     pub old_size_bytes: u32,
+    /// Its rent size after the invocation.
     pub new_size_bytes: u32,
+    /// Its TTL before the invocation; 0 for a new entry.
     pub old_live_until_ledger: u32,
+    /// Its TTL after the invocation.
     pub new_live_until_ledger: u32,
 }
 
 /// The network's fee settings, as the hosts' `fees` module wants them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FeeSettings {
+    /// The fee per 10,000 instructions, in stroops.
     pub fee_per_instruction_increment: i64,
+    /// The fee per ledger entry read from disk, in stroops.
     pub fee_per_disk_read_entry: i64,
+    /// The fee per ledger entry written, in stroops.
     pub fee_per_write_entry: i64,
+    /// The fee per 1 KB read from disk, in stroops.
     pub fee_per_disk_read_1kb: i64,
     /// The flat write fee (`feeWrite1KB`).
     pub fee_per_write_1kb: i64,
+    /// The fee per 1 KB of history archived for the transaction, in stroops.
     pub fee_per_historical_1kb: i64,
+    /// The fee per 1 KB of contract events, in stroops.
     pub fee_per_contract_event_1kb: i64,
+    /// The fee per 1 KB of transaction size, in stroops.
     pub fee_per_transaction_size_1kb: i64,
     /// The inputs of the rent fee per 1 KB, which grows with the state size.
     pub state_target_size_bytes: i64,
+    /// The rent fee per 1 KB when the state is empty, in stroops.
     pub rent_fee_1kb_state_size_low: i64,
+    /// The rent fee per 1 KB when the state reaches the target size, in stroops.
     pub rent_fee_1kb_state_size_high: i64,
+    /// How much faster the rent fee grows once the state exceeds the target.
     pub state_size_rent_fee_growth_factor: u32,
     /// Average of the network's `LiveSorobanStateSizeWindow`.
     pub average_state_size_bytes: i64,
+    /// The denominator of the rent rate of persistent entries.
     pub persistent_rent_rate_denominator: i64,
+    /// The denominator of the rent rate of temporary entries.
     pub temporary_rent_rate_denominator: i64,
 }
 
 /// What a transaction declared and what it emitted, for the fee computation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FeeRequest {
+    /// The declared instruction limit.
     pub instructions: u32,
+    /// Entries read from disk: classic ones and those listed for restoration.
     pub disk_read_entries: u32,
+    /// Entries in the read-write footprint.
     pub write_entries: u32,
+    /// The declared disk read bytes.
     pub disk_read_bytes: u32,
+    /// The declared write bytes.
     pub write_bytes: u32,
+    /// The size of the emitted contract events, XDR-encoded.
     pub contract_events_size_bytes: u32,
+    /// The size of the transaction envelope, XDR-encoded.
     pub transaction_size_bytes: u32,
+    /// The rent inputs of every footprint entry whose change costs rent.
     pub rent_changes: Vec<RentChange>,
+    /// The ledger the transaction ran in, which rent is counted from.
     pub ledger_sequence: u32,
+    /// The network's fee settings at that ledger.
     pub settings: FeeSettings,
 }
 
@@ -143,6 +192,7 @@ pub struct Fees {
     pub non_refundable: i64,
     /// The refundable part of the resource fee: the events fee.
     pub refundable: i64,
+    /// The rent fee for the entries the transaction created, grew or extended.
     pub rent: i64,
 }
 
@@ -152,12 +202,15 @@ pub struct Output {
     /// The return `ScVal`, XDR-encoded; on failure, the `ScError` behind it
     /// when the host error carries one.
     pub result: std::result::Result<Vec<u8>, Option<Vec<u8>>>,
+    /// One item per footprint entry, in footprint order; empty on failure.
     pub changes: Vec<Change>,
     /// Each `ContractEvent`, XDR-encoded.
     pub contract_events: Vec<Vec<u8>>,
     /// Each `DiagnosticEvent`, XDR-encoded.
     pub diagnostics: Vec<Vec<u8>>,
+    /// The instructions the budget consumed.
     pub cpu_insns: u64,
+    /// The memory the budget consumed, in bytes.
     pub mem_bytes: u64,
 }
 
@@ -166,7 +219,10 @@ pub struct Output {
 pub enum Failure {
     /// A value did not round-trip through the host's XDR.
     Xdr(String),
+    /// The budget could not be built from the network's cost parameters, or
+    /// could not report what it consumed.
     Budget(String),
+    /// The module cache could not be set up.
     ModuleCache(String),
     /// The host failed with an internal error, which stellar-core treats as
     /// a bug rather than as a transaction result.
@@ -186,6 +242,7 @@ pub struct Host {
 }
 
 impl Host {
+    /// Run the invocation through this host's `invoke_host_function`.
     pub fn invoke(&self, invocation: &Invocation<'_>) -> std::result::Result<Output, Failure> {
         (self.invoke)(invocation)
     }

@@ -26,8 +26,8 @@ use crate::codec;
 use crate::error::{Result, RewindError};
 use crate::replay::{BudgetUse, Fidelity, PrngSeed};
 use crate::report::{
-    Diagnostics, FootprintReport, Report, ResultPair, ResultSummary, TtlDriftEntry, TtlDriftReason,
-    SCHEMA_VERSION,
+    Diagnostics, FootprintReport, Report, ResultPair, ResultSummary, SCHEMA_VERSION, TtlDriftEntry,
+    TtlDriftReason,
 };
 use crate::rpc::{RawLedgerEntry, RawTransaction, TxStatus};
 use crate::story::Story;

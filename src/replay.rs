@@ -63,7 +63,9 @@ pub struct ReplayOutcome {
     pub error: Option<ScError>,
     /// The host's diagnostics, followed by the ones stellar-core would add.
     pub diagnostics: Vec<DiagnosticEvent>,
+    /// CPU and memory the replay consumed, and the limits it ran under.
     pub budget: BudgetUse,
+    /// Whether the PRNG seed was the network's or a zeroed stand-in.
     pub prng_seed: PrngSeed,
 }
 
@@ -72,9 +74,13 @@ pub struct ReplayOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BudgetUse {
+    /// CPU instructions the local replay consumed.
     pub cpu_insns: u64,
+    /// The transaction's declared `instructions` resource limit.
     pub cpu_limit: u64,
+    /// Memory the local replay consumed, in bytes.
     pub mem_bytes: u64,
+    /// The network's per-transaction memory limit, in bytes.
     pub mem_limit: u64,
     /// `cpu_insn` from the network's own `core_metrics` diagnostics.
     pub network_cpu_insns: Option<u64>,
@@ -122,8 +128,11 @@ pub fn prng_seed(tx_set_hash: &[u8; 32], application_order: Option<u32>) -> ([u8
 /// Does the local run agree with what the network recorded?
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Fidelity {
+    /// The local run reproduced the network's outcome; see [`Divergence`] for
+    /// what is compared.
     #[serde(rename = "match")]
     pub matches: bool,
+    /// How the run differs; `None` when it matches.
     pub divergence: Option<Divergence>,
 }
 
@@ -139,11 +148,13 @@ pub enum Divergence {
 }
 
 impl Fidelity {
+    /// The local run reproduced the network's outcome.
     pub const MATCH: Fidelity = Fidelity {
         matches: true,
         divergence: None,
     };
 
+    /// The local run differed from the network's, in the given way.
     pub const fn diverged(divergence: Divergence) -> Fidelity {
         Fidelity {
             matches: false,
@@ -518,10 +529,10 @@ impl PostHostChecks {
             };
             let size = value.len() as u64;
             // The limits depend only on the kind of entry, which leads its XDR.
-            if let Ok(entry) = stellar_xdr::LedgerEntry::from_xdr(value, Limits::none()) {
-                if let Some(failed) = self.sizes.check(&entry.data, size) {
-                    return Err(failed);
-                }
+            if let Ok(entry) = stellar_xdr::LedgerEntry::from_xdr(value, Limits::none())
+                && let Some(failed) = self.sizes.check(&entry.data, size)
+            {
+                return Err(failed);
             }
             written += size;
             if written > self.write_bytes_limit {
@@ -884,7 +895,9 @@ mod tests {
         let failed = checks(code_size - 1, data_size)
             .run(&both, &[], &[])
             .unwrap_err();
-        assert!(message(&failed).contains("Wasm size exceeds network config maximum contract size"));
+        assert!(
+            message(&failed).contains("Wasm size exceeds network config maximum contract size")
+        );
         assert_eq!(failed.0, InvokeHostFunctionResult::ResourceLimitExceeded);
     }
 

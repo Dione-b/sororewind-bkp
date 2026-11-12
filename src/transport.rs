@@ -47,6 +47,7 @@ pub const FIXTURE_VERSION: u32 = 2;
 const MANIFEST_FILE: &str = "fixture.json";
 const ENTRIES_FILE: &str = "ledgerEntries.json";
 
+/// The boxed future a [`Transport`] returns, so the trait stays object-safe.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A source of raw JSON-RPC response bodies.
@@ -82,6 +83,8 @@ const RETRY_BASE: Duration = Duration::from_millis(400);
 /// The longest a `Retry-After` header is obeyed.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 
+/// A [`Transport`] that sends each call to a live RPC endpoint over HTTP,
+/// retrying transient failures.
 pub struct HttpTransport {
     url: String,
     /// What is shown of `url`: see [`redact`].
@@ -123,6 +126,8 @@ enum Attempt {
 }
 
 impl HttpTransport {
+    /// A transport for the RPC at `url`, with the default timeouts and retry
+    /// policy. Fails only when the HTTP client cannot be built.
     pub fn new(url: impl Into<String>) -> Result<Self> {
         let url = url.into();
         let http = reqwest::Client::builder()
@@ -277,12 +282,15 @@ impl Transport for HttpTransport {
 /// `fixture.json`: identifies a recording and the layout it was written in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixtureManifest {
+    /// The fixture layout version; this build reads only [`FIXTURE_VERSION`].
     pub version: u32,
     /// The transaction this fixture was recorded for.
     pub hash: String,
 }
 
 impl FixtureManifest {
+    /// Read and check `fixture.json` in `dir`. Fails when it is missing,
+    /// unparseable or written in another layout version.
     pub async fn load(dir: &Path) -> Result<Self> {
         let path = dir.join(MANIFEST_FILE);
         let text = match tokio::fs::read_to_string(&path).await {
@@ -296,7 +304,7 @@ impl FixtureManifest {
                     } else {
                         "there is no such directory".to_string()
                     },
-                })
+                });
             }
             Err(e) => return Err(RewindError::fixture_path(&path)(e)),
         };
@@ -318,6 +326,7 @@ impl FixtureManifest {
         Ok(manifest)
     }
 
+    /// The recorded hash, parsed and normalised.
     pub fn tx_hash(&self) -> Result<TxHash> {
         self.hash.parse()
     }
@@ -335,6 +344,7 @@ struct EntryStore {
     entries: BTreeMap<String, Option<Value>>,
 }
 
+/// A [`Transport`] that answers from a recorded fixture directory, offline.
 pub struct FixtureTransport {
     dir: PathBuf,
     manifest: FixtureManifest,
@@ -342,6 +352,8 @@ pub struct FixtureTransport {
 }
 
 impl FixtureTransport {
+    /// Open the fixture in `dir`. A missing `ledgerEntries.json` is an empty
+    /// store, not an error.
     pub async fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         let manifest = FixtureManifest::load(&dir).await?;
@@ -392,7 +404,7 @@ impl FixtureTransport {
                     return Err(RewindError::FixtureMissing {
                         dir: self.dir.clone(),
                         what: format!("ledger key {key}"),
-                    })
+                    });
                 }
             }
         }
@@ -463,6 +475,9 @@ struct RecordingState {
 pub struct RecordingHandle(std::sync::Arc<RecordingState>);
 
 impl<T: Transport> Recording<T> {
+    /// Start recording `inner`'s responses for `hash` into `dir`, staged until
+    /// [`RecordingHandle::commit`]. Whatever an interrupted run left in the
+    /// staging directory is removed first.
     pub async fn create(inner: T, dir: impl Into<PathBuf>, hash: &TxHash) -> Result<Self> {
         let target: PathBuf = dir.into();
         let name = target
@@ -1159,21 +1174,25 @@ mod tests {
         let fixture = FixtureTransport::open(&target).await.unwrap();
         assert_eq!(fixture.tx_hash().unwrap(), other);
         assert!(!target.join("getHealth.json").exists());
-        assert!(fixture
-            .request("getLedgerEntries", &json!({"keys": ["old"]}))
-            .await
-            .is_err());
+        assert!(
+            fixture
+                .request("getLedgerEntries", &json!({"keys": ["old"]}))
+                .await
+                .is_err()
+        );
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, ["fixture.v1"]);
         // No temporary file survives inside the fixture either.
-        assert!(std::fs::read_dir(&target).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .ends_with(".tmp")));
+        assert!(std::fs::read_dir(&target).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
     }
 
     #[tokio::test]

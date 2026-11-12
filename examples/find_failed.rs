@@ -9,15 +9,18 @@
 //! hashes in a fixture expire from the RPC after about a week, so new
 //! fixtures always start from a transaction found this way.
 
+// A command-line tool: printing is what it is for.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::process::ExitCode;
 
 use clap::Parser;
-use sororewind::discover::{recent_failures, Search};
+use sororewind::Network;
+use sororewind::discover::{Search, recent_failures};
 use sororewind::network::NetworkId;
 use sororewind::report::ResultSummary;
 use sororewind::rpc::RpcClient;
 use sororewind::transport::HttpTransport;
-use sororewind::Network;
 
 #[derive(Parser)]
 struct Args {

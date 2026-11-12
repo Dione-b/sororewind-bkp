@@ -15,20 +15,34 @@ use crate::network::{Network, NetworkId};
 /// Stellar RPC's stock `HISTORY_RETENTION_WINDOW`, in ledgers (about 7 days).
 pub const DEFAULT_RETENTION_WINDOW: u32 = 120_960;
 
+/// Every failure a run can end in. `Display` is the message for the terminal;
+/// [`RewindError::kind`] is the stable name for the `--json` error document.
 #[derive(Debug, Error)]
 pub enum RewindError {
+    /// The hash given on the command line is not 64 hex characters.
     #[error("invalid transaction hash `{hash}`: expected 64 hexadecimal characters (32 bytes)")]
-    InvalidHash { hash: String },
+    InvalidHash {
+        /// The hash as the user typed it.
+        hash: String,
+    },
 
+    /// Neither a hash nor a `--fixture` to read one from was given.
     #[error("no transaction hash was given, and there is no --fixture to take one from")]
     MissingHash,
 
+    /// `SOROREWIND_RPC_URL` is not an http(s) URL with a host (`--rpc-url`
+    /// itself is checked by clap).
     #[error("invalid RPC URL: {reason}")]
-    InvalidRpcUrl { reason: String },
+    InvalidRpcUrl {
+        /// Why the URL was rejected.
+        reason: String,
+    },
 
+    /// The report could not be serialized or written to stdout; holds the cause.
     #[error("could not write the report: {0}")]
     Output(String),
 
+    /// `getTransaction` answered `NOT_FOUND` for the hash.
     #[error(
         "transaction {hash} not found on {network}.\n\
          \n\
@@ -38,60 +52,92 @@ pub enum RewindError {
          Tip: pass --network, or --rpc-url to point at another RPC."
     )]
     NotFound {
+        /// The transaction that was looked up.
         hash: TxHash,
+        /// The network the RPC serves.
         network: NetworkId,
+        /// What the RPC said about how far back it keeps transactions.
         retention: Retention,
     },
 
+    /// No answer came back from the RPC: DNS, connection, TLS or a timeout,
+    /// after any retries.
     #[error("cannot reach the RPC at {url}: {detail}")]
     RpcUnreachable {
         /// The endpoint, redacted: see `transport::redact`.
         url: String,
         /// The whole cause chain, innermost last.
         detail: String,
+        /// The underlying HTTP client error.
         #[source]
         source: reqwest::Error,
     },
 
+    /// The `reqwest` client could not be built (for example, no TLS backend).
     #[error("could not set up the HTTP client: {0}")]
     HttpClient(#[source] reqwest::Error),
 
+    /// The RPC answered with a JSON-RPC error, a non-2xx HTTP status, or a
+    /// response that makes no sense.
     #[error("the RPC ({origin}) returned an error for {method}: {detail}{}", code_suffix(*.code))]
     Rpc {
+        /// Where the answer came from: the redacted RPC URL, or `fixture:<dir>`.
         origin: String,
+        /// The JSON-RPC method that failed, such as `getTransaction`.
         method: String,
         /// The JSON-RPC error code, when the failure was a JSON-RPC error.
         code: Option<i64>,
+        /// The RPC's error message, the HTTP status and body, or what was wrong
+        /// with its answer.
         detail: String,
     },
 
+    /// `--network` names a network other than the one the RPC's passphrase
+    /// says it serves.
     #[error(
         "--network {expected} was requested, but {origin} serves {actual}.\n\
          \n\
          Drop --network to trust the RPC's own passphrase, or point --rpc-url at a {expected} endpoint."
     )]
     NetworkMismatch {
+        /// The network `--network` asked for.
         expected: Network,
+        /// The network the RPC reported via `getNetwork`.
         actual: NetworkId,
+        /// The redacted RPC URL, or `fixture:<dir>`.
         origin: String,
     },
 
+    /// The transaction has no `InvokeHostFunction` operation to replay.
     #[error(
         "transaction {hash} is not a Soroban transaction: {reason}\n\
          \n\
          sororewind only replays transactions that invoke a host function \
          (contract calls, token operations, contract deployment)."
     )]
-    NotSoroban { hash: TxHash, reason: String },
+    NotSoroban {
+        /// The transaction that was looked up.
+        hash: TxHash,
+        /// What the transaction is instead.
+        reason: String,
+    },
 
+    /// The transaction failed in stellar-core before any contract code ran.
     #[error(
         "transaction {hash} failed before it reached the Soroban host (transaction result `{code}`).\n\
          \n\
          stellar-core rejected it during validation or fee processing, so no contract code ran \
          and there is nothing to replay."
     )]
-    NeverReachedHost { hash: TxHash, code: &'static str },
+    NeverReachedHost {
+        /// The failed transaction.
+        hash: TxHash,
+        /// The `TransactionResultCode` name, such as `TxBadSeq`.
+        code: &'static str,
+    },
 
+    /// The transaction's ledger ran on a protocol none of the embedded hosts
+    /// execute.
     #[error(
         "cannot replay transaction {hash}: it ran on protocol {tx_protocol}, but this build of\n\
          sororewind embeds protocols {supported}.\n\
@@ -104,117 +150,189 @@ pub enum RewindError {
          Network: {network}"
     )]
     ProtocolMismatch {
+        /// The transaction that cannot be replayed.
         hash: TxHash,
+        /// The protocol version of the ledger the transaction ran in.
         tx_protocol: u32,
         /// The protocols this build replays, with their host versions.
         supported: String,
+        /// The network the transaction is on.
         network: NetworkId,
     },
 
+    /// The transaction succeeded, so there is no failure to narrate.
     #[error(
         "transaction {hash} succeeded on-chain; there is nothing to explain.\n\
          sororewind narrates failures."
     )]
-    NotAFailure { hash: TxHash },
+    NotAFailure {
+        /// The successful transaction.
+        hash: TxHash,
+    },
 
+    /// A ledger header needed for replay is outside the RPC's retention window.
     #[error(
         "the RPC has no ledger {sequence} in its retention window; \
          it can no longer tell us the state that transaction ran against"
     )]
-    LedgerUnavailable { sequence: u32 },
+    LedgerUnavailable {
+        /// The ledger sequence number that could not be fetched.
+        sequence: u32,
+    },
 
+    /// A network config setting the host needs was absent from
+    /// `getLedgerEntries`.
     #[error(
         "the RPC did not return the network setting `{setting}`, so the replay cannot be \
          priced the way the network priced it"
     )]
-    ConfigSettingMissing { setting: &'static str },
+    ConfigSettingMissing {
+        /// The `ConfigSettingId` name, such as `ContractComputeV0`.
+        setting: &'static str,
+    },
 
+    /// A network config setting came back with the wrong shape or an unusable
+    /// value.
     #[error("the network setting `{setting}` returned by the RPC is not usable: {detail}")]
     ConfigSettingMalformed {
+        /// The `ConfigSettingId` name.
         setting: &'static str,
+        /// What was wrong with it.
         detail: String,
     },
 
+    /// A contract data or code entry came back without its TTL.
     #[error(
         "the RPC returned {entry} without a liveUntilLedgerSeq, so whether it was live when \
          the transaction ran cannot be established"
     )]
-    MissingTtl { entry: String },
+    MissingTtl {
+        /// The ledger key of the entry, as text.
+        entry: String,
+    },
 
+    /// A file in the `--fixture` directory could not be read.
     #[error("could not read {path}: {source}")]
     FixtureIo {
+        /// The file that could not be read.
         path: PathBuf,
+        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
 
+    /// The hash given on the command line differs from the one the fixture
+    /// records.
     #[error(
         "the fixture at {dir} was recorded for transaction {recorded}, not {requested}.\n\
          \n\
          Drop the hash to replay the transaction the fixture holds."
     )]
     FixtureHashMismatch {
+        /// The `--fixture` directory.
         dir: PathBuf,
+        /// The transaction the fixture was recorded for.
         recorded: TxHash,
+        /// The transaction the command line asked for.
         requested: TxHash,
     },
 
+    /// A fixture file exists but cannot be parsed or is inconsistent.
     #[error("{path} is not a usable fixture: {reason}")]
-    FixtureInvalid { path: PathBuf, reason: String },
+    FixtureInvalid {
+        /// The offending file or directory.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
 
+    /// Replay made a call the fixture has no recorded response for.
     #[error(
         "the fixture at {dir} has no recorded answer for {what}; it was recorded for a \
          different transaction"
     )]
-    FixtureMissing { dir: PathBuf, what: String },
+    FixtureMissing {
+        /// The `--fixture` directory.
+        dir: PathBuf,
+        /// The call or ledger key that was not recorded.
+        what: String,
+    },
 
+    /// Writing a `--record` fixture file failed.
     #[error("could not write the recording to {path}: {source}")]
     RecordIo {
+        /// The file that could not be written.
         path: PathBuf,
+        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
 
+    /// The `--wasm-debug` file could not be read.
     #[error("could not read --wasm-debug {path}: {source}")]
     WasmFile {
+        /// The path given to `--wasm-debug`.
         path: PathBuf,
+        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
 
+    /// XDR from the RPC did not decode.
     #[error("failed to decode {what} returned by the RPC: {source}")]
     XdrDecode {
+        /// Which field or value failed, such as `envelopeXdr`.
         what: &'static str,
+        /// The XDR decoding error.
         #[source]
         source: stellar_xdr::Error,
     },
 
+    /// A base64 XDR string from the RPC was not valid base64.
     #[error("invalid base64 in {what} returned by the RPC: {source}")]
     Base64 {
+        /// Which field failed, such as `resultXdr`.
         what: &'static str,
+        /// The base64 decoding error.
         #[source]
         source: base64::DecodeError,
     },
 
+    /// A value could not be encoded to XDR to hand to the Soroban host.
     #[error("could not encode {what} for the host: {source}")]
     XdrEncode {
+        /// Which value failed.
         what: &'static str,
+        /// The XDR encoding error.
         #[source]
         source: stellar_xdr::Error,
     },
 
+    /// An RPC response lacks a field sororewind needs.
     #[error("the {method} response is missing `{field}`")]
     MissingField {
+        /// The JSON-RPC method whose response was incomplete.
         method: &'static str,
+        /// The missing field's JSON name.
         field: &'static str,
     },
 
+    /// The contract's WASM has no usable `contractspecv0` error enum.
     #[error("the contract declares no error names: {reason}")]
-    SpecMissing { reason: String },
+    SpecMissing {
+        /// What was missing or malformed in the spec.
+        reason: String,
+    },
 
+    /// The failing contract's WASM could not be found in the replayed state.
     #[error("the contract's code could not be located: {reason}")]
-    ContractCode { reason: &'static str },
+    ContractCode {
+        /// Which step of the lookup failed.
+        reason: &'static str,
+    },
 
+    /// The Soroban host could not be set up or returned something unusable;
+    /// holds the reason.
     #[error("replay could not be started: {0}")]
     Replay(String),
 }
@@ -286,7 +404,14 @@ impl RewindError {
 /// answered at all. Only used to word [`RewindError::NotFound`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retention {
-    Reported { window: u32, oldest: Option<u32> },
+    /// `getHealth` answered with its window.
+    Reported {
+        /// The retention window, in ledgers.
+        window: u32,
+        /// The oldest ledger the RPC still holds, when it said.
+        oldest: Option<u32>,
+    },
+    /// `getHealth` failed or did not report a window.
     Unknown,
 }
 
@@ -328,6 +453,7 @@ fn approximate_duration(ledgers: u32) -> String {
     }
 }
 
+/// The crate's `Result`, failing with a [`RewindError`].
 pub type Result<T> = std::result::Result<T, RewindError>;
 
 #[cfg(test)]
@@ -369,9 +495,11 @@ mod tests {
                      ledger: 10 for this rpc instance"
                 .to_string(),
         };
-        assert!(error(Some(-32600))
-            .to_string()
-            .ends_with("(JSON-RPC code -32600)"));
+        assert!(
+            error(Some(-32600))
+                .to_string()
+                .ends_with("(JSON-RPC code -32600)")
+        );
         assert!(error(None).to_string().ends_with("for this rpc instance"));
         assert!(error(None).is_ledger_out_of_range());
         assert_eq!(error(None).kind(), "rpc_error");

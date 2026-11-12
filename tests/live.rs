@@ -12,11 +12,11 @@
 //! contract can fill the whole recent history), so the test samples a few
 //! failures of each kind and demands that every replay completes in time and
 //! that at least one matches.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 use std::time::{Duration, Instant};
 
-use sororewind::discover::{recent_failures, Candidate, Search};
+use sororewind::discover::{Candidate, Search, recent_failures};
 use sororewind::rpc::RpcClient;
 use sororewind::transport::HttpTransport;
 use sororewind::{Network, Outcome, Request};

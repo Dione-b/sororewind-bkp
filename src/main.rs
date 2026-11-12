@@ -1,6 +1,10 @@
 //! The `sororewind` binary: parse arguments, run the pipeline, print the
 //! report, exit with the outcome. Everything else lives in the library.
 
+// The library is linted against printing (Cargo.toml); this is where its
+// output reaches the terminal.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
@@ -78,6 +82,14 @@ async fn main() -> ExitCode {
             };
         }
     };
+    // `--completions` and `--man` stand alone (clap rejects anything next
+    // to them), so there is nothing to replay.
+    if let Some(shell) = cli.completions {
+        return finish(write_stdout(&Cli::completion_script(shell)));
+    }
+    if cli.man {
+        return finish(Cli::man_page().and_then(|page| write_stdout(&page)));
+    }
     init_logging(cli.verbose);
 
     let result = run(&cli).await;
@@ -103,6 +115,17 @@ async fn main() -> ExitCode {
             if cli.json {
                 let _ = write_stdout(&format!("{}\n", render::json_error(&err)));
             }
+            eprintln!("sororewind: {err}");
+            ExitCode::from(sororewind::EXIT_ERROR)
+        }
+    }
+}
+
+/// The exit code of a run that only prints, reporting a failure to print.
+fn finish(printed: Result<()>) -> ExitCode {
+    match printed {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
             eprintln!("sororewind: {err}");
             ExitCode::from(sororewind::EXIT_ERROR)
         }

@@ -13,7 +13,7 @@ use crate::hash::TxHash;
 use crate::network::{Network, NetworkId};
 use crate::replay::{self, Fidelity, ReplayOutcome};
 use crate::report::{
-    Diagnostics, FootprintReport, Report, ResultPair, TtlDriftEntry, SCHEMA_VERSION,
+    Diagnostics, FootprintReport, Report, ResultPair, SCHEMA_VERSION, TtlDriftEntry,
 };
 use crate::rpc::{RawTransaction, RpcClient, TxStatus};
 use crate::state::{self, LedgerContext, Reconstructed};
@@ -25,6 +25,7 @@ use stellar_xdr::{ConfigSettingId, InvokeHostFunctionResult};
 /// What to replay.
 #[derive(Debug, Clone)]
 pub struct Request {
+    /// The transaction to replay.
     pub hash: TxHash,
     /// The network the caller believes the RPC serves. When set, a different
     /// passphrase is an error instead of a silently mislabelled report.
@@ -34,6 +35,9 @@ pub struct Request {
     pub wasm_debug: Option<PathBuf>,
 }
 
+/// Replay `request.hash` against `rpc` and assemble the [`Report`]: fetch,
+/// decode, reconstruct the ledger state, replay, compare with what the
+/// network recorded, and narrate the outcome.
 pub async fn run(rpc: &RpcClient, request: &Request) -> Result<Report> {
     let fetched = fetch(rpc, request).await?;
     let tx = tx::decode(&request.hash, &fetched.raw)?;
@@ -72,14 +76,14 @@ async fn fetch(rpc: &RpcClient, request: &Request) -> Result<Fetched> {
 
     // The passphrase is the network's identity; `--network` is only a claim.
     let network = NetworkId::from_passphrase(&info.passphrase);
-    if let Some(expected) = request.network {
-        if network != NetworkId::Known(expected) {
-            return Err(RewindError::NetworkMismatch {
-                expected,
-                actual: network,
-                origin: rpc.origin(),
-            });
-        }
+    if let Some(expected) = request.network
+        && network != NetworkId::Known(expected)
+    {
+        return Err(RewindError::NetworkMismatch {
+            expected,
+            actual: network,
+            origin: rpc.origin(),
+        });
     }
 
     match raw.status {

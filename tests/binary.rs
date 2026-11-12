@@ -150,6 +150,33 @@ fn help_and_version_exit_0_on_stdout() {
     assert_eq!(out.status.code(), Some(0));
     assert!(stdout(&out).starts_with("sororewind "), "{}", stdout(&out));
     assert!(stdout(&out).contains("protocols"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("; commit "), "{}", stdout(&out));
+}
+
+#[test]
+fn completions_and_the_man_page_print_and_exit_0() {
+    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+        let out = sororewind(&["--completions", shell]);
+        assert_eq!(out.status.code(), Some(0), "{shell}");
+        assert!(stdout(&out).contains("sororewind"), "{shell}");
+        assert!(out.stderr.is_empty(), "{shell}");
+    }
+
+    let out = sororewind(&["--man"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        stdout(&out).contains(".TH sororewind 1"),
+        "{}",
+        stdout(&out)
+    );
+
+    // They stand alone: nothing is replayed next to them.
+    let hash = "ab".repeat(32);
+    let out = sororewind(&["--man", &hash]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let out = sororewind(&["--completions", "tcsh"]);
+    assert_eq!(out.status.code(), Some(1));
 }
 
 #[test]

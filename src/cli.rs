@@ -34,7 +34,7 @@ up to the point of failure.",
 pub struct Cli {
     /// Hash of the failed transaction (hex, with or without 0x). Optional with
     /// --fixture, which records the hash it was made for
-    #[arg(required_unless_present = "fixture")]
+    #[arg(required_unless_present_any = ["fixture", "completions", "man"])]
     pub tx_hash: Option<TxHash>,
 
     /// Network the transaction lives on; selects the default RPC endpoint and
@@ -81,22 +81,37 @@ pub struct Cli {
     /// the directory as it was
     #[arg(long, value_name = "DIR", hide = true, conflicts_with = "fixture")]
     pub record: Option<PathBuf>,
+
+    /// Print a completion script for SHELL and exit, e.g. `sororewind
+    /// --completions fish > ~/.config/fish/completions/sororewind.fish`
+    #[arg(long, value_name = "SHELL", value_enum, exclusive = true)]
+    pub completions: Option<clap_complete::Shell>,
+
+    /// Print a man page (roff) and exit, e.g. `sororewind --man > sororewind.1`
+    #[arg(long, exclusive = true)]
+    pub man: bool,
 }
 
-/// `0.1.0 (protocols 29 (soroban-env-host 29.0.2), 30 (...))`: which
-/// transactions this build can replay is part of its version.
+/// `0.1.0 (protocols 29 (soroban-env-host 29.0.2), 30 (...); commit
+/// 1b1ad7efb040, x86_64-unknown-linux-gnu)`: which transactions this build
+/// can replay, and the exact code and platform it was built from, are part of
+/// its version. The commit is `unknown` outside a git checkout (`build.rs`).
 static VERSION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "{} (protocols {})",
+        "{} (protocols {}; commit {}, {})",
         env!("CARGO_PKG_VERSION"),
-        crate::host::describe()
+        crate::host::describe(),
+        env!("SOROREWIND_COMMIT"),
+        env!("SOROREWIND_TARGET"),
     )
 });
 
 /// Where the responses come from, what to replay, and the recording being
 /// made of it, if any.
 pub struct Connection {
+    /// The client over the live RPC, the recorder wrapping it, or the fixture.
     pub rpc: RpcClient,
+    /// The transaction to replay and the options that shape the replay.
     pub request: Request,
     /// With `--record`: the staged recording, to commit once the run is over.
     pub recording: Option<RecordingHandle>,
@@ -161,6 +176,8 @@ fn default_rpcs() -> String {
 }
 
 impl Cli {
+    /// The clap command, with the version and `--network` help that list the
+    /// embedded protocols and default RPCs.
     pub fn command() -> clap::Command {
         <Cli as CommandFactory>::command()
             .version(VERSION.as_str())
@@ -171,6 +188,22 @@ impl Cli {
                     default_rpcs()
                 ))
             })
+    }
+
+    /// The completion script for `shell`, as `--completions` prints it.
+    pub fn completion_script(shell: clap_complete::Shell) -> String {
+        let mut script = Vec::new();
+        clap_complete::generate(shell, &mut Cli::command(), "sororewind", &mut script);
+        String::from_utf8_lossy(&script).into_owned()
+    }
+
+    /// The man page, in roff, as `--man` prints it.
+    pub fn man_page() -> Result<String> {
+        let mut page = Vec::new();
+        clap_mangen::Man::new(Cli::command())
+            .render(&mut page)
+            .map_err(|e| RewindError::Output(e.to_string()))?;
+        Ok(String::from_utf8_lossy(&page).into_owned())
     }
 
     /// Parse arguments; clap's own error carries help, version and usage
@@ -409,9 +442,11 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
         let text = err.to_string();
         let expected = format!(
-            "sororewind {} (protocols {})\n",
+            "sororewind {} (protocols {}; commit {}, {})\n",
             env!("CARGO_PKG_VERSION"),
-            crate::host::describe()
+            crate::host::describe(),
+            env!("SOROREWIND_COMMIT"),
+            env!("SOROREWIND_TARGET"),
         );
         assert_eq!(text, expected);
         assert!(text.contains("29 (soroban-env-host 29."), "{text}");

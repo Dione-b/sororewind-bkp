@@ -13,11 +13,14 @@ use crate::rpc::RawLedgerEntry;
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
+/// Decode standard base64, ignoring surrounding whitespace; `what` names
+/// the field in the error.
 pub fn b64_decode(text: &str, what: &'static str) -> Result<Vec<u8>> {
     B64.decode(text.trim())
         .map_err(|source| RewindError::Base64 { what, source })
 }
 
+/// Encode bytes as standard, padded base64.
 pub fn b64_encode(bytes: &[u8]) -> String {
     B64.encode(bytes)
 }

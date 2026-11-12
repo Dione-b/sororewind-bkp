@@ -1,7 +1,7 @@
 # Common tasks. Run `just` to list them; see CONTRIBUTING.md for setup.
 
-# Minimum supported Rust; keep in sync with `rust-version` in Cargo.toml.
-msrv := "1.89"
+# Minimum supported Rust, read from `rust-version` in Cargo.toml.
+msrv := `sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml`
 
 default:
     @just --list

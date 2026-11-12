@@ -55,8 +55,13 @@ sororewind is not on crates.io yet. To build it from source instead, with
 Rust 1.89 or newer:
 
 ```bash
-cargo install --git https://github.com/Dione-b/sororewind
+cargo install --locked --git https://github.com/Dione-b/sororewind
 ```
+
+Keep `--locked`: it builds the embedded hosts with the exact dependency
+versions they are tested with. Without it, Cargo resolves their dependencies
+afresh, and a different version can change what a host charges for a call,
+turning a match into a divergence.
 
 Each build replays the Stellar protocols of the Soroban hosts it embeds:
 currently 29 and 30, so it covers testnet and mainnet across an upgrade, when
@@ -129,8 +134,15 @@ parts appear when they have something to say, or when you ask for detail:
   printed when the replay diverges, and always with `-v`.
 
 `-v` adds return values, the CPU and memory budget (local against the limits,
-and what the network used), and the full footprint lists. `-vv` also prints
-the raw on-chain and local diagnostic events, plus an RPC trace on stderr.
+and what the network used), and the full footprint lists. It also prints
+debug lines on stderr, tagged with where they come from: `[spec]` when a
+contract's error names could not be read, `[replay]` when ledger metadata or
+a cached module was unavailable, `[rpc]` for retried requests, and `[record]`
+while recording a fixture. `-vv` also prints the raw on-chain and local
+diagnostic events, plus a trace of every RPC request and response (`[rpc]`,
+or `[fixture]` when replaying a fixture) on stderr. The report itself always
+goes to stdout, so capture both to keep everything: `sororewind <TX_HASH> -vv
+2>&1 | tee run.log`.
 
 ## Exit codes
 
@@ -157,6 +169,9 @@ the usual `2`, so a script can treat `2` strictly as "diverged".
 | `--no-color` | Same as `--color never`. |
 | `-v, --verbose` | Repeat for more detail (`-v`, `-vv`). |
 | `--fixture <DIR>` | Replay from a recorded fixture directory, offline. The hash is optional, since the fixture records it; a different hash is an error. Cannot be combined with `--rpc-url`. |
+| `--completions <SHELL>` | Print a completion script for `bash`, `zsh`, `fish`, `elvish` or `powershell`, e.g. `sororewind --completions fish > ~/.config/fish/completions/sororewind.fish`. |
+| `--man` | Print a man page, e.g. `sororewind --man > ~/.local/share/man/man1/sororewind.1`. |
+| `-V, --version` | The version, the protocols this build replays, and the commit and target it was built from. Include it in bug reports. |
 
 The default RPCs are `https://soroban-testnet.stellar.org` (testnet),
 `https://mainnet.sorobanrpc.com` (mainnet, run by a third party),
@@ -176,6 +191,9 @@ main fields:
 |-------|---------|
 | `schemaVersion` | Version of the document's shape; currently `1`. It changes only when a field is removed, renamed, or changes meaning; new fields do not change it. |
 | `hash`, `network`, `ledger`, `protocol`, `closeTime` | Which transaction ran, and where. |
+| `feeBump` | Whether the transaction was wrapped in a fee-bump; `hash` is then whichever of the outer and inner hashes was asked for. |
+| `rpc` | Where the responses came from: the endpoint as scheme and host only (a path or query may hold an API key), or `fixture:<dir>`. |
+| `status` | Always `failed`: sororewind only replays failed transactions. |
 | `fidelity.match`, `fidelity.divergence` | Whether the replay matched, and if not, how it diverged. |
 | `result.onchain`, `result.local` | Each side's result, as `{ code, resultHash }`. |
 | `failure` | The error that ended the transaction, with the contract, function and depth it came from; `null` when there is none. `failure.cause` is the contract error a host error was raised in answer to, when there is one. |
@@ -298,7 +316,8 @@ fixture tooling and the live test.
 ### Fixtures
 
 A fixture is a complete offline recording of every RPC response one replay
-needs. Each directory under `fixtures/` holds one failed testnet transaction;
+needs. Each directory under `fixtures/` holds one failed transaction, from testnet
+unless its name says otherwise (`mainnet-auth-error`);
 `tests/narrative.rs` pins its narrative and exit code and checks the main JSON
 fields. The layout is documented at the top of `src/transport.rs`.
 

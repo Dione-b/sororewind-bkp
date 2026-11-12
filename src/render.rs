@@ -25,6 +25,8 @@ pub enum Detail {
 }
 
 impl Detail {
+    /// Map the number of `-v` flags to a level; more than two means
+    /// [`Detail::Diagnostics`].
     pub fn from_verbosity(verbose: u8) -> Detail {
         match verbose {
             0 => Detail::Summary,
@@ -40,20 +42,27 @@ pub enum ColorChoice {
     /// Colour when stdout is a terminal that can show it.
     #[default]
     Auto,
+    /// Colour even when stdout is not a terminal.
     Always,
+    /// Never colour.
     Never,
 }
 
 /// The environment variables and the terminal check [`use_color`] consults.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ColorEnv {
+    /// `NO_COLOR`, if set.
     pub no_color: Option<std::ffi::OsString>,
+    /// `CLICOLOR_FORCE`, if set.
     pub clicolor_force: Option<std::ffi::OsString>,
+    /// `TERM`, if set.
     pub term: Option<std::ffi::OsString>,
+    /// Whether stdout is a terminal.
     pub stdout_is_terminal: bool,
 }
 
 impl ColorEnv {
+    /// Read the variables and the terminal check from this process.
     pub fn current() -> Self {
         Self {
             no_color: std::env::var_os("NO_COLOR"),
@@ -382,10 +391,10 @@ fn call_tree(out: &mut impl Write, calls: &[Call], p: &Palette, detail: Detail) 
         let args: Vec<String> = call.args.iter().map(|arg| safe(arg)).collect();
         let mut line = format!("{ancestry}{branch}{head}({})", args.join(", "));
 
-        if detail >= Detail::Budget {
-            if let Some(returned) = &call.returned {
-                write!(line, " → {}", safe(returned))?;
-            }
+        if detail >= Detail::Budget
+            && let Some(returned) = &call.returned
+        {
+            write!(line, " → {}", safe(returned))?;
         }
         if call.recovered {
             write!(line, "  {}", p.dim("(recovered by try_call)"))?;

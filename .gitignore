@@ -1,3 +1,7 @@
 /target
 # Local tool binaries (e.g. the stellar CLI); not needed to build or test.
 .tools/
+# insta writes pending snapshot changes next to the snapshots; review them
+# with `cargo insta review` (`just snap`) instead of committing them.
+*.snap.new
+*.pending-snap

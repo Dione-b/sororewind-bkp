@@ -35,7 +35,11 @@ pub struct ErrorNames {
 /// The name of one error code, and where it was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorName {
+    /// The case name, or `Enum::Case or Enum::Case` when several enums
+    /// declare the code.
     pub name: String,
+    /// Where the name came from, worded for the report: the spec enum, the
+    /// SAC's built-in errors, or how many enums claim the code.
     pub origin: String,
 }
 
@@ -67,6 +71,7 @@ impl ErrorNames {
         }
     }
 
+    /// Just the name from [`ErrorNames::lookup`], without its origin.
     pub fn name(&self, code: u32) -> Option<String> {
         self.lookup(code).map(|found| found.name)
     }
@@ -210,6 +215,7 @@ fn leb128_u32(bytes: &[u8]) -> Option<(u32, usize)> {
 /// What executes a contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContractCode {
+    /// A WASM contract, with the bytes the ledger holds for it.
     Wasm(ContractWasm),
     /// The built-in Stellar Asset Contract: no WASM, no spec.
     StellarAsset,
@@ -218,6 +224,7 @@ pub enum ContractCode {
 /// A contract's WASM as the ledger has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractWasm {
+    /// The contract code entry's WASM bytes.
     pub wasm: Vec<u8>,
     /// The contract's instance or code was written at or after the
     /// transaction's ledger (and could not be rebuilt): it may have been

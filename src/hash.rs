@@ -17,6 +17,7 @@ use crate::error::RewindError;
 pub struct TxHash(String);
 
 impl TxHash {
+    /// The normalised hash: 64 lowercase hex characters, no `0x`.
     pub fn as_str(&self) -> &str {
         &self.0
     }

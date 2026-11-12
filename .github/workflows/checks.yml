@@ -79,16 +79,20 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo doc --no-deps --locked
 
-  # Keeps the `rust-version` in Cargo.toml honest.
+  # Keeps the `rust-version` in Cargo.toml honest. That line is the only
+  # place the version is written; this job reads it from there.
   msrv:
     if: github.workflow != 'Release' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    env:
-      # Overrides rust-toolchain.toml for every cargo and rustup call in the
-      # job, so the pinned toolchain is neither installed nor used here.
-      RUSTUP_TOOLCHAIN: "1.89"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: dtolnay/rust-toolchain@599c45df1a24c1c63ae1129a7e59f46654b8fb66 # 1.89
+      # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml for every later cargo
+      # and rustup call in the job, so the pinned toolchain is neither
+      # installed nor used here.
+      - run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          test -n "$msrv"
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --locked --all-targets

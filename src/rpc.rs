@@ -11,11 +11,11 @@ use std::collections::HashMap;
 use futures_util::{StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::{Result, RewindError};
 use crate::hash::TxHash;
-use crate::transport::{truncate, Transport};
+use crate::transport::{Transport, truncate};
 
 /// The most ledger keys one `getLedgerEntries` call accepts.
 ///
@@ -32,8 +32,12 @@ pub const MAX_TRANSACTIONS_PER_PAGE: u32 = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TxStatus {
+    /// The transaction was applied and succeeded.
     Success,
+    /// The transaction was applied and failed; its fee was still charged.
     Failed,
+    /// The RPC has no record of the hash: never applied, or older than its
+    /// retention window.
     NotFound,
     /// A status this build does not know: a newer RPC, or a provider's own.
     #[serde(other)]
@@ -44,31 +48,49 @@ pub enum TxStatus {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawTransaction {
+    /// `getTransaction`'s verdict on the hash.
     pub status: TxStatus,
+    /// The transaction's hash, lowercase hex; `None` when the record omits it.
     #[serde(default)]
     pub tx_hash: Option<String>,
+    /// Sequence of the ledger the transaction was applied in; `None` for
+    /// `NOT_FOUND`.
     #[serde(default)]
     pub ledger: Option<u32>,
     /// One-based position of the transaction in the ledger's apply order.
     #[serde(default)]
     pub application_order: Option<u32>,
+    /// The `TransactionEnvelope`, base64 XDR; `None` for `NOT_FOUND`.
     #[serde(default)]
     pub envelope_xdr: Option<String>,
+    /// The `TransactionResult`, base64 XDR; `None` for `NOT_FOUND`.
     #[serde(default)]
     pub result_xdr: Option<String>,
+    /// The `TransactionMeta`, base64 XDR: the ledger changes and diagnostic
+    /// events. `None` for `NOT_FOUND`.
     #[serde(default)]
     pub result_meta_xdr: Option<String>,
 }
 
+/// One entry from `getLedgerEntries`, still in pieces; `codec::assemble_entry`
+/// puts it back together.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawLedgerEntry {
+    /// The `LedgerKey` this entry answers, base64 XDR.
     pub key: String,
+    /// The entry body, a `LedgerEntryData`, base64 XDR.
     pub xdr: String,
+    /// The `LedgerEntryExt`, base64 XDR. Older RPCs omit it; it is then
+    /// replayed as `V0`.
     #[serde(default)]
     pub ext_xdr: Option<String>,
+    /// The ledger that last changed the entry; `None` when the RPC omits it,
+    /// which is reported as unknown drift.
     #[serde(default)]
     pub last_modified_ledger_seq: Option<u32>,
+    /// The last ledger the entry is live in; `None` for entries without a TTL
+    /// (accounts, trustlines and the like).
     #[serde(default)]
     pub live_until_ledger_seq: Option<u32>,
 }
@@ -83,7 +105,9 @@ struct GetLedgerEntriesResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawLedger {
+    /// The ledger's sequence number.
     pub sequence: u32,
+    /// The `LedgerHeaderHistoryEntry`, base64 XDR.
     pub header_xdr: String,
     /// The full `LedgerCloseMeta`, as a live RPC sends it.
     #[serde(default)]
@@ -98,6 +122,7 @@ pub struct RawLedger {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawChangeGroup {
+    /// When in the ledger these changes were applied.
     pub phase: crate::history::Phase,
     /// Zero-based apply position of the transaction in its ledger.
     pub tx: u32,
@@ -111,18 +136,24 @@ struct GetLedgersResponse {
     ledgers: Vec<RawLedger>,
 }
 
+/// One page of `getTransactions`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionsPage {
+    /// The transactions on this page, oldest first.
     #[serde(default)]
     pub transactions: Vec<RawTransaction>,
+    /// Where the next page starts; pass it back to `get_transactions`. `None`
+    /// when the RPC sends none.
     #[serde(default)]
     pub cursor: Option<String>,
 }
 
+/// `getNetwork`: the identity of the network the RPC serves.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkInfo {
+    /// The network passphrase, e.g. `Test SDF Network ; September 2015`.
     pub passphrase: String,
 }
 
@@ -131,10 +162,13 @@ pub struct NetworkInfo {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Health {
+    /// The newest ledger the RPC has ingested.
     #[serde(default)]
     pub latest_ledger: Option<u32>,
+    /// The oldest ledger the RPC still keeps.
     #[serde(default)]
     pub oldest_ledger: Option<u32>,
+    /// How many ledgers the RPC keeps, counting back from the latest.
     #[serde(default)]
     pub ledger_retention_window: Option<u32>,
 }
@@ -155,11 +189,13 @@ struct RpcErrorBody {
     data: Option<Value>,
 }
 
+/// The typed Soroban RPC client; every call goes through its [`Transport`].
 pub struct RpcClient {
     transport: Box<dyn Transport>,
 }
 
 impl RpcClient {
+    /// A client that sends every call through `transport`.
     pub fn new(transport: impl Transport + 'static) -> Self {
         Self {
             transport: Box::new(transport),
@@ -213,14 +249,18 @@ impl RpcClient {
         })
     }
 
+    /// `getHealth`: which ledgers the RPC holds.
     pub async fn health(&self) -> Result<Health> {
         self.call("getHealth", json!({})).await
     }
 
+    /// `getNetwork`: the passphrase of the network the RPC serves.
     pub async fn network(&self) -> Result<NetworkInfo> {
         self.call("getNetwork", json!({})).await
     }
 
+    /// `getTransaction` for `hash`. A hash the RPC does not know comes back as
+    /// [`TxStatus::NotFound`], not as an error.
     pub async fn get_transaction(&self, hash: &TxHash) -> Result<RawTransaction> {
         self.call("getTransaction", json!({ "hash": hash.as_str() }))
             .await

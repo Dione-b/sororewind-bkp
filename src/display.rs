@@ -224,7 +224,7 @@ pub fn diagnostic(event: &DiagnosticEvent) -> String {
         .event
         .contract_id
         .as_ref()
-        .map_or_else(|| "-".to_string(), |c| strkey::contract(&c.0 .0));
+        .map_or_else(|| "-".to_string(), |c| strkey::contract(&c.0.0));
     let (topics, data) = event_parts(&event.event);
     let topics: Vec<String> = topics.iter().map(scval).collect();
     format!(
@@ -269,7 +269,7 @@ pub fn ledger_key(key: &LedgerKey) -> String {
         },
         LedgerKey::LiquidityPool(k) => format!(
             "liquidity pool {}",
-            strkey::shorten(&strkey::liquidity_pool(&k.liquidity_pool_id.0 .0), 8)
+            strkey::shorten(&strkey::liquidity_pool(&k.liquidity_pool_id.0.0), 8)
         ),
         LedgerKey::ContractData(k) => format!(
             "contract data {} {} ({})",
@@ -301,7 +301,7 @@ fn trustline_asset(asset: &TrustLineAsset) -> String {
         TrustLineAsset::Native => "native".to_string(),
         TrustLineAsset::CreditAlphanum4(a) => credit(&a.asset_code.0, &a.issuer),
         TrustLineAsset::CreditAlphanum12(a) => credit(&a.asset_code.0, &a.issuer),
-        TrustLineAsset::PoolShare(pool) => format!("pool {}", hex_prefix(&pool.0 .0)),
+        TrustLineAsset::PoolShare(pool) => format!("pool {}", hex_prefix(&pool.0.0)),
     }
 }
 

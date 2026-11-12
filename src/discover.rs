@@ -16,7 +16,9 @@ use crate::tx;
 /// A failed `InvokeHostFunction` transaction found on the network.
 #[derive(Debug, Clone)]
 pub struct Candidate {
+    /// The transaction's hash, ready to pass to sororewind.
     pub hash: TxHash,
+    /// Sequence number of the ledger it was applied in.
     pub ledger: u32,
     /// The result code the network recorded.
     pub result: InvokeHostFunctionResult,
@@ -129,11 +131,11 @@ async fn failures_between(rpc: &RpcClient, from: u32, to: u32) -> Result<Vec<Can
 fn category(tx: &tx::DecodedTx) -> String {
     let last_error = tx.onchain_diagnostic_events.iter().rev().find_map(|event| {
         match display::event_parts(&event.event).0 {
-            [stellar_xdr::ScVal::Symbol(kind), stellar_xdr::ScVal::Error(error), ..]
-                if kind.0.as_slice() == b"error" =>
-            {
-                Some(error.discriminant())
-            }
+            [
+                stellar_xdr::ScVal::Symbol(kind),
+                stellar_xdr::ScVal::Error(error),
+                ..,
+            ] if kind.0.as_slice() == b"error" => Some(error.discriminant()),
             _ => None,
         }
     });
@@ -151,7 +153,7 @@ mod tests {
     use super::*;
     use crate::codec;
     use crate::test_support::{
-        error_event, invoke_envelope, result_xdr, InvokeSpec, MemoryTransport,
+        InvokeSpec, MemoryTransport, error_event, invoke_envelope, result_xdr,
     };
     use serde_json::json;
     use stellar_xdr::{ScError, ScErrorCode};
@@ -202,9 +204,11 @@ mod tests {
         // Newest window first, newest transaction first within it. The first
         // window is the 60 ledgers up to and including the latest.
         assert_eq!(ledgers, [943, 942, 902]);
-        assert!(found
-            .iter()
-            .all(|c| c.result == InvokeHostFunctionResult::Trapped));
+        assert!(
+            found
+                .iter()
+                .all(|c| c.result == InvokeHostFunctionResult::Trapped)
+        );
         assert_eq!(found[0].category, "trapped");
     }
 

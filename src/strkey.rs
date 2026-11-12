@@ -4,27 +4,32 @@
 //! fixed-capacity `heapless::String`; going through `format!` instead picks up
 //! their `Display` impls and gives us an ordinary owned `String`.
 
-use stellar_strkey::{ed25519, ClaimableBalance, Contract, LiquidityPool};
+use stellar_strkey::{ClaimableBalance, Contract, LiquidityPool, ed25519};
 use stellar_xdr::{AccountId, ClaimableBalanceId, ContractId, Hash, PublicKey, ScAddress};
 
+/// The `G…` strkey of an ed25519 public key.
 pub fn account(bytes: &[u8; 32]) -> String {
     format!("{}", ed25519::PublicKey(*bytes))
 }
 
+/// The `G…` strkey of an account.
 pub fn account_id(id: &AccountId) -> String {
     match &id.0 {
         PublicKey::PublicKeyTypeEd25519(key) => account(&key.0),
     }
 }
 
+/// The `C…` strkey of a contract id.
 pub fn contract(bytes: &[u8; 32]) -> String {
     format!("{}", Contract(*bytes))
 }
 
+/// The `B…` strkey of a V0 claimable balance id.
 pub fn claimable_balance(bytes: &[u8; 32]) -> String {
     format!("{}", ClaimableBalance::V0(*bytes))
 }
 
+/// The `L…` strkey of a liquidity pool id.
 pub fn liquidity_pool(bytes: &[u8; 32]) -> String {
     format!("{}", LiquidityPool(*bytes))
 }
@@ -47,10 +52,11 @@ pub fn shorten(strkey: &str, tail: usize) -> String {
     format!("{first}…{last}")
 }
 
+/// The strkey of any `ScAddress`; muxed addresses keep their mux id.
 pub fn address(addr: &ScAddress) -> String {
     match addr {
         ScAddress::Account(id) => account_id(id),
-        ScAddress::Contract(c) => contract(&c.0 .0),
+        ScAddress::Contract(c) => contract(&c.0.0),
         // The `M…` strkey carries the mux id, so two sub-accounts of one
         // account stay distinct.
         ScAddress::MuxedAccount(m) => format!(
@@ -63,17 +69,18 @@ pub fn address(addr: &ScAddress) -> String {
         ScAddress::ClaimableBalance(ClaimableBalanceId::ClaimableBalanceIdTypeV0(h)) => {
             claimable_balance(&h.0)
         }
-        ScAddress::LiquidityPool(pool) => liquidity_pool(&pool.0 .0),
+        ScAddress::LiquidityPool(pool) => liquidity_pool(&pool.0.0),
         ScAddress::MuxedContract(m) => format!(
             "{}",
             stellar_strkey::MuxedContract {
-                contract_id: m.contract_id.0 .0,
+                contract_id: m.contract_id.0.0,
                 id: m.id,
             }
         ),
     }
 }
 
+/// [`address`], shortened to its first character and last four.
 pub fn short_address(addr: &ScAddress) -> String {
     shorten(&address(addr), 4)
 }

@@ -17,6 +17,9 @@
 //! `find_failed`. Fixtures that replay as a divergence are skipped: they
 //! captured a ledger that had already moved and cannot be reproduced.
 
+// A command-line tool: printing is what it is for.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -153,11 +156,11 @@ async fn rerecord(args: &Args, name: &str, hash: &TxHash) -> Result<Recorded> {
 async fn main() -> ExitCode {
     let args = Args::parse();
     let single = args.name.clone().zip(args.hash.clone());
-    if let Some((name, _)) = &single {
-        if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
-            eprintln!("record_fixture: invalid fixture name `{name}`");
-            return ExitCode::FAILURE;
-        }
+    if let Some((name, _)) = &single
+        && (name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']))
+    {
+        eprintln!("record_fixture: invalid fixture name `{name}`");
+        return ExitCode::FAILURE;
     }
     let jobs = match single.clone() {
         Some(job) => vec![job],

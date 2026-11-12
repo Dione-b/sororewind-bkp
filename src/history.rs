@@ -100,6 +100,7 @@ pub const BACKWARD_HOPS: u32 = 24;
 /// The transaction whose view of the ledger is being rebuilt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
+    /// The ledger it was applied in.
     pub ledger: u32,
     /// One-based position in the ledger's apply order.
     pub application_order: Option<u32>,
@@ -108,6 +109,7 @@ pub struct Target {
 /// An entry as the transaction saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PastValue {
+    /// Its value then, from the `state` record of the first later change.
     Entry(Box<LedgerEntry>),
     /// It did not exist yet.
     Absent,
@@ -120,6 +122,7 @@ pub enum PastValue {
 /// nothing and the current state stands.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Past {
+    /// The entry's value when the transaction ran.
     pub value: Option<PastValue>,
     /// The entry's `liveUntilLedgerSeq` when the transaction ran.
     pub live_until: Option<u32>,
@@ -128,6 +131,7 @@ pub struct Past {
 /// The outcome of a rebuild: one [`Past`] per footprint key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rebuild {
+    /// In footprint order.
     pub past: Vec<Past>,
     /// Why some drifted entries were left as they are now.
     pub note: Option<String>,
@@ -137,11 +141,17 @@ pub struct Rebuild {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Phase {
+    /// `feeProcessing`: the fee charged before any transaction is applied.
     Fee,
+    /// `txChangesBefore`: the sequence-number bump.
     Before,
+    /// The operations' changes.
     Operations,
+    /// `txChangesAfter`.
     After,
+    /// `postTxApplyFeeProcessing`: Soroban refunds.
     PostFee,
+    /// `upgradesProcessing`.
     Upgrade,
 }
 
@@ -195,7 +205,7 @@ impl LedgerChanges {
                 return Err(RewindError::MissingField {
                     method: "getLedgers",
                     field: "metadataXdr",
-                })
+                });
             }
         };
         groups.sort_by_key(Group::order);
@@ -414,16 +424,16 @@ impl Tracker {
                         }
                     });
                 }
-            } else if let Some(&index) = self.ttl.get(&key) {
-                if !self.ttl_seen[index] {
-                    self.ttl_seen[index] = true;
-                    if let LedgerEntryChange::State(LedgerEntry {
-                        data: LedgerEntryData::Ttl(ttl),
-                        ..
-                    }) = change
-                    {
-                        self.live_until[index] = Some(ttl.live_until_ledger_seq);
-                    }
+            } else if let Some(&index) = self.ttl.get(&key)
+                && !self.ttl_seen[index]
+            {
+                self.ttl_seen[index] = true;
+                if let LedgerEntryChange::State(LedgerEntry {
+                    data: LedgerEntryData::Ttl(ttl),
+                    ..
+                }) = change
+                {
+                    self.live_until[index] = Some(ttl.live_until_ledger_seq);
                 }
             }
         }
@@ -680,8 +690,8 @@ fn note(entries: usize, reasons: &[Unresolved]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{account_entry, data_entry, raw_entry, MemoryTransport};
-    use serde_json::{json, Value};
+    use crate::test_support::{MemoryTransport, account_entry, data_entry, raw_entry};
+    use serde_json::{Value, json};
     use stellar_xdr::{
         ContractDataDurability::Persistent, LedgerCloseMetaV2, OperationMetaV2, TransactionMetaV4,
         TransactionResultMetaV1, TtlEntry,
@@ -1089,9 +1099,10 @@ mod tests {
         };
         let kept = LedgerChanges::from_raw(&slimmed).unwrap();
         assert_eq!(states(&kept, Some(1)), [220, 230, 140, 240]);
-        assert!(kept
-            .after(None)
-            .all(|change| change_key(change).as_ref() == Some(&key)));
+        assert!(
+            kept.after(None)
+                .all(|change| change_key(change).as_ref() == Some(&key))
+        );
         // One `state` per update: the `updated` halves are not kept.
         assert_eq!(kept.after(None).count(), 10);
         assert_eq!(slim("AAAA", &keep), None);

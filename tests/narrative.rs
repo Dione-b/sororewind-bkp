@@ -10,8 +10,8 @@
 
 mod common;
 
-use sororewind::render::{self, Detail};
 use sororewind::Outcome;
+use sororewind::render::{self, Detail};
 
 async fn check(name: &str, expected: Outcome) {
     let result = common::replay(name).await;
