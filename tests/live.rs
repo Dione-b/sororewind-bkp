@@ -1,7 +1,9 @@
 //! Live end-to-end test against the public testnet RPC.
 //!
 //! Ignored by default (`cargo test` stays offline and deterministic); CI runs
-//! it nightly with `cargo test --test live -- --ignored --nocapture`.
+//! it nightly with `cargo test --release --test live -- --ignored --nocapture`
+//! (`just live`). It runs optimised because it times each replay, and an
+//! unoptimised host interprets WASM several times slower.
 //!
 //! No hash is committed here: the RPC forgets transactions after about a
 //! week, so the test asks the network for its most recent failures instead.
@@ -10,11 +12,11 @@
 //! contract can fill the whole recent history), so the test samples a few
 //! failures of each kind and demands that every replay completes in time and
 //! that at least one matches.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 use std::time::{Duration, Instant};
 
-use sororewind::discover::{recent_failures, Candidate, Search};
+use sororewind::discover::{Candidate, Search, recent_failures};
 use sororewind::rpc::RpcClient;
 use sororewind::transport::HttpTransport;
 use sororewind::{Network, Outcome, Request};
@@ -22,8 +24,9 @@ use sororewind::{Network, Outcome, Request};
 /// How many recent failures of each category to replay.
 const PER_CATEGORY: usize = 3;
 
-/// The tool must answer in a few seconds; generous headroom for CI, but it
-/// still catches a pathological RPC round-trip.
+/// The tool must answer in a few seconds; generous headroom for CI and for a
+/// replay that fetches ledger metadata, but it still catches a pathological
+/// RPC round-trip. Meant for a release build.
 const TIME_BUDGET: Duration = Duration::from_secs(15);
 
 #[tokio::test]
@@ -111,7 +114,7 @@ async fn no_network_is_ahead_of_the_embedded_hosts() {
     for network in [Network::Testnet, Network::Mainnet] {
         let rpc = RpcClient::new(HttpTransport::new(network.default_rpc_url()).unwrap());
         let passphrase = rpc.network().await.unwrap().passphrase;
-        let latest = rpc.health().await.unwrap().latest_ledger;
+        let latest = rpc.health().await.unwrap().latest_ledger.unwrap();
         let ledger = sororewind::state::read_ledger(&rpc, latest, &passphrase)
             .await
             .unwrap();

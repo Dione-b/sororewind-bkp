@@ -26,8 +26,8 @@ use crate::codec;
 use crate::error::{Result, RewindError};
 use crate::replay::{BudgetUse, Fidelity, PrngSeed};
 use crate::report::{
-    Diagnostics, FootprintReport, Report, ResultPair, ResultSummary, TtlDriftEntry, TtlDriftReason,
-    SCHEMA_VERSION,
+    Diagnostics, FootprintReport, Report, ResultPair, ResultSummary, SCHEMA_VERSION, TtlDriftEntry,
+    TtlDriftReason,
 };
 use crate::rpc::{RawLedgerEntry, RawTransaction, TxStatus};
 use crate::story::Story;
@@ -94,6 +94,7 @@ impl Transport for MemoryTransport {
                 Some(respond) => Ok(respond(params)),
                 None => Err(RewindError::Rpc {
                     origin: self.origin(),
+                    code: None,
                     method: method.to_string(),
                     detail: "no response configured".to_string(),
                 }),
@@ -291,6 +292,46 @@ pub fn config_entry(id: ConfigSettingId, last_modified: u32) -> RawLedgerEntry {
                 ..StateArchivalSettings::default()
             })
         }
+        ConfigSettingId::ContractLedgerCostV0 => ConfigSettingEntry::ContractLedgerCostV0(
+            stellar_xdr::ConfigSettingContractLedgerCostV0 {
+                fee_disk_read_ledger_entry: 6_250,
+                fee_write_ledger_entry: 10_000,
+                fee_disk_read1_kb: 1_786,
+                soroban_state_target_size_bytes: 3_000_000_000,
+                rent_fee1_kb_soroban_state_size_low: -17_000,
+                rent_fee1_kb_soroban_state_size_high: 10_000,
+                soroban_state_rent_fee_growth_factor: 5_000,
+                ..Default::default()
+            },
+        ),
+        ConfigSettingId::ContractLedgerCostExtV0 => ConfigSettingEntry::ContractLedgerCostExtV0(
+            stellar_xdr::ConfigSettingContractLedgerCostExtV0 {
+                tx_max_footprint_entries: 100,
+                fee_write1_kb: 3_500,
+            },
+        ),
+        ConfigSettingId::ContractHistoricalDataV0 => ConfigSettingEntry::ContractHistoricalDataV0(
+            stellar_xdr::ConfigSettingContractHistoricalDataV0 {
+                fee_historical1_kb: 16_235,
+            },
+        ),
+        ConfigSettingId::ContractBandwidthV0 => {
+            ConfigSettingEntry::ContractBandwidthV0(stellar_xdr::ConfigSettingContractBandwidthV0 {
+                fee_tx_size1_kb: 1_624,
+                ..Default::default()
+            })
+        }
+        ConfigSettingId::ContractMaxSizeBytes => ConfigSettingEntry::ContractMaxSizeBytes(131_072),
+        ConfigSettingId::ContractDataEntrySizeBytes => {
+            ConfigSettingEntry::ContractDataEntrySizeBytes(65_536)
+        }
+        ConfigSettingId::LiveSorobanStateSizeWindow => {
+            ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                vec![1_000_000_000u64, 1_000_000_002, 1_000_000_003]
+                    .try_into()
+                    .unwrap(),
+            )
+        }
         other => panic!("no test value for {other}"),
     };
     raw_entry(
@@ -299,7 +340,7 @@ pub fn config_entry(id: ConfigSettingId, last_modified: u32) -> RawLedgerEntry {
     )
 }
 
-/// The five settings `state::build_config` asks for, in request order.
+/// The settings `state::build_config` asks for, in request order.
 pub fn config_entries(last_modified: u32) -> Vec<Option<RawLedgerEntry>> {
     [
         ConfigSettingId::ContractCostParamsCpuInstructions,
@@ -307,6 +348,13 @@ pub fn config_entries(last_modified: u32) -> Vec<Option<RawLedgerEntry>> {
         ConfigSettingId::ContractComputeV0,
         ConfigSettingId::ContractEventsV0,
         ConfigSettingId::StateArchival,
+        ConfigSettingId::ContractLedgerCostV0,
+        ConfigSettingId::ContractLedgerCostExtV0,
+        ConfigSettingId::ContractHistoricalDataV0,
+        ConfigSettingId::ContractBandwidthV0,
+        ConfigSettingId::ContractMaxSizeBytes,
+        ConfigSettingId::ContractDataEntrySizeBytes,
+        ConfigSettingId::LiveSorobanStateSizeWindow,
     ]
     .into_iter()
     .map(|id| Some(config_entry(id, last_modified)))
@@ -467,6 +515,8 @@ pub fn decoded_tx() -> DecodedTx {
         source_account: account([1; 32]),
         host_function: host_function(),
         resources: resources(),
+        resource_fee: 0,
+        envelope_size: 0,
         auth: Vec::new(),
         restored_rw_indices: Vec::new(),
         onchain_result: InvokeHostFunctionResult::Trapped,
@@ -476,17 +526,22 @@ pub fn decoded_tx() -> DecodedTx {
 
 // --- WASM -------------------------------------------------------------------
 
-/// A WASM binary made of the given `(section id, payload)` pairs. Payloads
-/// must be shorter than 128 bytes so their length fits one LEB128 byte.
+/// A WASM binary made of the given `(section id, payload)` pairs.
 pub fn wasm_with_sections(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
     let mut wasm = b"\0asm\x01\0\0\0".to_vec();
     for (id, payload) in sections {
-        assert!(
-            payload.len() < 128,
-            "test helper only writes one-byte lengths"
-        );
         wasm.push(*id);
-        wasm.push(payload.len() as u8);
+        // The length, as unsigned LEB128.
+        let mut length = payload.len();
+        loop {
+            let byte = (length & 0x7f) as u8;
+            length >>= 7;
+            if length == 0 {
+                wasm.push(byte);
+                break;
+            }
+            wasm.push(byte | 0x80);
+        }
         wasm.extend(payload);
     }
     wasm
@@ -522,16 +577,15 @@ pub fn sample_report() -> Report {
     let events = [
         fn_call(None, C, "outer", vec![ScVal::U32(1), string("two")]),
         log_event(Some(C), "starting"),
+        // A `try_call` that fails and is recovered from.
         fn_call(Some(C), C, "probe", vec![]),
-        fn_return(C, "probe", ScVal::Void),
+        error_event(Some(C), ScError::Contract(9), "probe failed"),
         fn_call(Some(C), C, "inner", vec![]),
         log_event(Some(C), "about to fail"),
         error_event(Some(C), fatal.clone(), "balance too low"),
         error_event(Some(C), fatal.clone(), "escalating"),
     ];
     let mut story = Story::build(&events, Some(&fatal));
-    // Pretend `probe` was a recovered try_call so that rendering is covered.
-    story.calls[1].recovered = true;
     if let Some(failure) = &mut story.failure {
         failure.name = Some("InsufficientBalance".to_string());
         failure.name_origin = Some("spec enum Error".to_string());
@@ -548,7 +602,7 @@ pub fn sample_report() -> Report {
         ledger: 1_000,
         protocol: 30,
         close_time: 1_700_000_000,
-        status: TxStatus::Failed,
+        status: "failed",
         fidelity: Fidelity::MATCH,
         result: ResultPair {
             onchain: trapped.clone(),
@@ -571,13 +625,13 @@ pub fn sample_report() -> Report {
                 entry: "contract data C…AAAA Balance (persistent)".to_string(),
                 reason: TtlDriftReason::ExtendedSince,
             }],
-            archived: Vec::new(),
-            config_drifted: Vec::new(),
+            ..FootprintReport::default()
         },
         prng_seed: PrngSeed::Derived,
         diagnostics: Diagnostics {
             onchain: vec![diagnostic.clone()],
             local: vec![diagnostic],
+            ..Diagnostics::default()
         },
     }
 }

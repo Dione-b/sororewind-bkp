@@ -1,7 +1,7 @@
 [package]
 name = "sororewind"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.89"
 description = "Replay a failed Soroban transaction locally and narrate the call tree to the point of failure"
 license = "Apache-2.0"
@@ -14,8 +14,10 @@ exclude = ["fixtures/", "tests/", ".github/"]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+clap_mangen = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # One Soroban host per protocol this build replays, at most two at a time
 # (the previous and the current one). Each host's major version is the
@@ -31,10 +33,12 @@ thiserror = "2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# reqwest already pulls 0.23 in; the hosts use 0.22 for their XDR.
 base64 = "0.23"
 hex = "0.4"
 stellar-strkey = "1.0"
-sha2 = "0.11"
+# The version the hosts and stellar-xdr hash with, so it is built once.
+sha2 = "0.10"
 
 [dev-dependencies]
 insta = "1.49"
@@ -42,6 +46,8 @@ tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -49,13 +55,19 @@ unwrap_used = "warn"
 expect_used = "warn"
 too_many_arguments = "warn"
 needless_pass_by_value = "warn"
+# Only `src/main.rs` writes to the terminal; the library returns what to print.
+print_stdout = "warn"
+print_stderr = "warn"
 
+# What `cargo install` builds: thin LTO keeps a source install of two
+# embedded hosts quick.
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
 strip = true
 
-# The profile that 'dist' will build with
+# The profile that 'dist' will build with: the published binaries are built
+# once per release, so they get the full optimisation.
 [profile.dist]
 inherits = "release"
-lto = "thin"
+lto = true
+codegen-units = 1

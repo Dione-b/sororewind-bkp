@@ -20,17 +20,29 @@ use crate::rpc::RawTransaction;
 /// Everything replay needs, lifted out of the envelope.
 #[derive(Debug)]
 pub struct DecodedTx {
+    /// The hash the transaction was fetched by.
     pub hash: TxHash,
+    /// Sequence of the ledger the transaction was applied in.
     pub ledger: u32,
     /// The envelope was a fee-bump wrapping the Soroban transaction.
     pub fee_bump: bool,
-    /// One-based position in the ledger's apply order, when the RPC reports it.
+    /// One-based position in the ledger's apply order, when the RPC reports
+    /// it. Zero is not a position: its readers treat it as unknown.
     pub application_order: Option<u32>,
 
     /// The account the host treats as the transaction invoker.
     pub source_account: AccountId,
+    /// What the `InvokeHostFunction` operation asked the host to run.
     pub host_function: HostFunction,
+    /// The declared footprint and resource limits (`sorobanData.resources`).
     pub resources: SorobanResources,
+    /// The resource fee the transaction declared (`sorobanData.resourceFee`).
+    pub resource_fee: i64,
+    /// XDR size of the Soroban transaction's own envelope, signatures
+    /// included: what core charges the transaction-size fee on. For a
+    /// fee-bump that is the inner envelope.
+    pub envelope_size: u32,
+    /// The authorization entries the operation carried, in envelope order.
     pub auth: Vec<SorobanAuthorizationEntry>,
     /// Indices into `resources.footprint.read_write` of entries the transaction
     /// asked the host to auto-restore. Empty for ordinary invocations.
@@ -38,6 +50,8 @@ pub struct DecodedTx {
 
     /// What the network actually recorded.
     pub onchain_result: InvokeHostFunctionResult,
+    /// The diagnostic events the network recorded; empty when the RPC sent
+    /// no `resultMetaXdr` or the meta holds none.
     pub onchain_diagnostic_events: Vec<DiagnosticEvent>,
 }
 
@@ -54,18 +68,22 @@ impl DecodedTx {
             .collect()
     }
 
+    /// The host function as raw XDR, for the host.
     pub fn encoded_host_function(&self) -> Result<Vec<u8>> {
         codec::encode(&self.host_function, "the host function")
     }
 
+    /// The declared resources as raw XDR, for the host.
     pub fn encoded_resources(&self) -> Result<Vec<u8>> {
         codec::encode(&self.resources, "the transaction resources")
     }
 
+    /// The source account as raw XDR, for the host.
     pub fn encoded_source_account(&self) -> Result<Vec<u8>> {
         codec::encode(&self.source_account, "the source account")
     }
 
+    /// Each authorization entry as raw XDR, in envelope order.
     pub fn encoded_auth(&self) -> Result<Vec<Vec<u8>>> {
         self.auth
             .iter()
@@ -74,27 +92,30 @@ impl DecodedTx {
     }
 }
 
+/// Decode a `getTransaction` record. Fails with `NotSoroban` unless the
+/// envelope holds exactly one `InvokeHostFunction` operation with Soroban
+/// resources, and with `MissingField` when the RPC left out a field it needs.
 pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
     let not_soroban = |reason: String| RewindError::NotSoroban {
         hash: hash.clone(),
         reason,
     };
-    let field = |value: &Option<String>, field: &'static str| {
-        value.clone().ok_or(RewindError::MissingField {
+    fn field<'a>(value: &'a Option<String>, field: &'static str) -> Result<&'a str> {
+        value.as_deref().ok_or(RewindError::MissingField {
             method: "getTransaction",
             field,
         })
-    };
+    }
 
     let envelope: TransactionEnvelope =
-        codec::decode(&field(&raw.envelope_xdr, "envelopeXdr")?, "envelopeXdr")?;
+        codec::decode(field(&raw.envelope_xdr, "envelopeXdr")?, "envelopeXdr")?;
 
     // A fee-bump only changes who pays: the Soroban transaction is its inner
     // transaction, and that is what the host executes.
-    let (tx, fee_bump) = match envelope {
-        TransactionEnvelope::Tx(v1) => (v1.tx, false),
+    let (inner, fee_bump) = match envelope {
+        TransactionEnvelope::Tx(v1) => (v1, false),
         TransactionEnvelope::TxFeeBump(outer) => match outer.tx.inner_tx {
-            FeeBumpTransactionInnerTx::Tx(inner) => (inner.tx, true),
+            FeeBumpTransactionInnerTx::Tx(inner) => (inner, true),
         },
         TransactionEnvelope::TxV0(_) => {
             return Err(not_soroban(
@@ -103,6 +124,9 @@ pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
             ));
         }
     };
+    // A `TransactionEnvelope` is its four-byte type followed by the envelope.
+    let envelope_size = 4 + codec::encode(&inner, "the transaction envelope")?.len();
+    let tx = inner.tx;
     let Transaction {
         source_account: tx_source,
         operations,
@@ -135,7 +159,7 @@ pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
     })?;
 
     let tx_result: TransactionResult =
-        codec::decode(&field(&raw.result_xdr, "resultXdr")?, "resultXdr")?;
+        codec::decode(field(&raw.result_xdr, "resultXdr")?, "resultXdr")?;
     let onchain_result = extract_invoke_result(&tx_result, hash)?;
 
     let onchain_diagnostic_events = match raw.result_meta_xdr.as_deref() {
@@ -156,10 +180,12 @@ pub fn decode(hash: &TxHash, raw: &RawTransaction) -> Result<DecodedTx> {
         hash: hash.clone(),
         ledger,
         fee_bump,
-        application_order: raw.application_order.filter(|order| *order > 0),
+        application_order: raw.application_order,
         source_account,
         host_function: invoke.host_function.clone(),
         resources: soroban_data.resources,
+        resource_fee: soroban_data.resource_fee,
+        envelope_size: u32::try_from(envelope_size).unwrap_or(u32::MAX),
         auth: invoke.auth.to_vec(),
         restored_rw_indices,
         onchain_result,
@@ -234,7 +260,7 @@ mod tests {
     use super::*;
     use crate::rpc::TxStatus;
     use crate::test_support::{
-        account, fee_bump, invoke_envelope, muxed, raw_tx, result_xdr, tx_result, InvokeSpec,
+        InvokeSpec, account, fee_bump, invoke_envelope, muxed, raw_tx, result_xdr, tx_result,
     };
     use stellar_xdr::{
         InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
@@ -436,11 +462,13 @@ mod tests {
             .try_into()
             .unwrap(),
         ));
-        assert!(reason(raw_tx(
-            &invoke_envelope(&InvokeSpec::default()),
-            &wrong_result
-        ))
-        .contains("`Payment`, not a host function result"));
+        assert!(
+            reason(raw_tx(
+                &invoke_envelope(&InvokeSpec::default()),
+                &wrong_result
+            ))
+            .contains("`Payment`, not a host function result")
+        );
     }
 
     #[test]

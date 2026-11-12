@@ -9,14 +9,18 @@
 //! hashes in a fixture expire from the RPC after about a week, so new
 //! fixtures always start from a transaction found this way.
 
+// A command-line tool: printing is what it is for.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::process::ExitCode;
 
 use clap::Parser;
-use sororewind::discover::{recent_failures, Search};
-use sororewind::display;
+use sororewind::Network;
+use sororewind::discover::{Search, recent_failures};
+use sororewind::network::NetworkId;
+use sororewind::report::ResultSummary;
 use sororewind::rpc::RpcClient;
 use sororewind::transport::HttpTransport;
-use sororewind::Network;
 
 #[derive(Parser)]
 struct Args {
@@ -33,6 +37,24 @@ struct Args {
     ledgers: u32,
 }
 
+/// Scan `rpc`, once it is known to serve `network`: `--network mainnet` with
+/// a testnet `--rpc-url` must not quietly list testnet transactions.
+async fn scan(
+    rpc: &RpcClient,
+    network: Network,
+    search: Search,
+) -> sororewind::Result<Vec<sororewind::discover::Candidate>> {
+    let actual = NetworkId::from_passphrase(&rpc.network().await?.passphrase);
+    if actual != NetworkId::Known(network) {
+        return Err(sororewind::RewindError::NetworkMismatch {
+            expected: network,
+            actual,
+            origin: rpc.origin(),
+        });
+    }
+    recent_failures(rpc, search).await
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
@@ -45,7 +67,7 @@ async fn main() -> ExitCode {
     };
 
     let found = match HttpTransport::new(url) {
-        Ok(http) => recent_failures(&RpcClient::new(http), search).await,
+        Ok(http) => scan(&RpcClient::new(http), args.network, search).await,
         Err(err) => Err(err),
     };
     match found {
@@ -56,7 +78,7 @@ async fn main() -> ExitCode {
                     candidate.category,
                     candidate.hash,
                     candidate.ledger,
-                    display::result_label(&candidate.result)
+                    ResultSummary::from(&candidate.result).label()
                 );
             }
             ExitCode::SUCCESS

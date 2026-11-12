@@ -13,11 +13,14 @@ use crate::rpc::RawLedgerEntry;
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
+/// Decode standard base64, ignoring surrounding whitespace; `what` names
+/// the field in the error.
 pub fn b64_decode(text: &str, what: &'static str) -> Result<Vec<u8>> {
     B64.decode(text.trim())
         .map_err(|source| RewindError::Base64 { what, source })
 }
 
+/// Encode bytes as standard, padded base64.
 pub fn b64_encode(bytes: &[u8]) -> String {
     B64.encode(bytes)
 }
@@ -41,7 +44,9 @@ pub fn encode<T: WriteXdr>(value: &T, what: &'static str) -> Result<Vec<u8>> {
 pub fn assemble_entry(raw: &RawLedgerEntry) -> Result<LedgerEntry> {
     let data: LedgerEntryData = decode(&raw.xdr, "a ledger entry body")?;
 
-    // Older RPCs omit the field; an absent extension means `V0`.
+    // Older RPCs omit the field; an absent extension is replayed as `V0`,
+    // and `state` reports the classic entries it may have shrunk. Likewise an
+    // absent sequence is `0` for the host, and reported as unknown drift.
     let ext = match raw.ext_xdr.as_deref() {
         Some(text) if !text.is_empty() => decode(text, "a ledger entry extension")?,
         _ => LedgerEntryExt::V0,

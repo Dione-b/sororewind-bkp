@@ -12,7 +12,6 @@ use stellar_xdr::InvokeHostFunctionResult;
 use crate::display;
 use crate::hash::TxHash;
 use crate::replay::{BudgetUse, Fidelity, PrngSeed};
-use crate::rpc::TxStatus;
 use crate::state::TtlDrift;
 use crate::story::Story;
 
@@ -24,7 +23,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Report {
+    /// Always [`SCHEMA_VERSION`].
     pub schema_version: u32,
+    /// The transaction that was replayed.
     pub hash: TxHash,
     /// The transaction was wrapped in a fee-bump; `hash` may be the outer or
     /// the inner hash, whichever the RPC was asked for.
@@ -33,25 +34,35 @@ pub struct Report {
     pub network: String,
     /// The endpoint, or `fixture:<dir>`.
     pub rpc: String,
+    /// Sequence number of the ledger the transaction was applied in.
     pub ledger: u32,
+    /// Protocol version of that ledger, which picked the host that replayed it.
     pub protocol: u32,
     /// Close time of the transaction's ledger, seconds since the Unix epoch.
     pub close_time: u64,
-    pub status: TxStatus,
+    /// Always `failed`: sororewind only replays failures.
+    pub status: &'static str,
 
+    /// Whether the replay reproduced the network's outcome.
     pub fidelity: Fidelity,
+    /// The network's recorded result and the replay's.
     pub result: ResultPair,
     /// `failure` and `calls`.
     #[serde(flatten)]
     pub story: Story,
 
+    /// CPU and memory the replay used, against its limits and the network's.
     pub budget: BudgetUse,
+    /// How faithfully the footprint's entries could be put back as they were.
     pub footprint: FootprintReport,
+    /// Whether the host's PRNG seed matched the network's.
     pub prng_seed: PrngSeed,
+    /// The diagnostic events of both runs.
     pub diagnostics: Diagnostics,
 }
 
 impl Report {
+    /// Whether the replay matched the network, for the exit code.
     pub fn outcome(&self) -> Outcome {
         if self.fidelity.matches {
             Outcome::Matched
@@ -73,7 +84,9 @@ pub enum Outcome {
 /// The network's result next to the local one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResultPair {
+    /// What the network recorded.
     pub onchain: ResultSummary,
+    /// What the local replay produced.
     pub local: ResultSummary,
 }
 
@@ -126,30 +139,56 @@ pub struct FootprintReport {
     /// Entries that were archived when the transaction ran and not restored
     /// by it.
     pub archived: Vec<String>,
+    /// The archived entries whose TTL back then is lost: that they were
+    /// archived is taken from the network's `ENTRY_ARCHIVED` result, so a
+    /// match on that result is assumed rather than reproduced.
+    pub archived_inferred: Vec<String>,
+    /// Entries that changed since the transaction and were rebuilt, from
+    /// ledger metadata, as the transaction saw them.
+    pub rebuilt: Vec<String>,
+    /// Why the entries still listed in `drifted` could not be rebuilt.
+    pub rebuild_note: Option<String>,
+    /// Entries the RPC returned without a `lastModifiedLedgerSeq`: whether
+    /// they changed since the transaction is unknown.
+    pub drift_unknown: Vec<String>,
+    /// Classic entries the RPC returned without their extension; they were
+    /// replayed with an empty one and may be smaller than they were.
+    pub ext_missing: Vec<String>,
     /// Network settings modified at or after the transaction's ledger.
     pub config_drifted: Vec<String>,
+    /// Network settings the RPC returned without a `lastModifiedLedgerSeq`.
+    pub config_drift_unknown: Vec<String>,
 }
 
+/// A footprint entry whose TTL changed after the transaction ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TtlDriftEntry {
+    /// The entry's ledger key, rendered for reading.
     pub entry: String,
+    /// How its TTL changed.
     pub reason: TtlDriftReason,
 }
 
+/// How an entry's TTL changed since the transaction ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum TtlDriftReason {
     /// The TTL was extended after the transaction ran.
     ExtendedSince,
     /// The entry was live for the transaction and has been archived since.
     ArchivedSince,
+    /// The transaction listed the entry for restoration; something else has
+    /// restored it since.
+    RestoredSince,
 }
 
 impl TtlDriftReason {
+    /// The reason as a short phrase for the human report.
     pub fn describe(self) -> &'static str {
         match self {
             TtlDriftReason::ExtendedSince => "TTL extended since",
             TtlDriftReason::ArchivedSince => "archived since",
+            TtlDriftReason::RestoredSince => "restored since",
         }
     }
 }
@@ -159,15 +198,25 @@ impl From<TtlDrift> for TtlDriftReason {
         match drift {
             TtlDrift::ExtendedSince => TtlDriftReason::ExtendedSince,
             TtlDrift::ArchivedSince => TtlDriftReason::ArchivedSince,
+            TtlDrift::RestoredSince => TtlDriftReason::RestoredSince,
         }
     }
 }
 
-/// Diagnostic events, one rendered line each, for side-by-side comparison.
+/// Diagnostic events, one rendered line each, for side-by-side comparison,
+/// and the events themselves.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Diagnostics {
+    /// The network's diagnostic events, one rendered line each; empty when
+    /// the RPC kept none.
     pub onchain: Vec<String>,
+    /// The replay's diagnostic events, one rendered line each.
     pub local: Vec<String>,
+    /// Each on-chain `DiagnosticEvent`, base64 XDR, in the order of `onchain`.
+    pub onchain_xdr: Vec<String>,
+    /// Each local `DiagnosticEvent`, base64 XDR, in the order of `local`.
+    pub local_xdr: Vec<String>,
 }
 
 #[cfg(test)]

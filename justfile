@@ -1,13 +1,13 @@
 # Common tasks. Run `just` to list them; see CONTRIBUTING.md for setup.
 
-# Minimum supported Rust; keep in sync with `rust-version` in Cargo.toml.
-msrv := "1.89"
+# Minimum supported Rust, read from `rust-version` in Cargo.toml.
+msrv := `sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml`
 
 default:
     @just --list
 
 # Everything CI enforces on a pull request.
-check: fmt clippy test msrv deny
+check: fmt clippy test snapshots docs msrv deny
 
 # Formatting, as CI checks it.
 fmt:
@@ -20,6 +20,14 @@ clippy:
 # The offline test suite.
 test:
     cargo test --locked
+
+# No pending or unreferenced snapshots (needs cargo-insta).
+snapshots:
+    cargo insta test --check --unreferenced=reject
+
+# The API docs, with warnings as errors.
+docs:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 
 # Build on the minimum supported Rust.
 msrv:
@@ -35,7 +43,7 @@ snap:
 
 # The live test against testnet, as the nightly CI job runs it.
 live:
-    cargo test --locked --test live -- --ignored --nocapture
+    cargo test --release --locked --test live -- --ignored --nocapture
 
 # List recent failed testnet transactions, to pick fixture hashes from.
 find *args:

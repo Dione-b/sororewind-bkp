@@ -5,9 +5,9 @@
 //! cargo run --example record_fixture                    # re-record all
 //! ```
 //!
-//! The recording is staged next to the target and only replaces
-//! `fixtures/<name>` once the replay has run, so a failed recording never
-//! destroys a usable fixture. By default only a replay that *matches* the
+//! The recording is staged next to the target (in a hidden directory) and
+//! only replaces `fixtures/<name>` once the replay has run, so a failed or
+//! interrupted recording never destroys a usable fixture. By default only a replay that *matches* the
 //! network is kept; pass `--allow-diverged` to keep a divergence on purpose
 //! (that is how the `diverged-*` fixtures were made).
 //!
@@ -16,6 +16,9 @@
 //! transaction (about a week); after that, find a fresh one with
 //! `find_failed`. Fixtures that replay as a divergence are skipped: they
 //! captured a ledger that had already moved and cannot be reproduced.
+
+// A command-line tool: printing is what it is for.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -54,26 +57,35 @@ enum Recorded {
     Skipped(&'static str),
 }
 
-async fn replay(rpc: &RpcClient, hash: &TxHash, network: Network) -> Result<Outcome> {
+/// `network` is the network the RPC is expected to serve; `None` trusts the
+/// RPC's own passphrase, which is the only option for a custom network.
+async fn replay(rpc: &RpcClient, hash: &TxHash, network: Option<Network>) -> Result<Outcome> {
     let request = Request {
         hash: hash.clone(),
-        network: Some(network),
+        network,
         wasm_debug: None,
     };
     Ok(sororewind::run(rpc, &request).await?.outcome())
 }
 
-async fn record(args: &Args, name: &str, hash: &TxHash, network: Network) -> Result<Recorded> {
-    let target = args.dir.join(name);
-    let staging = args.dir.join(format!(".{name}.staging"));
-    let _ = std::fs::remove_dir_all(&staging);
-
+/// Record `hash` as `name`. `rpc_network` picks the default endpoint;
+/// `expected` is the network to hold the RPC to, if any.
+async fn record(
+    args: &Args,
+    name: &str,
+    hash: &TxHash,
+    rpc_network: Network,
+    expected: Option<Network>,
+) -> Result<Recorded> {
     let url = args
         .rpc_url
         .clone()
-        .unwrap_or_else(|| network.default_rpc_url().to_string());
-    let recording = Recording::create(HttpTransport::new(url)?, &staging, hash).await?;
-    let outcome = replay(&RpcClient::new(recording), hash, network).await;
+        .unwrap_or_else(|| rpc_network.default_rpc_url().to_string());
+    // The recording is staged next to the target and only replaces it when
+    // committed; see `Recording`.
+    let recording = Recording::create(HttpTransport::new(url)?, args.dir.join(name), hash).await?;
+    let handle = recording.handle();
+    let outcome = replay(&RpcClient::new(recording), hash, expected).await;
 
     let keep = match &outcome {
         Ok(Outcome::Matched) => true,
@@ -81,36 +93,15 @@ async fn record(args: &Args, name: &str, hash: &TxHash, network: Network) -> Res
         Err(_) => false,
     };
     if !keep {
-        let _ = std::fs::remove_dir_all(&staging);
+        handle.discard().await;
         return outcome.map(|_| Recorded::Rejected);
     }
-    swap_in(&staging, &target)?;
+    handle.commit().await?;
     outcome.map(Recorded::Kept)
 }
 
-/// Replace `target` with `staging`, restoring the old one if that fails.
-fn swap_in(staging: &Path, target: &Path) -> Result<()> {
-    let io = |path: &Path| sororewind::RewindError::RecordIo {
-        path: path.to_path_buf(),
-        source: std::io::Error::other("could not move the recording into place"),
-    };
-    let backup = target.with_extension("backup");
-    let had_old = target.exists();
-    if had_old {
-        std::fs::rename(target, &backup).map_err(|_| io(target))?;
-    }
-    if std::fs::rename(staging, target).is_err() {
-        if had_old {
-            let _ = std::fs::rename(&backup, target);
-        }
-        let _ = std::fs::remove_dir_all(staging);
-        return Err(io(target));
-    }
-    let _ = std::fs::remove_dir_all(&backup);
-    Ok(())
-}
-
-/// Every fixture under `dir`, with the hash it was recorded for.
+/// Every fixture under `dir`, with the hash it was recorded for. Anything
+/// else in there is reported and left alone.
 async fn existing(dir: &Path) -> Result<Vec<(String, TxHash)>> {
     let mut found = Vec::new();
     let entries = std::fs::read_dir(dir).map_err(|source| sororewind::RewindError::FixtureIo {
@@ -122,8 +113,13 @@ async fn existing(dir: &Path) -> Result<Vec<(String, TxHash)>> {
         if !entry.path().is_dir() || name.starts_with('.') {
             continue;
         }
-        let manifest = FixtureManifest::load(&entry.path()).await?;
-        found.push((name, manifest.tx_hash()?));
+        match FixtureManifest::load(&entry.path())
+            .await
+            .and_then(|m| m.tx_hash())
+        {
+            Ok(hash) => found.push((name, hash)),
+            Err(err) => eprintln!("{name}: skipped, {err}"),
+        }
     }
     found.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(found)
@@ -132,28 +128,39 @@ async fn existing(dir: &Path) -> Result<Vec<(String, TxHash)>> {
 async fn rerecord(args: &Args, name: &str, hash: &TxHash) -> Result<Recorded> {
     // A fixture that already diverges offline captured drift on purpose.
     let offline = RpcClient::new(FixtureTransport::open(args.dir.join(name)).await?);
-    // Re-record from the network the fixture was recorded on.
-    let network = match NetworkId::from_passphrase(&offline.network().await?.passphrase) {
-        NetworkId::Known(network) => network,
-        NetworkId::Custom(_) => args.network,
-    };
-    if matches!(replay(&offline, hash, network).await, Ok(Outcome::Diverged)) {
+    // Re-record from the network the fixture was recorded on. A custom
+    // network has no default endpoint and no name to check: it needs
+    // `--rpc-url`, and the RPC's passphrase is taken at its word.
+    let (rpc_network, expected) =
+        match NetworkId::from_passphrase(&offline.network().await?.passphrase) {
+            NetworkId::Known(network) => (network, Some(network)),
+            NetworkId::Custom(_) if args.rpc_url.is_none() => {
+                return Ok(Recorded::Skipped(
+                    "it was recorded on a custom network; pass --rpc-url to re-record it",
+                ));
+            }
+            NetworkId::Custom(_) => (args.network, None),
+        };
+    if matches!(
+        replay(&offline, hash, expected).await,
+        Ok(Outcome::Diverged)
+    ) {
         return Ok(Recorded::Skipped(
             "it captures a divergence, which cannot be re-recorded",
         ));
     }
-    record(args, name, hash, network).await
+    record(args, name, hash, rpc_network, expected).await
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
     let single = args.name.clone().zip(args.hash.clone());
-    if let Some((name, _)) = &single {
-        if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
-            eprintln!("record_fixture: invalid fixture name `{name}`");
-            return ExitCode::FAILURE;
-        }
+    if let Some((name, _)) = &single
+        && (name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']))
+    {
+        eprintln!("record_fixture: invalid fixture name `{name}`");
+        return ExitCode::FAILURE;
     }
     let jobs = match single.clone() {
         Some(job) => vec![job],
@@ -169,7 +176,7 @@ async fn main() -> ExitCode {
     let mut failed = false;
     for (name, hash) in &jobs {
         let result = if single.is_some() {
-            record(&args, name, hash, args.network).await
+            record(&args, name, hash, args.network, Some(args.network)).await
         } else {
             rerecord(&args, name, hash).await
         };

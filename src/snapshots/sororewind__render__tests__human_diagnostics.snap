@@ -14,12 +14,12 @@ where it broke
   "balance too low"
   in CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::inner (depth 1)
   name from spec enum Error
-  2 error diagnostics: balance too low → escalating
+  3 error diagnostics: probe failed → balance too low → escalating
 
 call tree
-CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::outer(1, "two")
+CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::outer(1, "two")  (no return)
     · starting
-└─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::probe() → void (recovered by try_call)
+├─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::probe()  (recovered by try_call)
 └─ CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM::inner()  ✗
        · about to fail
 

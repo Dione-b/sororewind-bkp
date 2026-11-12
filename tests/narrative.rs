@@ -10,8 +10,8 @@
 
 mod common;
 
-use sororewind::render::{self, Detail};
 use sororewind::Outcome;
+use sororewind::render::{self, Detail};
 
 async fn check(name: &str, expected: Outcome) {
     let result = common::replay(name).await;
@@ -50,7 +50,7 @@ async fn check(name: &str, expected: Outcome) {
         "testnet"
     };
     assert_eq!(json["network"], network, "{name}");
-    assert_eq!(json["status"], "FAILED", "{name}");
+    assert_eq!(json["status"], "failed", "{name}");
     assert_eq!(
         json["result"]["onchain"]["code"] == json["result"]["local"]["code"],
         json["fidelity"]["divergence"] != "result",
@@ -87,6 +87,14 @@ fixtures! {
     budget_error: "budget-error" => Matched,
     contract_error: "contract-error" => Matched,
     storage_error: "storage-error" => Matched,
+    // Failed stellar-core's refundable-fee check, after the host succeeded.
+    refundable_fee: "refundable-fee" => Matched,
+    // An oracle's price entry, rewritten every few ledgers: only matches
+    // because the entry is rebuilt from ledger metadata.
+    rebuilt_entry: "rebuilt-entry" => Matched,
+    // Five contracts, calls three levels deep, a log with arguments, and a
+    // contract error named from the failing contract's own spec.
+    nested_contract_error: "nested-contract-error" => Matched,
     // Protocol 29, replayed by the older embedded host.
     mainnet_auth_error: "mainnet-auth-error" => Matched,
 }
@@ -109,7 +117,11 @@ fn every_fixture_has_a_test() {
     );
 }
 
-/// Fixtures are committed; keep them small.
+/// Fixtures are committed; keep them small. The cap was raised from 1 MB on
+/// purpose when fixtures started to keep the ledger entry changes their
+/// replay rebuilds entries from: most of it is `mainnet-auth-error`, whose
+/// footprint touches a busy pool. A new fixture that needs more room than
+/// this should rather replace one.
 #[test]
 fn fixtures_stay_small() {
     let mut total = 0;
@@ -120,13 +132,15 @@ fn fixtures_stay_small() {
             .map(|meta| meta.len())
             .sum::<u64>();
     }
-    assert!(total < 1_000_000, "fixtures/ is {total} bytes");
+    assert!(total < 2_000_000, "fixtures/ is {total} bytes");
 }
 
-/// sororewind reads one ledger header; a recording holding more ledgers, or
-/// their `metadataXdr`, means the `getLedgers` request lost its limit.
+/// sororewind reads one ledger header, and a few ledgers' entry changes when
+/// the footprint drifted. A recording holding `metadataXdr` itself, or long
+/// runs of ledgers, means the recorder stopped slimming or the `getLedgers`
+/// request lost its limit.
 #[test]
-fn fixtures_record_one_ledger() {
+fn fixtures_record_no_ledger_metadata() {
     for name in FIXTURES {
         for entry in std::fs::read_dir(common::fixture_dir(name)).unwrap() {
             let path = entry.unwrap().path();
@@ -137,8 +151,11 @@ fn fixtures_record_one_ledger() {
             let body: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             let ledgers = body["result"]["ledgers"].as_array().unwrap();
-            assert_eq!(ledgers.len(), 1, "{name}/{file}");
-            assert!(ledgers[0].get("metadataXdr").is_none(), "{name}/{file}");
+            assert!((1..=4).contains(&ledgers.len()), "{name}/{file}");
+            for ledger in ledgers {
+                assert!(ledger.get("metadataXdr").is_none(), "{name}/{file}");
+                assert!(ledger.get("metadataJson").is_none(), "{name}/{file}");
+            }
         }
     }
 }

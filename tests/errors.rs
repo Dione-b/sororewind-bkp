@@ -9,10 +9,10 @@ mod common;
 
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sororewind::rpc::RpcClient;
 use sororewind::transport::{FixtureTransport, HttpTransport};
-use sororewind::{codec, Request, RewindError};
+use sororewind::{Request, RewindError, codec};
 use stellar_xdr::{
     ConfigSettingId, LedgerHeaderHistoryEntry, LedgerKey, Limits, Operation, OperationBody,
     PaymentOp, TransactionEnvelope, TransactionResult, TransactionResultExt,
@@ -215,7 +215,40 @@ async fn rpc_error_response() {
         json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602, "message": "invalid hash" } }),
     );
     let err = fails(overlay, "invalid hash").await;
+    // The JSON-RPC code is kept, and shown.
+    assert!(matches!(
+        err,
+        RewindError::Rpc {
+            code: Some(-32602),
+            ..
+        }
+    ));
+    assert!(err.to_string().ends_with("(JSON-RPC code -32602)"), "{err}");
+}
+
+#[tokio::test]
+async fn transaction_with_an_unknown_status() {
+    let overlay = Overlay::on(FIXTURE)
+        .await
+        .rewrite_result("getTransaction", transaction("status", json!("PENDING")));
+    let err = fails(overlay, "a status this build of sororewind does not know").await;
     assert!(matches!(err, RewindError::Rpc { .. }));
+}
+
+#[tokio::test]
+async fn ledger_outside_the_rpc_window() {
+    // What stellar-rpc answers for a `startLedger` it no longer keeps.
+    let overlay = Overlay::on(FIXTURE).await.respond(
+        "getLedgers",
+        json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32600, "message":
+            "start ledger (5) must be between the oldest ledger: 5559289 and the latest \
+             ledger: 5680248 for this rpc instance" } }),
+    );
+    let err = fails(overlay, "in its retention window").await;
+    assert!(
+        matches!(err, RewindError::LedgerUnavailable { .. }),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -241,7 +274,12 @@ async fn rpc_response_with_undecodable_xdr() {
 #[tokio::test]
 async fn unreachable_rpc() {
     // Nothing listens on the discard port; the connection is refused at once.
-    let rpc = RpcClient::new(HttpTransport::new("http://127.0.0.1:9").unwrap());
+    // It is retried first; keep the waits short.
+    let rpc = RpcClient::new(
+        HttpTransport::new("http://127.0.0.1:9")
+            .unwrap()
+            .with_retry_base(std::time::Duration::from_millis(1)),
+    );
     let err = fails_with(
         &rpc,
         &common::request(FIXTURE).await,
@@ -266,7 +304,8 @@ async fn fixture_directory_that_does_not_exist() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, RewindError::FixtureIo { .. }));
+    assert!(matches!(err, RewindError::FixtureInvalid { .. }));
+    assert!(err.to_string().contains("no such directory"), "{err}");
     assert_eq!(sororewind::exit_code(&Err(err)), 1);
 }
 
@@ -298,56 +337,5 @@ async fn fixture_missing_a_response() {
             .unwrap(),
     );
     let err = fails_with(&rpc, &request, "getTransaction").await;
-    assert!(matches!(
-        err,
-        RewindError::FixtureIo { .. } | RewindError::FixtureMissing { .. }
-    ));
-}
-
-/// The binary itself: argument errors and the two output modes.
-mod binary {
-    use std::process::{Command, Output};
-
-    fn sororewind(args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sororewind"))
-            .args(args)
-            .env("NO_COLOR", "1")
-            .output()
-            .unwrap()
-    }
-
-    fn fixture() -> String {
-        super::common::fixture_dir(super::FIXTURE)
-            .display()
-            .to_string()
-    }
-
-    #[test]
-    fn invalid_hash_exits_1() {
-        let out = sororewind(&["not-a-hash"]);
-        assert_eq!(out.status.code(), Some(1));
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("expected 64 hexadecimal characters"),
-            "{stderr}"
-        );
-    }
-
-    #[test]
-    fn invalid_flags_exit_1() {
-        let out = sororewind(&["--fixture", &fixture(), "--rpc-url", "http://x"]);
-        assert_eq!(out.status.code(), Some(1));
-    }
-
-    #[test]
-    fn narrative_and_json_exit_0() {
-        let out = sororewind(&["--fixture", &fixture()]);
-        assert_eq!(out.status.code(), Some(0));
-        assert!(String::from_utf8_lossy(&out.stdout).contains("replay matches network"));
-
-        let out = sororewind(&["--fixture", &fixture(), "--json"]);
-        assert_eq!(out.status.code(), Some(0));
-        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(json["fidelity"]["match"], true);
-    }
+    assert!(matches!(err, RewindError::FixtureMissing { .. }));
 }

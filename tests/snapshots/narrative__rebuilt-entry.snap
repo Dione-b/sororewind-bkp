@@ -1,0 +1,20 @@
+---
+source: tests/narrative.rs
+expression: "common::transcript(&result, &human)"
+---
+--- exit code: 0
+sororewind  ce4e87…ce44  testnet
+ledger 5679032 · protocol 30 · 2026-11-11 17:40:03 UTC
+
+✓ replay matches network
+  on-chain  trapped
+  local     trapped
+
+where it broke
+  storage error ExceededLimit
+  "trying to access contract data key outside of the footprint [CD4KFB23CQLJ47RIPESVBTQ444R75M6QVEZULWXHHFYYZT7SS2VGXOPW, \"BTC\"]"
+  in CD4KFB23CQLJ47RIPESVBTQ444R75M6QVEZULWXHHFYYZT7SS2VGXOPW::write_prices (depth 0)
+
+call tree
+CD4KFB23CQLJ47RIPESVBTQ444R75M6QVEZULWXHHFYYZT7SS2VGXOPW::write_prices(GBV54BUAQBFAS6WIRKGURXXCMXWALH4OYBCYE75VBHROJLEKJ4LOZTFB, ["BTC"], 0x4254430000000000…(335 bytes))  ✗
+    · VM call trapped with HostError [write_prices, storage error ExceededLimit]

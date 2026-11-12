@@ -8,4 +8,4 @@ use soroban_env_host_p29 as soroban_env_host;
 #[path = "proto.rs"]
 mod proto;
 
-pub use proto::{invoke, PROTOCOL, VERSION};
+pub use proto::{PROTOCOL, VERSION, fees, invoke};

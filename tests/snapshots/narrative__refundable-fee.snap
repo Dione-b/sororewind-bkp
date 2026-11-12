@@ -1,0 +1,20 @@
+---
+source: tests/narrative.rs
+expression: "common::transcript(&result, &human)"
+---
+--- exit code: 0
+sororewind  8a5229…11e0  testnet
+ledger 5678910 · protocol 30 · 2026-11-11 17:29:53 UTC
+
+✓ replay matches network
+  on-chain  insufficient refundable fee
+  local     insufficient refundable fee
+⚠ network settings changed since this transaction ran: LiveSorobanStateSizeWindow
+
+where it broke
+  budget error ExceededLimit
+  "refundable resource fee was not sufficient to cover the ledger storage rent: {} > {} [8992, 5119]"
+
+call tree
+CBDVQKYEN6QMRGQZC77DFYEQXQHDMCVJ3TPBJKNERJVMIESA6GQT44LG::relay_pyth(0xe4bd474d4e2bd8d0…(295 bytes))
+└─ CAYFT5JE3UQTKT4Q6ZOZK4FXVYVT6RE3MFC7STA4UB6WAEGBT65MRU52::verify_update(0xe4bd474d4e2bd8d0…(295 bytes))

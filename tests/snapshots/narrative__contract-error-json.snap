@@ -18,6 +18,11 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
         "GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG",
         "20000000000"
       ],
+      "argsXdr": [
+        "AAAAEgAAAAAAAAAAdYoBAo0g0BwEBgYPylyRoTIJShU8+Hw33rMb+/UJ/sk=",
+        "AAAAEgAAAAAAAAAAcn/g4IYibbIFUXI3GQohMGz5aWiIfDgfV8I1pMuCPR0=",
+        "AAAACgAAAAAAAAAAAAAABKgXyAA="
+      ],
       "contract": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
       "depth": 0,
       "failure": true,
@@ -25,7 +30,8 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
       "logs": [],
       "open": true,
       "recovered": false,
-      "returned": null
+      "returned": null,
+      "returnedXdr": null
     }
   ],
   "closeTime": 1794385548,
@@ -33,6 +39,10 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
     "local": [
       "fail [-] fn_call, 0xd7928b72c2703ccf…(32 bytes), transfer [GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000]",
       "fail [CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC] error, contract error #10 [\"resulting balance is not within the allowed range\", 10000000, -15000000100, 9223372036854775807]"
+    ],
+    "localXdr": [
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAADAAAADwAAAAdmbl9jYWxsAAAAAA0AAAAg15KLcsJwPM/q9+uf9O9NUEpVqLl5/JtFDqLIQrTRzmEAAAAPAAAACHRyYW5zZmVyAAAAEAAAAAEAAAADAAAAEgAAAAAAAAAAdYoBAo0g0BwEBgYPylyRoTIJShU8+Hw33rMb+/UJ/skAAAASAAAAAAAAAAByf+DghiJtsgVRcjcZCiEwbPlpaIh8OB9XwjWky4I9HQAAAAoAAAAAAAAAAAAAAASoF8gA",
+      "AAAAAAAAAAAAAAAB15KLcsJwPM/q9+uf9O9NUEpVqLl5/JtFDqLIQrTRzmEAAAACAAAAAAAAAAIAAAAPAAAABWVycm9yAAAAAAAAAgAAAAAAAAAKAAAAEAAAAAEAAAAEAAAADgAAADFyZXN1bHRpbmcgYmFsYW5jZSBpcyBub3Qgd2l0aGluIHRoZSBhbGxvd2VkIHJhbmdlAAAAAAAABgAAAAAAmJaAAAAABv////yB7imcAAAABn//////////"
     ],
     "onchain": [
       "fail [-] fn_call, 0xd7928b72c2703ccf…(32 bytes), transfer [GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC, GBZH7YHAQYRG3MQFKFZDOGIKEEYGZ6LJNCEHYOA7K7BDLJGLQI6R3RAG, 20000000000]",
@@ -52,14 +62,39 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
       "fail [-] core_metrics, emit_event_byte 0",
       "fail [-] core_metrics, cpu_insn 907402",
       "fail [-] core_metrics, mem_byte 24184",
-      "fail [-] core_metrics, invoke_time_nsecs 358838",
+      "fail [-] core_metrics, invoke_time_nsecs 269714",
       "fail [-] core_metrics, max_rw_key_byte 40",
       "fail [-] core_metrics, max_rw_data_byte 144",
       "fail [-] core_metrics, max_rw_code_byte 0",
       "fail [-] core_metrics, max_emit_event_byte 0"
+    ],
+    "onchainXdr": [
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAADAAAADwAAAAdmbl9jYWxsAAAAAA0AAAAg15KLcsJwPM/q9+uf9O9NUEpVqLl5/JtFDqLIQrTRzmEAAAAPAAAACHRyYW5zZmVyAAAAEAAAAAEAAAADAAAAEgAAAAAAAAAAdYoBAo0g0BwEBgYPylyRoTIJShU8+Hw33rMb+/UJ/skAAAASAAAAAAAAAAByf+DghiJtsgVRcjcZCiEwbPlpaIh8OB9XwjWky4I9HQAAAAoAAAAAAAAAAAAAAASoF8gA",
+      "AAAAAAAAAAAAAAAB15KLcsJwPM/q9+uf9O9NUEpVqLl5/JtFDqLIQrTRzmEAAAACAAAAAAAAAAIAAAAPAAAABWVycm9yAAAAAAAAAgAAAAAAAAAKAAAAEAAAAAEAAAAEAAAADgAAADFyZXN1bHRpbmcgYmFsYW5jZSBpcyBub3Qgd2l0aGluIHRoZSBhbGxvd2VkIHJhbmdlAAAAAAAABgAAAAAAmJaAAAAABv////yB7imcAAAABn//////////",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAA5ob3N0X2ZuX2ZhaWxlZAAAAAAAAgAAAAAAAAAKAAAAAQ==",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAACnJlYWRfZW50cnkAAAAAAAUAAAAAAAAABA==",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAC3dyaXRlX2VudHJ5AAAAAAUAAAAAAAAAAA==",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAEGxlZGdlcl9yZWFkX2J5dGUAAAAFAAAAAAAAAOw=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAEWxlZGdlcl93cml0ZV9ieXRlAAAAAAAABQAAAAAAAAAA",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAADXJlYWRfa2V5X2J5dGUAAAAAAAAFAAAAAAAAAFA=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAADndyaXRlX2tleV9ieXRlAAAAAAAFAAAAAAAAAAA=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAADnJlYWRfZGF0YV9ieXRlAAAAAAAFAAAAAAAAAOw=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAD3dyaXRlX2RhdGFfYnl0ZQAAAAAFAAAAAAAAAAA=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAADnJlYWRfY29kZV9ieXRlAAAAAAAFAAAAAAAAAAA=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAD3dyaXRlX2NvZGVfYnl0ZQAAAAAFAAAAAAAAAAA=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAACmVtaXRfZXZlbnQAAAAAAAUAAAAAAAAAAA==",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAD2VtaXRfZXZlbnRfYnl0ZQAAAAAFAAAAAAAAAAA=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAACGNwdV9pbnNuAAAABQAAAAAADdiK",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAACG1lbV9ieXRlAAAABQAAAAAAAF54",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAEWludm9rZV90aW1lX25zZWNzAAAAAAAABQAAAAAABB2S",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAD21heF9yd19rZXlfYnl0ZQAAAAAFAAAAAAAAACg=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAEG1heF9yd19kYXRhX2J5dGUAAAAFAAAAAAAAAJA=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAEG1heF9yd19jb2RlX2J5dGUAAAAFAAAAAAAAAAA=",
+      "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAxjb3JlX21ldHJpY3MAAAAPAAAAE21heF9lbWl0X2V2ZW50X2J5dGUAAAAABQAAAAAAAAAA"
     ]
   },
   "failure": {
+    "cause": null,
     "contract": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
     "contractCode": 10,
     "depth": 0,
@@ -67,11 +102,11 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
     "errorCode": null,
     "errorType": "contract",
     "function": "transfer",
-    "message": "resulting balance is not within the allowed range",
-    "name": null,
-    "nameOrigin": null,
+    "message": "resulting balance is not within the allowed range [10000000, -15000000100, 9223372036854775807]",
+    "name": "BalanceError",
+    "nameOrigin": "the Stellar Asset Contract's built-in errors",
     "trail": [
-      "resulting balance is not within the allowed range"
+      "resulting balance is not within the allowed range [10000000, -15000000100, 9223372036854775807]"
     ]
   },
   "feeBump": false,
@@ -81,12 +116,16 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
   },
   "footprint": {
     "archived": [],
+    "archivedInferred": [],
+    "configDriftUnknown": [],
     "configDrifted": [],
-    "drifted": [
-      "account GB2YUAICRUQNAHAEAYDA7SS4SGQTECKKCU6PQ7BX32ZRX67VBH7MSCWC"
-    ],
+    "driftUnknown": [],
+    "drifted": [],
     "entries": 4,
+    "extMissing": [],
     "missing": 1,
+    "rebuildNote": null,
+    "rebuilt": [],
     "ttlDrifted": []
   },
   "hash": "dd1f9bb61fc8d599aa7914469f4e013b40648a6dcd1adb6d294467f55efa53db",
@@ -106,5 +145,5 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
   },
   "rpc": "<fixture>",
   "schemaVersion": 1,
-  "status": "FAILED"
+  "status": "failed"
 }

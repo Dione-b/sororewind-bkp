@@ -11,14 +11,18 @@ use clap::ValueEnum;
 /// Networks sororewind knows a default RPC endpoint and passphrase for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Network {
+    /// The SDF test network.
     Testnet,
+    /// The public network (pubnet).
     Mainnet,
+    /// The SDF network that previews upcoming protocol changes.
     Futurenet,
     /// A local quickstart / standalone network.
     Local,
 }
 
 impl Network {
+    /// Every known network, in declaration order.
     pub const ALL: [Network; 4] = [
         Network::Testnet,
         Network::Mainnet,
@@ -26,6 +30,7 @@ impl Network {
         Network::Local,
     ];
 
+    /// The name `--network` accepts and the report prints.
     pub fn name(self) -> &'static str {
         match self {
             Network::Testnet => "testnet",
@@ -35,6 +40,7 @@ impl Network {
         }
     }
 
+    /// The passphrase that identifies the network, as `getNetwork` reports it.
     pub fn passphrase(self) -> &'static str {
         match self {
             Network::Testnet => "Test SDF Network ; September 2015",
@@ -58,6 +64,7 @@ impl Network {
         }
     }
 
+    /// The known network with exactly this passphrase, if any.
     pub fn from_passphrase(passphrase: &str) -> Option<Network> {
         Network::ALL
             .into_iter()
@@ -74,12 +81,15 @@ impl fmt::Display for Network {
 /// The network an RPC actually serves, derived from its passphrase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkId {
+    /// A network sororewind has a name for.
     Known(Network),
     /// A passphrase sororewind has no name for; printed verbatim.
     Custom(String),
 }
 
 impl NetworkId {
+    /// Name the network behind `passphrase`, falling back to
+    /// [`NetworkId::Custom`].
     pub fn from_passphrase(passphrase: &str) -> NetworkId {
         match Network::from_passphrase(passphrase) {
             Some(network) => NetworkId::Known(network),

@@ -1,6 +1,10 @@
 //! The `sororewind` binary: parse arguments, run the pipeline, print the
 //! report, exit with the outcome. Everything else lives in the library.
 
+// The library is linted against printing (Cargo.toml); this is where its
+// output reaches the terminal.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
@@ -42,8 +46,25 @@ fn init_logging(verbose: u8) {
 }
 
 async fn run(cli: &Cli) -> Result<Report> {
-    let (rpc, request) = cli.connect().await?;
-    sororewind::run(&rpc, &request).await
+    let connection = cli.connect().await?;
+    let result = sororewind::run(&connection.rpc, &connection.request).await;
+    if let Some(recording) = &connection.recording {
+        // Only a run that got as far as a report is a fixture worth having:
+        // anything else would replay as a different error, or as another
+        // transaction's leftovers.
+        match &result {
+            Ok(_) => recording.commit().await?,
+            Err(_) => {
+                recording.discard().await;
+                log::warn!(
+                    target: "record",
+                    "the run failed, so nothing was recorded; {} is unchanged",
+                    recording.target().display()
+                );
+            }
+        }
+    }
+    result
 }
 
 #[tokio::main]
@@ -61,31 +82,67 @@ async fn main() -> ExitCode {
             };
         }
     };
+    // `--completions` and `--man` stand alone (clap rejects anything next
+    // to them), so there is nothing to replay.
+    if let Some(shell) = cli.completions {
+        return finish(write_stdout(&Cli::completion_script(shell)));
+    }
+    if cli.man {
+        return finish(Cli::man_page().and_then(|page| write_stdout(&page)));
+    }
     init_logging(cli.verbose);
 
     let result = run(&cli).await;
     let code = sororewind::exit_code(&result);
     let printed = result.and_then(|report| {
-        if cli.json {
-            let document = render::json(&report).map_err(|e| {
-                sororewind::RewindError::Replay(format!("could not serialise the report: {e}"))
-            })?;
-            println!("{document}");
+        let text = if cli.json {
+            let mut document = render::json(&report)
+                .map_err(|e| sororewind::RewindError::Output(e.to_string()))?;
+            document.push('\n');
+            document
         } else {
             let detail = Detail::from_verbosity(cli.verbose);
-            print!(
-                "{}",
-                render::human(&report, render::use_color(cli.no_color), detail)
-            );
-        }
-        Ok(())
+            let color = render::use_color(cli.color_choice(), &render::ColorEnv::current());
+            render::human(&report, color, detail)
+        };
+        write_stdout(&text)
     });
 
     match printed {
         Ok(()) => ExitCode::from(code),
         Err(err) => {
+            // A script reading `--json` gets a document either way.
+            if cli.json {
+                let _ = write_stdout(&format!("{}\n", render::json_error(&err)));
+            }
             eprintln!("sororewind: {err}");
             ExitCode::from(sororewind::EXIT_ERROR)
         }
+    }
+}
+
+/// The exit code of a run that only prints, reporting a failure to print.
+fn finish(printed: Result<()>) -> ExitCode {
+    match printed {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("sororewind: {err}");
+            ExitCode::from(sororewind::EXIT_ERROR)
+        }
+    }
+}
+
+/// Write to stdout without panicking when the reader has gone away:
+/// `sororewind … | head -1` closes the pipe early, and that is not a failure.
+fn write_stdout(text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(sororewind::RewindError::Output(e.to_string())),
     }
 }
