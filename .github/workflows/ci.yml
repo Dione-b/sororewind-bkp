@@ -5,7 +5,8 @@ on:
     branches: [master]
   pull_request:
   schedule:
-    # nightly live-RPC replay check
+    # Nightly: the live-RPC replay check and the advisory database. The rest
+    # only changes when the code does.
     - cron: '17 5 * * *'
   workflow_dispatch:
 
@@ -20,52 +21,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  fmt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      # Installs the toolchain pinned in rust-toolchain.toml.
-      - run: rustup toolchain install
-      - run: cargo fmt --all --check
+  # Formatting, lints, tests, snapshots, docs and MSRV; see checks.yml.
+  checks:
+    if: github.event_name != 'schedule'
+    uses: ./.github/workflows/checks.yml
 
-  clippy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      # Installs the toolchain pinned in rust-toolchain.toml.
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked -- -D warnings
-
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      # Installs the toolchain pinned in rust-toolchain.toml.
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
-
-  # Keeps the `rust-version` in Cargo.toml honest.
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.89
-      - uses: Swatinem/rust-cache@v2
-      # `+1.89` overrides rust-toolchain.toml, which would otherwise win.
-      - run: cargo +1.89 check --locked --all-targets
-
-  # Advisories, licences, banned crates and sources; see deny.toml.
+  # Advisories, licences, banned crates and sources; see deny.toml. Nightly
+  # too: an advisory can be published against an unchanged lockfile.
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   # Replays recent failed testnet transactions against the live RPC. Not run
   # on push or PR, so an RPC outage cannot fail unrelated changes.
@@ -74,9 +41,39 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       # Installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Optimised: the test times each replay, and the hosts interpret WASM.
       - run: cargo test --release --locked --test live -- --ignored --nocapture
+
+  # A scheduled run has no author to notify, so a failure opens an issue (or
+  # comments on the one already open): a network moving past the embedded
+  # protocols must not go unnoticed.
+  report-nightly-failure:
+    if: ${{ always() && github.event_name == 'schedule' && (needs.live.result == 'failure' || needs.deny.result == 'failure') }}
+    needs: [live, deny]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TITLE: Nightly CI is failing
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      BODY: |
+        The scheduled CI run failed (live: ${{ needs.live.result }}, deny: ${{ needs.deny.result }}).
+
+        If the live job failed on `no_network_is_ahead_of_the_embedded_hosts`, a network has
+        upgraded its protocol: see CONTRIBUTING.md, "Protocol upgrades".
+    steps:
+      - run: |
+          existing=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --title "$TITLE" --body "$BODY
+
+          Run: $RUN_URL"
+          fi

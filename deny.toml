@@ -32,7 +32,14 @@ allow = [
 confidence-threshold = 0.9
 
 [bans]
-multiple-versions = "allow"
+# Two embedded hosts (one per protocol) bring two of most of their
+# dependency tree; those duplicates are expected and skipped. Anything else
+# built twice is worth a look.
+multiple-versions = "warn"
+skip-tree = [
+    { crate = "soroban-env-host@29.0.2", reason = "the previous protocol's host, embedded on purpose" },
+    { crate = "soroban-env-host@30.0.0", reason = "the current protocol's host, embedded on purpose" },
+]
 wildcards = "deny"
 
 [sources]

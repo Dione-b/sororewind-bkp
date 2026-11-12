@@ -35,8 +35,24 @@ shows what changed, rather than guessing.
 
 ## Install
 
-sororewind has not been published to crates.io yet. Install it from source
-with Rust 1.89 or newer:
+Each tagged release publishes prebuilt binaries on the
+[Releases page](https://github.com/Dione-b/sororewind/releases): macOS (Apple
+silicon and Intel), Linux (x86_64 and arm64, plus a static musl build for
+x86_64 that runs on any distribution) and Windows (x86_64). An installer
+script puts the right one on your `PATH`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Dione-b/sororewind/releases/latest/download/sororewind-installer.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Dione-b/sororewind/releases/latest/download/sororewind-installer.ps1 | iex"
+```
+
+sororewind is not on crates.io yet. To build it from source instead, with
+Rust 1.89 or newer:
 
 ```bash
 cargo install --git https://github.com/Dione-b/sororewind

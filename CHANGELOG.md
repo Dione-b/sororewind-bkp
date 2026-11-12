@@ -54,6 +54,8 @@ an incompatible change to the JSON bumps its `schemaVersion`.
   retried with backoff, honouring `Retry-After`; connecting has its own
   10-second timeout.
 - `SOROREWIND_RPC_URL` names the RPC endpoint when `--rpc-url` is not given.
+- Prebuilt binaries for each release, including a static Linux (musl) build,
+  and a PowerShell installer for Windows.
 
 ### Changed
 
@@ -76,6 +78,9 @@ an incompatible change to the JSON bumps its `schemaVersion`.
   errors instead of silent fallbacks.
 - Invalid command-line flags exit with code 1, so `2` always means
   "diverged".
+- Releases are built only once the pull-request checks pass on the tagged
+  commit. `cargo install` builds with thin LTO; the published binaries keep
+  full LTO.
 
 ### Fixed
 
