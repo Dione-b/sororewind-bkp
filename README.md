@@ -13,8 +13,8 @@ ledger 5672381 · protocol 30 · 2026-11-11 08:25:48 UTC
   local     trapped
 
 where it broke
-  contract error #10
-  "resulting balance is not within the allowed range"
+  contract error #10 · BalanceError
+  "resulting balance is not within the allowed range [10000000, -15000000100, 9223372036854775807]"
   in CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::transfer (depth 0)
 
 call tree
@@ -126,8 +126,11 @@ parts appear when they have something to say, or when you ask for detail:
   declares one, the message the host logged, and the contract function and
   call depth where it was raised.
 - **Call tree.** Every contract call in order, with decoded arguments. Nested
-  calls are indented with `└─`, `✗` marks the call that failed, and lines
-  starting with `·` are the contract's log messages.
+  calls hang off `├─` / `└─` rails, `✗` marks the call that failed, and lines
+  starting with `·` are the contract's log messages. A call that failed but
+  whose caller caught the failure with `try_call` and carried on is marked
+  `(recovered by try_call)`; one that never returned because the transaction
+  failed inside it is marked `(no return)`.
 - **Footprint.** The number of entries the transaction touched, which of them
   changed at or after its ledger (value, TTL, or archived), how many were
   missing, and whether the random-number seed was derived or fixed. It is
@@ -293,8 +296,9 @@ recent failed transactions on testnet and checks that they replay quickly and
 that at least one matches.
 
 CI also runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-the tests on Linux, macOS and Windows, a `cargo check` on the minimum
-supported Rust (1.89), and `cargo deny check`.
+the tests on Linux, macOS and Windows, a snapshot check that rejects pending
+or unreferenced snapshots, `cargo doc` with warnings as errors, a `cargo
+check` on the minimum supported Rust (1.89), and `cargo deny check`.
 
 ### How the code is organised
 

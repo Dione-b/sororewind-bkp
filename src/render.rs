@@ -396,15 +396,24 @@ fn call_tree(out: &mut impl Write, calls: &[Call], p: &Palette, detail: Detail) 
         {
             write!(line, " → {}", safe(returned))?;
         }
-        if call.recovered {
-            write!(line, "  {}", p.dim("(recovered by try_call)"))?;
-        }
-        if call.is_failure {
-            writeln!(out, "{}", p.red(&format!("{line}  ✗")))?;
-        } else if call.open {
-            writeln!(out, "{}", p.yellow(&format!("{line}  (no return)")))?;
+        // Each part is painted on its own: a style's reset would end the
+        // colour of anything it were nested in.
+        let recovered = if call.recovered {
+            format!("  {}", p.dim("(recovered by try_call)"))
         } else {
-            writeln!(out, "{line}")?;
+            String::new()
+        };
+        if call.is_failure {
+            writeln!(out, "{}{recovered}{}", p.red(&line), p.red("  ✗"))?;
+        } else if call.open {
+            writeln!(
+                out,
+                "{}{recovered}{}",
+                p.yellow(&line),
+                p.yellow("  (no return)")
+            )?;
+        } else {
+            writeln!(out, "{line}{recovered}")?;
         }
 
         if call.depth > 0 {
@@ -556,7 +565,21 @@ fn quoted(text: &str) -> String {
 fn safe(text: &str) -> String {
     let hostile = |c: char| {
         c.is_control()
-            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+            || matches!(
+                c,
+                // Soft hyphen, Arabic letter mark, Mongolian vowel separator.
+                '\u{ad}' | '\u{61c}' | '\u{180e}'
+                    // Zero-width characters and directional marks.
+                    | '\u{200b}'..='\u{200f}'
+                    // Line and paragraph separators, directional embeddings.
+                    | '\u{2028}'..='\u{202e}'
+                    // Word joiner, invisible operators, directional isolates.
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{feff}'
+                    // Tag characters.
+                    | '\u{e0000}'..='\u{e007f}'
+            )
     };
     if !text.contains(hostile) {
         return text.to_string();
@@ -698,6 +721,26 @@ mod tests {
         assert_eq!(safe("a\u{1b}[31mb\r\nc"), "a\\u{1b}[31mb\\r\\nc");
         // Characters that reorder or hide text are spelled out too.
         assert_eq!(safe("x\u{202e}y\u{200b}z"), "x\\u{202e}y\\u{200b}z");
+        for hidden in [
+            '\u{ad}',
+            '\u{61c}',
+            '\u{180e}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{e0000}',
+            '\u{e0041}',
+            '\u{e007f}',
+        ] {
+            let text = format!("a{hidden}b");
+            assert_eq!(safe(&text), format!("a{}b", hidden.escape_default()));
+        }
+        // Their neighbours are left alone.
+        for visible in ['\u{ae}', '\u{2065}', '\u{e0080}'] {
+            let text = format!("a{visible}b");
+            assert_eq!(safe(&text), text);
+        }
 
         // Everything a contract, an RPC or a file can put in the report.
         let hostile = "evil\u{1b}[2J\rforged line\n";

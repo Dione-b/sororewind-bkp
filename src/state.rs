@@ -81,6 +81,12 @@
 //!   so it restored nothing, and something else has restored the entry since.
 //!   It is replayed as archived-and-restored. A smaller TTL can only have
 //!   been set before the transaction, so that entry was live.
+//!
+//! An entry ledger metadata shows was restored after the transaction, before
+//! any other change to it or its TTL, is judged like one archived now
+//! (`liveUntil == 0`): it was archived by the time of the restoration, and
+//! the TTL it had when the transaction ran is lost, so the current one, set
+//! by the restoration, says nothing about it.
 
 use std::collections::HashSet;
 
@@ -401,7 +407,8 @@ pub enum Liveness {
 pub enum TtlDrift {
     /// The TTL reaches further than any extension made by then could.
     ExtendedSince,
-    /// Archived now, but demonstrably live when the transaction ran.
+    /// Archived since (and possibly restored again), but demonstrably live
+    /// when the transaction ran.
     ArchivedSince,
     /// Listed for restoration by the transaction, and restored by something
     /// else since.
@@ -636,6 +643,12 @@ impl FootprintSlot {
         };
 
         let mut live_until = raw.and_then(|raw| raw.live_until_ledger_seq);
+        if past.restored_since && past.live_until.is_none() {
+            // Restored since, so archived by then, and the TTL it had when
+            // the transaction ran is lost: it is judged as an entry archived
+            // now, not by the TTL the restoration gave it.
+            live_until = Some(0);
+        }
         if let Some(raw) = raw {
             slot.entry = Some(codec::assemble_entry(raw)?);
             slot.last_modified = raw.last_modified_ledger_seq;
@@ -1299,6 +1312,7 @@ mod tests {
         let past = Past {
             value: Some(PastValue::Entry(Box::new(then.clone()))),
             live_until: Some(TX_LEDGER + 20),
+            restored_since: false,
         };
         let slot = FootprintSlot::new(key.clone(), vec![1], Some(&raw), &past, context).unwrap();
         assert_eq!(slot.entry.as_ref(), Some(&then));
@@ -1318,9 +1332,80 @@ mod tests {
         let past = Past {
             value: Some(PastValue::Absent),
             live_until: None,
+            restored_since: false,
         };
         let slot = FootprintSlot::new(key, vec![1], Some(&raw), &past, context).unwrap();
         assert!(slot.missing() && slot.rebuilt && slot.entry.is_none());
+    }
+
+    #[test]
+    fn an_entry_restored_since_is_judged_as_archived_now() {
+        // Restored after the transaction: the archived value, and the TTL the
+        // restoration set, which says nothing about the TTL back then.
+        let now = data_entry([2; 32], Persistent, TX_LEDGER + 7);
+        let then = {
+            let mut entry = now.clone();
+            entry.last_modified_ledger_seq = TX_LEDGER - 700;
+            entry
+        };
+        let key = crate::test_support::key_of(&now);
+        let raw = raw_entry(&now, Some(TX_LEDGER + 9_000));
+        let past = Past {
+            value: Some(PastValue::Entry(Box::new(then.clone()))),
+            live_until: None,
+            restored_since: true,
+        };
+        let slot = |restorable, refused| {
+            let context = SlotContext {
+                rule: &rule(),
+                restorable,
+                refused,
+            };
+            FootprintSlot::new(key.clone(), vec![1], Some(&raw), &past, context).unwrap()
+        };
+
+        // The network ran the host, so it was live then, and archived since.
+        let live = slot(false, false);
+        assert_eq!(live.entry.as_ref(), Some(&then));
+        assert!(live.rebuilt);
+        assert_eq!(
+            (live.liveness, live.ttl_drift),
+            (
+                Liveness::Live {
+                    live_until: TX_LEDGER
+                },
+                Some(TtlDrift::ArchivedSince)
+            )
+        );
+        // The network refused it: archived then, as the network recorded.
+        let refused = slot(false, true);
+        assert_eq!(refused.liveness, Liveness::Archived { inferred: true });
+        assert!(refused.archived());
+        // Listed for restoration: archived then, and restored by core.
+        let restored = slot(true, false);
+        assert!(restored.restored());
+        assert_eq!(restored.encoded().unwrap().live_until, Some(TX_LEDGER + 99));
+
+        // A TTL change recorded before the restoration is the TTL it had.
+        let past = Past {
+            live_until: Some(TX_LEDGER + 20),
+            ..past.clone()
+        };
+        let context = SlotContext {
+            rule: &rule(),
+            restorable: false,
+            refused: false,
+        };
+        let slot = FootprintSlot::new(key, vec![1], Some(&raw), &past, context).unwrap();
+        assert_eq!(
+            (slot.liveness, slot.ttl_drift),
+            (
+                Liveness::Live {
+                    live_until: TX_LEDGER + 20
+                },
+                None
+            )
+        );
     }
 
     fn header(version: u32, base_reserve: u32, upgrades: &[LedgerUpgrade]) -> LedgerHeader {

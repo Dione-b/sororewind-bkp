@@ -19,3 +19,7 @@ plan-jobs = ["./checks"]
 # dist sets `contents: write` for the whole release workflow; the checks only
 # read.
 github-custom-job-permissions = { "checks" = { contents = "read" } }
+# release.yml carries one hand edit that dist cannot generate: `host` (which
+# publishes) also requires the checks to have passed. See the comment there;
+# tests/release.rs checks the edit is still in place.
+allow-dirty = ["ci"]

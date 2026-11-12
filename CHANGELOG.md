@@ -88,6 +88,13 @@ an incompatible change to the JSON bumps its `schemaVersion`.
 
 ### Fixed
 
+- `--record` refuses a target that exists and is not a fixture (a file, or a
+  non-empty directory without `fixture.json`) instead of replacing it, and
+  puts back a fixture an interrupted recording left only in its backup.
+- A rate limit or gateway error (429, 502, 503, 504) is retried even when the
+  provider sends it as a JSON-RPC error.
+- The "did you mean http://…?" hint for an invalid `SOROREWIND_RPC_URL` shows
+  only the scheme, host and port.
 - `--record` stages the recording and moves it into place in one step once
   the replay has run: an existing fixture is replaced whole or left alone,
   never mixed with another transaction's files, and files are written

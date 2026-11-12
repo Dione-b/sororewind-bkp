@@ -33,7 +33,12 @@
 //! |-------------------------|------------------------------------------------|
 //! | `state` (then `updated` or `removed`) | the recorded state               |
 //! | `created`               | did not exist                                  |
-//! | `restored`              | the restored value (archived entries are frozen); its TTL then is not recorded |
+//! | `restored`              | the restored value (archived entries are frozen); archived by then, its TTL then lost |
+//!
+//! A `restored` first change does not say the entry was already archived
+//! when the transaction ran: it may have expired in between, and expiry is
+//! not a change. Its TTL then is lost, as for an entry archived now, and
+//! `state` decides its liveness the same way (see [`Past::restored_since`]).
 //!
 //! An entry last written in the transaction's own ledger with no change after
 //! the transaction was written *before* it (by an earlier transaction, or by
@@ -49,7 +54,10 @@
 //!   ledgers at most. This is what resolves busy contracts: the next write is
 //!   a few ledgers away. Every footprint key and TTL is watched here, not only
 //!   the drifted ones, so TTL extensions and deletions in that window are
-//!   rebuilt as well.
+//!   rebuilt as well. The scan runs whenever current state cannot rule such
+//!   changes out (see [`rebuild`]), and stops early once every drifted entry
+//!   and every watched TTL or missing entry has its first later change, or at
+//!   the RPC's latest ledger.
 //! - **Backward**, for entries not written again that soon: the entry's
 //!   current `lastModifiedLedgerSeq` names the ledger of its *last* change,
 //!   whose `state` record names the ledger of the one before, and so on. The
@@ -62,9 +70,13 @@
 //!
 //! - Metadata is only served inside the RPC's retention window (about seven
 //!   days by default). Past it, nothing can be rebuilt.
-//! - Each ledger is 100 KB to a few MB of metadata, fetched only when the
-//!   footprint has drifted entries. Fixtures keep only the changes to the
-//!   keys they recorded (`sororewindChanges`, see `transport`).
+//! - Each ledger is 100 KB to a few MB of metadata. It is not fetched when
+//!   current state proves nothing changed: no drifted entry, no missing one,
+//!   and no TTL that could still have been extended (a TTL that ran out
+//!   before the transaction can only move by a restoration, which rewrites
+//!   the entry). In practice that spares classic-only footprints. Fixtures
+//!   keep only the changes to the keys they recorded (`sororewindChanges`,
+//!   see `transport`).
 //! - Changes that leave no trace in current state are only seen inside the
 //!   forward window: a TTL extension does not touch the entry's
 //!   `lastModifiedLedgerSeq`, and a deleted entry is simply absent.
@@ -88,7 +100,7 @@ use crate::error::{Result, RewindError};
 use crate::rpc::{RawChangeGroup, RawLedger, RawLedgerEntry, RpcClient};
 
 /// How many ledgers, starting with the transaction's own, are scanned for the
-/// next change to each drifted entry.
+/// next change to each drifted or watched entry (see [`rebuild`]).
 pub const FORWARD_LEDGERS: u32 = 16;
 
 /// Ledgers fetched per `getLedgers` call while scanning forward.
@@ -126,6 +138,11 @@ pub struct Past {
     pub value: Option<PastValue>,
     /// The entry's `liveUntilLedgerSeq` when the transaction ran.
     pub live_until: Option<u32>,
+    /// The entry was restored from the archive after the transaction, before
+    /// any other change to it: it was archived by then, and unless
+    /// `live_until` is known, the TTL it had when the transaction ran is lost
+    /// just as for an entry archived now.
+    pub restored_since: bool,
 }
 
 /// The outcome of a rebuild: one [`Past`] per footprint key.
@@ -385,6 +402,8 @@ struct Tracker {
     live_until: Vec<Option<u32>>,
     /// The TTL's first later change has been seen, whatever it was.
     ttl_seen: Vec<bool>,
+    /// The first later change to the entry or its TTL was a restoration.
+    restored: Vec<bool>,
 }
 
 impl Tracker {
@@ -403,6 +422,7 @@ impl Tracker {
             values: vec![None; key_xdr.len()],
             live_until: vec![None; key_xdr.len()],
             ttl_seen: vec![false; key_xdr.len()],
+            restored: vec![false; key_xdr.len()],
         }
     }
 
@@ -415,7 +435,11 @@ impl Tracker {
             if let Some(&index) = self.data.get(&key) {
                 if self.values[index].is_none() {
                     self.values[index] = Some(match change {
-                        LedgerEntryChange::State(entry) | LedgerEntryChange::Restored(entry) => {
+                        LedgerEntryChange::State(entry) => {
+                            Found::Value(PastValue::Entry(Box::new(entry.clone())))
+                        }
+                        LedgerEntryChange::Restored(entry) => {
+                            self.restored[index] = true;
                             Found::Value(PastValue::Entry(Box::new(entry.clone())))
                         }
                         LedgerEntryChange::Created(_) => Found::Value(PastValue::Absent),
@@ -428,12 +452,14 @@ impl Tracker {
                 && !self.ttl_seen[index]
             {
                 self.ttl_seen[index] = true;
-                if let LedgerEntryChange::State(LedgerEntry {
-                    data: LedgerEntryData::Ttl(ttl),
-                    ..
-                }) = change
-                {
-                    self.live_until[index] = Some(ttl.live_until_ledger_seq);
+                match change {
+                    LedgerEntryChange::State(LedgerEntry {
+                        data: LedgerEntryData::Ttl(ttl),
+                        ..
+                    }) => self.live_until[index] = Some(ttl.live_until_ledger_seq),
+                    // It holds the TTL the restoration set, not the old one.
+                    LedgerEntryChange::Restored(_) => self.restored[index] = true,
+                    _ => {}
                 }
             }
         }
@@ -483,6 +509,13 @@ impl Unresolved {
 ///
 /// `current` holds the entries as `getLedgerEntries` returned them, one per
 /// key of `key_xdr`.
+///
+/// Metadata is fetched unless current state proves nothing changed since the
+/// transaction: an entry modified since is *drifted*, and a change that
+/// leaves no trace in `lastModifiedLedgerSeq` is *watched* for in the forward
+/// window wherever it cannot be ruled out. Only drifted entries that cannot
+/// be rebuilt are explained in the note; a watched change that cannot be
+/// looked for leaves the current state standing, as before the scan.
 pub async fn rebuild(
     rpc: &RpcClient,
     target: &Target,
@@ -493,16 +526,27 @@ pub async fn rebuild(
         past: vec![Past::default(); key_xdr.len()],
         note: None,
     };
-    let last_modified = |index: usize| -> Option<u32> {
-        current
-            .get(index)
-            .and_then(Option::as_ref)
-            .and_then(|raw| raw.last_modified_ledger_seq)
-    };
+    let raw = |index: usize| current.get(index).and_then(Option::as_ref);
+    let last_modified =
+        |index: usize| -> Option<u32> { raw(index).and_then(|raw| raw.last_modified_ledger_seq) };
     let drifted: Vec<usize> = (0..key_xdr.len())
         .filter(|&index| last_modified(index).is_some_and(|m| m >= target.ledger))
         .collect();
-    if drifted.is_empty() {
+    // Changes that leave no trace in current state.
+    let watched: Vec<usize> = (0..key_xdr.len())
+        .filter(|&index| match raw(index) {
+            // Deleted since, perhaps: a deletion leaves nothing behind.
+            None => true,
+            // A TTL extension does not touch the entry. A TTL that ran out
+            // before the transaction cannot have moved since but by a
+            // restoration, which rewrites the entry and shows as drift; `0`
+            // (archived now) may hide anything.
+            Some(raw) => raw
+                .live_until_ledger_seq
+                .is_some_and(|live_until| live_until == 0 || live_until >= target.ledger),
+        })
+        .collect();
+    if drifted.is_empty() && watched.is_empty() {
         return rebuild;
     }
 
@@ -519,15 +563,20 @@ pub async fn rebuild(
     let mut tracker = Tracker::new(key_xdr);
     let mut next = target.ledger;
     let window_end = target.ledger.saturating_add(FORWARD_LEDGERS);
-    let mut forward_failure = None;
+    // Why the transaction's own ledger could not be read, when it could not.
+    let mut own_ledger_failure = None;
     'forward: while next < window_end {
-        let pending = drifted
-            .iter()
-            .filter(|&&index| tracker.values[index].is_none())
-            .filter_map(|&index| last_modified(index))
-            .max();
-        // Every drifted entry is settled, or its last change lies behind us.
-        if pending.is_none_or(|last| last < next) {
+        // A drifted entry is settled by its first later change, or once its
+        // last change lies behind us; a watched one only by its first later
+        // change (of the entry when it is missing now, else of its TTL).
+        let drift_pending = drifted.iter().any(|&index| {
+            tracker.values[index].is_none() && last_modified(index).is_some_and(|m| m >= next)
+        });
+        let watch_pending = watched.iter().any(|&index| match raw(index) {
+            None => tracker.values[index].is_none(),
+            Some(_) => !tracker.ttl_seen[index],
+        });
+        if !drift_pending && !watch_pending {
             break;
         }
         let limit = FORWARD_PAGE.min(window_end - next);
@@ -535,19 +584,21 @@ pub async fn rebuild(
             Ok(ledgers) => ledgers,
             Err(err) => {
                 log::debug!(target: "replay", "ledger metadata from {next}: {err}");
-                forward_failure = Some(Unresolved::Unavailable(next));
+                if next == target.ledger {
+                    own_ledger_failure = Some(Unresolved::Unavailable(next));
+                }
                 break;
             }
         };
         let page = next..next + limit;
         for expected in page {
             let Some(raw) = ledgers.iter().find(|ledger| ledger.sequence == expected) else {
-                // The RPC's latest ledger: there is nothing further to scan.
-                if expected > next || !ledgers.is_empty() {
-                    next = expected;
-                    break 'forward;
+                // Past the RPC's latest ledger, there is nothing further to
+                // scan: a page that stops short, or an empty page after a
+                // full one. Only the transaction's own ledger must be there.
+                if expected == target.ledger {
+                    own_ledger_failure = Some(Unresolved::Unavailable(expected));
                 }
-                forward_failure = Some(Unresolved::Unavailable(expected));
                 break 'forward;
             };
             match LedgerChanges::from_raw(raw) {
@@ -556,7 +607,9 @@ pub async fn rebuild(
                 }
                 Err(err) => {
                     log::debug!(target: "replay", "metadata of ledger {expected}: {err}");
-                    forward_failure = Some(Unresolved::Unavailable(expected));
+                    if expected == target.ledger {
+                        own_ledger_failure = Some(Unresolved::Unavailable(expected));
+                    }
                     break 'forward;
                 }
             }
@@ -578,6 +631,7 @@ pub async fn rebuild(
         // rebuilt, or untouched since the transaction.
         if tracker.values[index] != Some(Found::Unusable) {
             past.live_until = tracker.live_until[index];
+            past.restored_since = tracker.restored[index];
         }
     }
 
@@ -591,7 +645,7 @@ pub async fn rebuild(
         if covered_until == target.ledger {
             // Not even the transaction's own ledger could be read, so changes
             // made in it after the transaction cannot be told from earlier ones.
-            unresolved.push(forward_failure.unwrap_or(Unresolved::Unavailable(target.ledger)));
+            unresolved.push(own_ledger_failure.unwrap_or(Unresolved::Unavailable(target.ledger)));
             continue;
         }
         let mut at = match last_modified(index) {
@@ -916,6 +970,114 @@ mod tests {
         let (past, _) = rebuild_one(&rpc, &now, Some(N + 500)).await;
         assert_eq!(past.value, Some(PastValue::Entry(Box::new(archived))));
         assert_eq!(past.live_until, None);
+        // It was archived by then: its liveness is not the current TTL's.
+        assert!(past.restored_since);
+    }
+
+    #[tokio::test]
+    async fn a_ttl_extended_since_is_found_without_value_drift() {
+        // The entry was not written since, but its TTL was extended: the
+        // extension does not touch the entry's `lastModifiedLedgerSeq`.
+        let now = data_entry([2; 32], Persistent, N - 5);
+        let ledgers = vec![(
+            N + 6,
+            vec![(
+                Phase::Operations,
+                0,
+                update(&ttl_entry(&now, N + 40), &ttl_entry(&now, N + 9_000)),
+            )],
+        )];
+        let (rpc, calls) = rpc(ledgers, N + 100);
+        let (past, note) = rebuild_one(&rpc, &now, Some(N + 9_000)).await;
+        assert_eq!(past.value, None);
+        assert_eq!(past.live_until, Some(N + 40));
+        assert_eq!(note, None);
+        // Two pages: the scan stops once the TTL's first later change is in.
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_entry_deleted_since_is_found_without_value_drift() {
+        let then = data_entry([2; 32], Persistent, N - 5);
+        let ledgers = vec![(
+            N + 1,
+            vec![(
+                Phase::Operations,
+                0,
+                // `removed` records follow, but fixtures do not keep them.
+                vec![
+                    LedgerEntryChange::State(then.clone()),
+                    LedgerEntryChange::State(ttl_entry(&then, N + 40)),
+                ],
+            )],
+        )];
+        let (rpc, _) = rpc(ledgers, N + 100);
+        let rebuilt = rebuild(&rpc, &TARGET, &[key_of(&then)], &[None]).await;
+        assert_eq!(
+            rebuilt.past[0],
+            Past {
+                value: Some(PastValue::Entry(Box::new(then))),
+                live_until: Some(N + 40),
+                restored_since: false,
+            }
+        );
+        assert_eq!(rebuilt.note, None);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_fetched_when_a_ttl_ran_out_before_the_transaction() {
+        // Only a restoration could move it since, and that rewrites the entry.
+        let (rpc, calls) = rpc(Vec::new(), N + 100);
+        let entry = data_entry([2; 32], Persistent, N - 9);
+        let (past, note) = rebuild_one(&rpc, &entry, Some(N - 1)).await;
+        assert_eq!((past, note), (Past::default(), None));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_forward_scan_stops_at_the_latest_ledger() {
+        let entry = data_entry([2; 32], Persistent, N - 9);
+        let starts = |calls: crate::test_support::Calls| -> Vec<u64> {
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, params)| params["startLedger"].as_u64().unwrap())
+                .collect()
+        };
+        let n = u64::from(N);
+
+        // A page that stops short.
+        let (short, calls) = rpc(Vec::new(), N + 5);
+        let (past, note) = rebuild_one(&short, &entry, Some(N + 50)).await;
+        assert_eq!((past, note), (Past::default(), None));
+        assert_eq!(starts(calls), [n, n + 4]);
+
+        // An empty page after a full one is the end, not a failure.
+        let (empty, calls) = rpc(Vec::new(), N + 3);
+        let (past, note) = rebuild_one(&empty, &entry, Some(N + 50)).await;
+        assert_eq!((past, note), (Past::default(), None));
+        assert_eq!(starts(calls), [n, n + 4]);
+
+        // A drifted entry is still settled by its own last change.
+        let now = account_entry([1; 32], N + 3);
+        let ledgers = vec![(
+            N + 3,
+            vec![(Phase::Operations, 0, update(&at(&now, N - 2), &now))],
+        )];
+        let (rpc_drifted, _) = rpc(ledgers, N + 3);
+        let (past, note) = rebuild_one(&rpc_drifted, &now, None).await;
+        assert_eq!(
+            past.value,
+            Some(PastValue::Entry(Box::new(at(&now, N - 2))))
+        );
+        assert_eq!(note, None);
+
+        // Only the transaction's own ledger must be served.
+        let (behind, _) = rpc(Vec::new(), N - 1);
+        let (past, note) = rebuild_one(&behind, &now, None).await;
+        assert_eq!(past, Past::default());
+        assert!(note.unwrap().contains(&format!("ledger {N} ")));
     }
 
     #[tokio::test]

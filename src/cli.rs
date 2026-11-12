@@ -133,9 +133,12 @@ fn parse_rpc_url(text: &str) -> std::result::Result<String, String> {
     let url =
         reqwest::Url::parse(text).map_err(|e| format!("{e} (expected http://… or https://…)"))?;
     if !matches!(url.scheme(), "http" | "https") {
+        // The hint shows only scheme, host and port: the rest of the URL may
+        // be an API key, and this message reaches stderr and `--json`.
         return Err(format!(
-            "the scheme is `{}`, expected http or https (did you mean http://{text}?)",
-            url.scheme()
+            "the scheme is `{}`, expected http or https (did you mean {}?)",
+            url.scheme(),
+            crate::transport::redact(&format!("http://{text}"))
         ));
     }
     if url.host_str().is_none_or(str::is_empty) {
@@ -367,6 +370,13 @@ mod tests {
             "{}",
             message("localhost:8000")
         );
+        // The hint never repeats a path, which may be an API key.
+        let reason = parse_rpc_url("rpc.provider.io:443/v1/SECRETKEY").unwrap_err();
+        assert!(
+            reason.contains("did you mean http://rpc.provider.io:443/…?"),
+            "{reason}"
+        );
+        assert!(!reason.contains("SECRETKEY"), "{reason}");
         assert!(message("ftp://rpc.example").contains("expected http or https"));
         assert!(message("rpc.example").contains("expected http://"));
     }

@@ -194,11 +194,26 @@ impl Story {
                     );
                 }
                 "error" => {
+                    let message = message(data);
+                    // The host's own word that a `try_call` caught the failure
+                    // of the frames above the caller: they are dead, and the
+                    // caller, which emits it, is alive.
+                    let caught = message.starts_with(TRY_CALL_FAILED);
+                    if caught {
+                        abandon_frames_above_caller(
+                            &mut calls,
+                            &mut stack,
+                            &errored,
+                            emitter.as_deref(),
+                        );
+                    }
                     let open_frame = emitting_frame(&calls, &stack, emitter.as_deref());
-                    errored.extend(open_frame);
+                    if !caught {
+                        errored.extend(open_frame);
+                    }
                     errors.push(ErrorEvent {
                         error: topics.get(1).and_then(sc_error),
-                        message: message(data),
+                        message,
                         open_frame,
                         stretch,
                     });
@@ -215,7 +230,7 @@ impl Story {
             }
         }
 
-        let failure = fatal.map(|fatal| build_failure(&errors, fatal, &calls, &stack));
+        let failure = fatal.map(|fatal| build_failure(&errors, fatal, &calls, &stack, stretch));
         if let Some(call) = failure
             .as_ref()
             .and_then(|f| f.call_index)
@@ -227,6 +242,10 @@ impl Story {
         Story { failure, calls }
     }
 }
+
+/// The message of the `error` diagnostic the host emits, from the caller,
+/// when a `try_call` returns the callee's error instead of failing.
+const TRY_CALL_FAILED: &str = "contract try_call failed";
 
 /// The innermost open frame of the contract an event was emitted from,
 /// falling back to the innermost frame of any contract.
@@ -252,8 +271,8 @@ fn emitting_frame(calls: &[Call], stack: &[usize], emitter: Option<&str>) -> Opt
 /// absorbed, so with recursion (A calls A) the innermost frame of a contract
 /// may be a dead one. A frame that emitted an `error` is taken to be dead
 /// when an outer frame of the same contract did not: only when every frame
-/// of the contract has errored (its own `try_call failed` diagnostic counts)
-/// is the innermost one used.
+/// of the contract has errored is the innermost one used. A `try_call
+/// failed` diagnostic does not count: the frame that emits it is alive.
 fn live_frame(
     calls: &[Call],
     stack: &[usize],
@@ -330,22 +349,30 @@ fn build_failure(
     fatal: &ScError,
     calls: &[Call],
     stack: &[usize],
+    last_stretch: usize,
 ) -> Failure {
     // The fatal error is the end of the last escalation: the errors raised
     // since the last frame was entered or left. Its first diagnostic there is
     // where it originated; later ones are the same error climbing the frame
-    // stack. An equal error from earlier on was caught by a `try_call`.
-    let last_stretch = errors.last().map(|event| event.stretch);
+    // stack. An equal error from earlier on was caught by a `try_call`, and so
+    // is any error from before a frame was last entered or left: when the
+    // last stretch has none, the fatal error left no diagnostic at all.
+    //
+    // A frame a `try_call` recovered from did not fail the transaction, so
+    // nothing raised in one is the origin.
+    let recovered = |event: &ErrorEvent| event.open_frame.is_some_and(|i| calls[i].recovered);
     let escalation = || {
         errors
             .iter()
             .enumerate()
-            .filter(move |(_, event)| Some(event.stretch) == last_stretch)
+            .filter(move |(_, event)| event.stretch == last_stretch)
     };
     let origin = escalation()
+        .filter(|(_, event)| !recovered(event))
         .find(|(_, event)| event.error.as_ref() == Some(fatal))
-        .or_else(|| errors.iter().enumerate().next_back());
+        .or_else(|| escalation().rfind(|(_, event)| !recovered(event)));
 
+    // Without an origin, the failure belongs to the frame that was running.
     let (message, call_index) = match origin {
         Some((_, event)) => (event.message.clone(), event.open_frame),
         None => (String::new(), stack.last().copied()),
@@ -356,17 +383,25 @@ fn build_failure(
     let frame = call_index.and_then(|i| calls.get(i));
 
     // A host error can be the host's answer to a contract error: the last one
-    // raised before it, in the same escalation, by a frame that never
-    // returned.
+    // raised before it, in the same escalation. Callers re-emit the code of a
+    // failed callee as it climbs (`contract try_call failed`, frame-exit
+    // escalations), so the contract error is credited to its first emission
+    // there: the innermost frame, whose contract declared the code.
     let cause_event = match (fatal, origin) {
         (ScError::Contract(_), _) | (_, None) => None,
-        (_, Some((origin, _))) => escalation()
-            .filter(|(index, _)| *index < origin)
-            .filter_map(|(_, event)| match event.error {
-                Some(ScError::Contract(code)) => Some((code, event)),
-                _ => None,
-            })
-            .rfind(|(_, event)| event.open_frame.is_some_and(|i| stack.contains(&i))),
+        (_, Some((origin, _))) => {
+            let contract_errors = || {
+                escalation()
+                    .take_while(move |(index, _)| *index < origin)
+                    .filter_map(|(_, event)| match event.error {
+                        Some(ScError::Contract(code)) => Some((code, event)),
+                        _ => None,
+                    })
+            };
+            contract_errors()
+                .last()
+                .and_then(|(last, _)| contract_errors().find(|(code, _)| *code == last))
+        }
     };
     let cause = cause_event.map(|(code, event)| {
         let frame = event.open_frame.and_then(|i| calls.get(i));
@@ -381,7 +416,11 @@ fn build_failure(
             depth: frame.map(|call| call.depth),
         }
     });
-    let cause_frame = cause_event.and_then(|(_, event)| event.open_frame);
+    // The cause's frame is the one that failed, unless a `try_call` caught
+    // its error: then the frame that went on to fail is.
+    let cause_frame = cause_event
+        .and_then(|(_, event)| event.open_frame)
+        .filter(|&i| !calls[i].recovered);
 
     Failure {
         error: fatal.clone(),
@@ -853,6 +892,99 @@ mod tests {
             Some(&fatal),
         );
         assert_eq!(story.failure.as_ref().unwrap().cause, None);
+    }
+
+    /// A host error that leaves no diagnostic, after a `try_call` was
+    /// recovered from, must not be blamed on the recovered frame.
+    #[test]
+    fn a_silent_fatal_error_is_not_blamed_on_a_recovered_frame() {
+        const C: [u8; 32] = [0xc; 32];
+        let fatal = ScError::Budget(ScErrorCode::ExceededLimit);
+        let story = Story::build(
+            &[
+                fn_call(None, A, "outer", vec![]),
+                fn_call(Some(A), B, "middle", vec![]),
+                // B try-calls C, which fails; B handles it and returns.
+                fn_call(Some(B), C, "probe", vec![]),
+                error_event(Some(C), ScError::Contract(3), "probe failed"),
+                error_event(Some(B), ScError::Contract(3), "contract try_call failed"),
+                fn_return(B, "middle", ScVal::Void),
+                // Then the budget runs out in A, with no diagnostic.
+            ],
+            Some(&fatal),
+        );
+        let failure = story.failure.as_ref().unwrap();
+        assert_eq!(failure.message, "");
+        assert_eq!(failure.contract.as_deref(), Some(id(A).as_str()));
+        assert_eq!(
+            (failure.function.as_deref(), failure.depth),
+            (Some("outer"), Some(0))
+        );
+        assert_eq!(failure.cause, None);
+        let [outer, middle, probe] = story.calls.as_slice() else {
+            panic!("expected three frames, got {:?}", story.calls);
+        };
+        assert!(outer.open && outer.is_failure);
+        assert!(!middle.open && !middle.is_failure);
+        assert!(probe.recovered && !probe.is_failure);
+        // No frame is ever both.
+        assert!(story.calls.iter().all(|c| !(c.recovered && c.is_failure)));
+
+        // With nothing left open, there is no frame to blame.
+        let story = Story::build(
+            &[
+                fn_call(None, A, "outer", vec![]),
+                fn_call(Some(A), B, "probe", vec![]),
+                error_event(Some(B), ScError::Contract(3), "probe failed"),
+                fn_return(A, "outer", ScVal::Void),
+            ],
+            Some(&fatal),
+        );
+        let failure = story.failure.as_ref().unwrap();
+        assert_eq!(failure.message, "");
+        assert_eq!(
+            (failure.function.as_deref(), failure.call_index),
+            (None, None)
+        );
+        assert!(story.calls[1].recovered && !story.calls[1].is_failure);
+    }
+
+    /// The caller re-emits a caught contract error as `contract try_call
+    /// failed`; the cause is still the callee that raised it, so its name is
+    /// looked up in the callee's spec.
+    #[test]
+    fn a_cause_caught_by_try_call_is_credited_to_the_callee() {
+        let fatal = ScError::WasmVm(ScErrorCode::InvalidAction);
+        let story = Story::build(
+            &[
+                fn_call(None, A, "outer", vec![]),
+                fn_call(Some(A), B, "probe", vec![]),
+                error_event(Some(B), ScError::Contract(3), "probe failed"),
+                error_event(Some(A), ScError::Contract(3), "contract try_call failed"),
+                // A unwraps the error it was handed back and traps.
+                error_event(Some(A), fatal.clone(), "escalating error to VM trap"),
+            ],
+            Some(&fatal),
+        );
+        let failure = story.failure.as_ref().unwrap();
+        assert_eq!(failure.message, "escalating error to VM trap");
+        assert_eq!(failure.function.as_deref(), Some("outer"));
+        let cause = failure.cause.as_ref().unwrap();
+        assert_eq!(cause.contract_code, 3);
+        assert_eq!(cause.message, "probe failed");
+        assert_eq!(cause.contract.as_deref(), Some(id(B).as_str()));
+        assert_eq!(
+            (cause.function.as_deref(), cause.depth),
+            (Some("probe"), Some(1))
+        );
+        let [outer, probe] = story.calls.as_slice() else {
+            panic!("expected two frames, got {:?}", story.calls);
+        };
+        // The try_call caught B's failure: B is recovered, and A, which went
+        // on to trap, is the frame that failed.
+        assert!(probe.recovered && !probe.open && !probe.is_failure);
+        assert!(outer.open && outer.is_failure);
+        assert_eq!(failure.call_index, Some(0));
     }
 
     #[test]

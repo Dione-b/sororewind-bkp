@@ -206,22 +206,25 @@ impl HttpTransport {
         if status.is_success() {
             return Attempt::Done(text);
         }
-        // Some providers answer a JSON-RPC error with a non-2xx status; the
-        // envelope says more than the status does, so let the client read it.
-        let is_envelope = serde_json::from_str::<Value>(&text)
-            .is_ok_and(|body| body.get("error").is_some_and(|error| !error.is_null()));
-        if is_envelope {
-            return Attempt::Done(text);
-        }
         let error = RewindError::Rpc {
             origin: self.origin(),
             method: method.to_string(),
             code: None,
             detail: format!("HTTP {status}: {}", truncate(&text, 300)),
         };
-        match status.as_u16() {
-            429 | 502 | 503 | 504 => Attempt::Transient(error, retry_after),
-            _ => Attempt::Failed(error),
+        // A rate limit or an overloaded gateway is worth waiting out, even
+        // when the provider phrases it as a JSON-RPC error.
+        if matches!(status.as_u16(), 429 | 502 | 503 | 504) {
+            return Attempt::Transient(error, retry_after);
+        }
+        // Some providers answer a JSON-RPC error with a non-2xx status; the
+        // envelope says more than the status does, so let the client read it.
+        let is_envelope = serde_json::from_str::<Value>(&text)
+            .is_ok_and(|body| body.get("error").is_some_and(|error| !error.is_null()));
+        if is_envelope {
+            Attempt::Done(text)
+        } else {
+            Attempt::Failed(error)
         }
     }
 
@@ -498,6 +501,20 @@ impl<T: Transport> Recording<T> {
         let staging = parent.join(format!(".{name}.recording"));
         let backup = parent.join(format!(".{name}.backup"));
 
+        // A commit interrupted between its two renames leaves the old fixture
+        // only in the backup: put it back before anything else touches it.
+        // A backup that is not a whole fixture is just debris.
+        if !tokio::fs::try_exists(&target).await.unwrap_or(true)
+            && tokio::fs::try_exists(backup.join(MANIFEST_FILE))
+                .await
+                .unwrap_or(false)
+        {
+            tokio::fs::rename(&backup, &target)
+                .await
+                .map_err(RewindError::record_path(&backup))?;
+        }
+        refuse_non_fixture(&target).await?;
+
         // Whatever an interrupted run left behind is not worth keeping.
         remove_dir_if_present(&staging).await?;
         tokio::fs::create_dir_all(&staging)
@@ -613,6 +630,41 @@ impl RecordingHandle {
     /// Throw the recording away; the fixture at the target stays as it was.
     pub async fn discard(&self) {
         let _ = tokio::fs::remove_dir_all(&self.0.staging).await;
+    }
+}
+
+/// The commit replaces the target whole, so it has to be a fixture already,
+/// an empty directory, or nothing: `--record ~/notes` must not delete notes.
+async fn refuse_non_fixture(target: &Path) -> Result<()> {
+    let refuse = |why: &str| {
+        Err(RewindError::record_path(target)(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{why}; refusing to replace it with a recording"),
+        )))
+    };
+    let meta = match tokio::fs::metadata(target).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(RewindError::record_path(target)(e)),
+    };
+    if !meta.is_dir() {
+        return refuse("it exists and is not a directory");
+    }
+    if tokio::fs::try_exists(target.join(MANIFEST_FILE))
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let mut entries = tokio::fs::read_dir(target)
+        .await
+        .map_err(RewindError::record_path(target))?;
+    match entries.next_entry().await {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => refuse(&format!(
+            "it is not empty and has no {MANIFEST_FILE}, so it is not a fixture"
+        )),
+        Err(e) => Err(RewindError::record_path(target)(e)),
     }
 }
 
@@ -885,6 +937,63 @@ mod tests {
         assert!(!text.contains("SECRETKEY"), "{text}");
         assert!(!transport.origin().contains("SECRETKEY"));
         assert!(transport.origin().ends_with("/…"));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_phrased_as_a_json_rpc_error_is_retried() {
+        let limited =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32007,"message":"request limit reached"}}"#;
+        let ok = r#"{"jsonrpc":"2.0","id":1,"result":{"passphrase":"p"}}"#;
+        let (url, server) = serve(vec![(429, "retry-after: 0\r\n", limited), (200, "", ok)]);
+        let text = fast(&url).request("getNetwork", &json!({})).await.unwrap();
+        assert_eq!(text, ok);
+        assert_eq!(server.join().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn recording_never_replaces_a_directory_that_is_not_a_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("notes");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("notes.txt"), "keep me").unwrap();
+        let err = Recording::create(MemoryTransport::new(), &target, &hash())
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("not a fixture"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(target.join("notes.txt")).unwrap(),
+            "keep me"
+        );
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(
+            Recording::create(MemoryTransport::new(), &file, &hash())
+                .await
+                .is_err()
+        );
+        // An empty directory is fine to record into.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        Recording::create(MemoryTransport::new(), &empty, &hash())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_commit_gets_its_old_fixture_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("rec");
+        let backup = dir.path().join(".rec.backup");
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join(MANIFEST_FILE), "{}").unwrap();
+        let recording = Recording::create(MemoryTransport::new(), &target, &hash())
+            .await
+            .unwrap();
+        assert!(target.join(MANIFEST_FILE).exists());
+        assert!(!backup.exists());
+        recording.handle().discard().await;
+        assert!(target.join(MANIFEST_FILE).exists(), "discarding keeps it");
     }
 
     #[tokio::test]

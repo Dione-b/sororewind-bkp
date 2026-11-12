@@ -36,8 +36,9 @@ just check
 ```
 
 This runs what CI enforces on every pull request: `cargo fmt --check`, clippy
-with warnings as errors, the offline test suite, a build on the minimum
-supported Rust, and `cargo deny check`. CI additionally runs the tests on
+with warnings as errors, the offline test suite, the snapshot check (no
+pending or unreferenced snapshots), the API docs with warnings as errors, a
+build on the minimum supported Rust, and `cargo deny check`. CI additionally runs the tests on
 macOS and Windows.
 
 Lint settings live in `Cargo.toml` (`[lints]`): `unsafe_code` is forbidden,

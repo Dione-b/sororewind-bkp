@@ -7,7 +7,7 @@ default:
     @just --list
 
 # Everything CI enforces on a pull request.
-check: fmt clippy test msrv deny
+check: fmt clippy test snapshots docs msrv deny
 
 # Formatting, as CI checks it.
 fmt:
@@ -20,6 +20,14 @@ clippy:
 # The offline test suite.
 test:
     cargo test --locked
+
+# No pending or unreferenced snapshots (needs cargo-insta).
+snapshots:
+    cargo insta test --check --unreferenced=reject
+
+# The API docs, with warnings as errors.
+docs:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 
 # Build on the minimum supported Rust.
 msrv:
