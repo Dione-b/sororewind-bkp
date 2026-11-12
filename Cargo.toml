@@ -16,7 +16,7 @@ exclude = ["fixtures/", "tests/", ".github/"]
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
 clap_mangen = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "gzip"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # One Soroban host per protocol this build replays, at most two at a time
